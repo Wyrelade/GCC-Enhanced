@@ -613,7 +613,7 @@ PRE_SIGMA_PASSES = ("un_hi_cse", "exit_merge")
 # under `.set noreorder` (one instruction per line, verbatim source) to stop the
 # assembler re-scheduling it. padnop needs neither (a trailing nop cannot be
 # rescheduled).
-WORD_PASSES = ("delay_fill", "epilogue_unfill", "padnop")
+WORD_PASSES = ("delay_fill", "epilogue_unfill", "reorder_indep", "padnop")
 
 # minimal register def/use for the delay_fill dependency guard (gas `$reg` syntax)
 _STORE_MN = {"sb", "sh", "sw", "swl", "swr", "swc1", "swc2", "sd", "sdc1", "sdc2"}
@@ -947,9 +947,92 @@ def delay_fill_src(span, tgt, our_words):
     return "\n".join(out), True
 
 
+_PURE_ALU = set((
+    "lui li la addiu addu addi ori xori andi and or xor sll srl sra sllv "
+    "srlv srav slt slti sltu sltiu subu sub move nor").split())
+
+
+def _pure_alu(disasm):
+    """A register-only instruction with no memory or control-flow effect, so two
+    adjacent ones may be swapped when register-independent (no aliasing to reason
+    about)."""
+    p = disasm.split(None, 1)
+    return bool(p) and p[0].lower() in _PURE_ALU
+
+
+def _word_eq(our_w, tgt_w, tgt_dis):
+    """Words equal, tolerating a relocated low-16 immediate: when the target insn
+    carries a `%hi`/`%lo`/`%gp_rel` relocation its low half is symbol-dependent
+    (our un-relinked assembly leaves it 0), so compare opcode+register fields only."""
+    if our_w == tgt_w:
+        return True
+    if "%hi" in tgt_dis or "%lo" in tgt_dis or "%gp_rel" in tgt_dis:
+        return (int(our_w, 16) >> 16) == (int(tgt_w, 16) >> 16)
+    return False
+
+
+def reorder_indep_src(span, tgt, our_words):
+    """Swap adjacent independent pure-ALU instructions to match the target's
+    schedule. Retail's cc1 sometimes emits two data-independent register ops (e.g.
+    an immediate load and a `lui` address setup) in the opposite order to ours;
+    swapping them is semantics-preserving. Target-guided: reorder only so our
+    assembled word stream lines up with the target, and only across a run where a
+    single adjacent transposition per step is enough. Requires a 1:1 source-insn to
+    word mapping (no macro expansion in the span) and register-independence of every
+    swapped pair. Returns (new_span, fired)."""
+    if len(our_words) != len(tgt):
+        return span, False
+    n = len(tgt)
+    lines = span.split("\n")
+    ins = [(i, l) for i, l in enumerate(lines) if _s_is_insn(l)]
+    if len(ins) != n:                       # macro expansion -> mapping unsafe
+        return span, False
+    ow = list(our_words)
+    order = list(range(n))                  # order[p] = original source index at p
+    swapped = set()
+    pos = 0
+    while pos < n - 1:
+        if _word_eq(ow[pos][0], tgt[pos][0], tgt[pos][1]):
+            pos += 1
+            continue
+        if (_word_eq(ow[pos + 1][0], tgt[pos][0], tgt[pos][1])
+                and _word_eq(ow[pos][0], tgt[pos + 1][0], tgt[pos + 1][1])):
+            a, b = ow[pos][1], ow[pos + 1][1]
+            if not (_pure_alu(a) and _pure_alu(b)):
+                return span, False
+            ad, au = defs_uses(a)
+            bd, bu = defs_uses(b)
+            if (ad & bu) or (bd & au) or (ad & bd):
+                return span, False          # data dependency: not swappable
+            ow[pos], ow[pos + 1] = ow[pos + 1], ow[pos]
+            order[pos], order[pos + 1] = order[pos + 1], order[pos]
+            swapped |= {pos, pos + 1}
+            pos += 2
+            continue
+        return span, False                  # not a single-adjacent-swap fix
+    if not swapped:
+        return span, False
+    final = [ins[order[p]][1].strip() for p in range(n)]
+    line_pos = {ins[p][0]: p for p in range(n)}
+    out = []
+    for idx, l in enumerate(lines):
+        if idx in line_pos:
+            p = line_pos[idx]
+            indent = _src_indent(ins[p][1])
+            if p in swapped and (p - 1) not in swapped:
+                out.append(indent + ".set\tnoreorder")
+            out.append(indent + final[p])
+            if p in swapped and (p + 1) not in swapped:
+                out.append(indent + ".set\treorder")
+        else:
+            out.append(l)
+    return "\n".join(out), True
+
+
 _REORDER_SRC = {
     "epilogue_unfill": epilogue_unfill_src,
     "delay_fill": delay_fill_src,
+    "reorder_indep": reorder_indep_src,
 }
 
 
@@ -963,7 +1046,7 @@ def emit_noreorder_span(span, tgt, our_words, reorder_passes):
         fn = _REORDER_SRC.get(name)
         if fn is None:
             raise NotImplementedError("reorder pass not wired: %s" % name)
-        if name == "delay_fill":
+        if name in ("delay_fill", "reorder_indep"):
             txt, _fired = fn(txt, tgt, our_words)
         else:
             txt, _fired = fn(txt, tgt)
@@ -1190,7 +1273,7 @@ def normalize_s(s_file, ctx, manifest=None):
             if name not in word_funcs:
                 continue
             reorder = [p for p in manifest[name]["passes"]
-                       if p in ("delay_fill", "epilogue_unfill")]
+                       if p in ("delay_fill", "epilogue_unfill", "reorder_indep")]
             if not reorder:
                 continue
             our, err = assemble_words(ctx, s_file, name)
