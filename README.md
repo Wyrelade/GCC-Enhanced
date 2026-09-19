@@ -116,10 +116,11 @@ study, but the method is general to any PSX-era GCC 2.x matching decomp.
   `equiv.py --selftest DIR` for the corpus test.
 - `tools/solve.py` - Phase C target-guided solver. Derives the register correspondence from the
   known target, applies it to the cc1 assembly, rebuilds through maspsx and the assembler, runs
-  the address-form, un-hi-cse, exit-merge, delay-unfill, delay-slot-fill and epilogue-unfill
-  passes (each fired target-guided), compares to the target bytes, and gates the result on
-  `equiv.py`. Builds the gate's control-flow graph from resolved branch addresses (including jal
-  relocations folded back to their symbol) so branchy functions and calls verify correctly.
+  the address-form, un-hi-cse, exit-merge, delay-unfill, delay-slot-fill, epilogue-unfill and
+  operand-recolor passes (each fired target-guided), compares to the target bytes, and gates the
+  result on `equiv.py`. Builds the gate's control-flow graph from resolved branch addresses
+  (including jal relocations folded back to their symbol) so branchy functions and calls verify
+  correctly.
 - `tools/batch.py` - batch driver over the solver. Takes a JSON job list or a directory of
   `f<FUNC>.c` stubs, reports verified / bytes-only / not-solved / error per function, and writes
   the verified wins to `solved_manifest.json`. A bytes-only result forces a nonzero exit so a

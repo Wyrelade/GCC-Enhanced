@@ -170,6 +170,23 @@ from the relocation table (a sound resolution, not a mask) makes the call trace 
 while two functions calling different symbols at the same index still compare unequal. Proven end
 to end on three frame functions, including one with three sequential calls.
 
+The operand-recolor family handles a commutative accumulate whose only divergence is which dead
+register carries the result. The near-miss compiler may accumulate a base-plus-index address into
+the index temporary while the target accumulates into the base temporary; the operation commutes,
+so the address value and the memory store are identical, and both temporaries are caller-saved and
+dead at the function exit. A global register map cannot express this, because the two registers
+keep their identity everywhere else and only swap roles for this one instruction, so it is a local
+recolor: rewrite the accumulate to the target's destination and operand order, then rename the old
+destination forward until it is redefined, bailing if the new destination is written before the old
+one dies. The verifier proves it equal under the identity map because the divergent registers are
+dead. When aligning the two sides, only the accumulate form (destination equal to the first source,
+a real non-zero second source) is counted, because an add of a register and zero prints as an add
+in a splat target but as a register-move pseudo-op in compiler assembly. A related lesson from the
+same family: an apparent operand divergence is sometimes only the wrong source shape. If the near-
+miss reloads a pointer between two stores through it (a store may alias the pointer in memory),
+caching the record pointer in a local removes the reload and the compiler then emits the target
+byte for byte, operand order included, with no rewrite at all.
+
 ## Phase D. cc1 reproduction at the RTL level
 
 Optional but principled. Build GCC 2.8.1 from source for the target, confirm baseline parity

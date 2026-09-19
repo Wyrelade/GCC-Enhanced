@@ -449,6 +449,109 @@ def delay_fill(words, tgt=None):
     return out
 
 # ---------------------------------------------------------------------------
+# operand-recolor: local dead-temp recolor of a commutative accumulate.
+#
+# The near-miss compiler sometimes accumulates a base+index address into the INDEX
+# register while the target compiler accumulates into the BASE register:
+#     near-miss: addu $I,$I,$B ; <mem> off($I)   (result in the index temp $I)
+#     target:    addu $B,$B,$I ; <mem> off($B)   (result in the base temp $B)
+# The op is commutative so the VALUE and the memory effect are identical; $I and
+# $B are both caller-saved temps dead at the function exit, so the only visible
+# difference is which dead register carries the address. A global register map
+# (sigma) cannot express this -- $I and $B keep their identity everywhere else and
+# only swap roles for this one accumulate -- so it is a LOCAL recolor: rewrite the
+# accumulate to the target's form and rename the old destination ($I) to $B in the
+# following instructions until $I is redefined. Target-guided (fire only on the
+# k-th commutative accumulate whose target form is `op $B,$B,$I` while the near-miss
+# form is the swapped `op $I,$I,$B`), and the equiv gate proves EQUAL (identical
+# memory, the divergent regs dead). Bail if $B is written before the old $I dies.
+# ---------------------------------------------------------------------------
+_COMMUTATIVE_ACC = {"addu", "add", "and", "or", "xor", "nor"}
+_ACC_S = re.compile(r"^(\s*)(\w+)\s+(\$\d+)\s*,\s*(\$\d+)\s*,\s*(\$\d+)\s*$")
+
+def _accs_numeric(pairs, to_num):
+    """List of (op, dst, rs, rt) numeric-register commutative ACCUMULATES (dst==rs, rt a
+    real non-zero register) in order. Restricting to the accumulate form keeps the two
+    sides aligned: a `op rd,rs,zero` renders as `addu` in a splat target but as a `move`
+    pseudo-op in the near-miss assembly, so counting all 3-operand commutatives would
+    mismatch."""
+    zero = "$%d" % E.ABI2NUM["zero"] if "zero" in E.ABI2NUM else "$0"
+    out = []
+    for _, dis in pairs:
+        m = re.match(r"(\w+)\s+(\$?\w+)\s*,\s*(\$?\w+)\s*,\s*(\$?\w+)\s*$", dis)
+        if not m or m.group(1).lower() not in _COMMUTATIVE_ACC:
+            continue
+        d, s, t = to_num(m.group(2)), to_num(m.group(3)), to_num(m.group(4))
+        if d and s and t and d == s and t != zero:
+            out.append((m.group(1).lower(), d, s, t))
+    return out
+
+def _abi_to_num(tok):
+    r = E.norm_reg(tok)
+    return ("$%d" % E.ABI2NUM[r]) if r in E.ABI2NUM else None
+
+def _num_to_num(tok):
+    return tok if re.fullmatch(r"\$\d+", tok or "") else None
+
+def _s_insn_lines(lines):
+    return [i for i, l in enumerate(lines) if _s_is_insn(l)]
+
+def operand_recolor_s(stext, tgt):
+    """Recolor a commutative accumulate the near-miss computes into the index temp but
+    the target computes into the base temp (a local dead-temp swap). Returns new text."""
+    tgt_accs = _accs_numeric(tgt, _abi_to_num)
+    if not tgt_accs:
+        return stext
+    lines = stext.split("\n")
+    insn_ix = _s_insn_lines(lines)
+    zero = "$%d" % E.ABI2NUM["zero"] if "zero" in E.ABI2NUM else "$0"
+    our_accs = []           # (line_index, op, dst, rs, rt) -- accumulate form only
+    for i in insn_ix:
+        m = _ACC_S.match(lines[i])
+        if m and m.group(2).lower() in _COMMUTATIVE_ACC \
+                and m.group(3) == m.group(4) and m.group(5) != zero:
+            our_accs.append((i, m.group(2).lower(), m.group(3), m.group(4), m.group(5)))
+    if len(our_accs) != len(tgt_accs):
+        return stext        # body not aligned: do not risk a recolor
+    for (li, op, od, os_, ot), (top, td, ts, tt) in zip(our_accs, tgt_accs):
+        if op != top:
+            continue
+        # target accumulates S into B: `op $B,$B,$S` (td==ts, S==tt). The near-miss is the
+        # swapped `op $S,$S,$B` (od==os_==tt, and ot==td). Recolor od(=$S) -> $B(td).
+        if not (td == ts and od == os_ and od == tt and ot == td):
+            continue
+        newB, oldI = td, od
+        indent = lines[li][:len(lines[li]) - len(lines[li].lstrip())]
+        # verify the merge is safe: scan forward from after the accumulate; newB must
+        # not be written before oldI is redefined (else merging clobbers a live value).
+        safe = True
+        redef_at = None
+        for j in insn_ix:
+            if j <= li:
+                continue
+            mm = re.match(r"\s*([a-z][\w.]*)\s+(\$\d+)\b", lines[j])
+            if not mm:
+                continue
+            mn, dst = mm.group(1).lower(), mm.group(2)
+            is_store = mn in _STORE_MNEMS or mn.startswith(("sb", "sh", "sw"))
+            if not is_store and dst == newB:      # newB overwritten while merging: unsafe
+                safe = False; break
+            if not is_store and dst == oldI:       # oldI redefined: stop renaming here
+                redef_at = j; break
+        if not safe:
+            continue
+        lines[li] = "%s%s\t%s,%s,%s" % (indent, op, newB, newB, oldI)
+        reg_re = re.compile(r"(?<![\w$])" + re.escape(oldI) + r"(?![\w])")
+        for j in insn_ix:
+            if j <= li:
+                continue
+            if redef_at is not None and j >= redef_at:
+                break
+            lines[j] = reg_re.sub(newB, lines[j])
+        return "\n".join(lines)
+    return stext
+
+# ---------------------------------------------------------------------------
 # epilogue-unfill (FILL/UNFILL class, target-guided).
 #
 # Some PSX GCC 2.x builds deallocate the stack frame BEFORE the return:
@@ -673,6 +776,20 @@ def solve_one(cfile, func, retty="void"):
             our_ex, err_ex = asmlib.assemble_words(s_ex, func)
             if not err_ex:
                 our = _strip_trailing_pad(our_ex); src = s_ex
+
+    # 0d) operand-recolor: local dead-temp recolor of a commutative accumulate the near-miss
+    # computes into the index temp while the target computes into the base temp. Runs before
+    # sigma because it repairs the exact register-role swap that would otherwise be a sigma
+    # conflict.
+    stext_c = open(src, encoding="utf-8", errors="replace").read()
+    recolored = operand_recolor_s(stext_c, tgt)
+    if recolored != stext_c:
+        s_rc = os.path.join(SCRATCH, func + ".recolor.s")
+        open(s_rc, "w", encoding="utf-8").write(recolored)
+        our_rc, err_rc = asmlib.assemble_words(s_rc, func)
+        if not err_rc:
+            our = _strip_trailing_pad(our_rc); src = s_rc
+            r["operand_recolor"] = True
 
     # 1) reg-realloc
     sigma, conflicts = derive_sigma(our, tgt)
