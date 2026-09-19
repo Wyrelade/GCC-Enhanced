@@ -375,6 +375,84 @@ def un_hi_cse_pass(stext, tgt):
 
 
 # --------------------------------------------------------------------------
+# store-side un_hi_cse: the get/set-through-assembler-temp leaf
+# `T f(T a){ T old = G; G = a; return old; }`. Our cc1 CSEs ONE `lui $B,%hi(G)`
+# and shares $B as the base of both the load (`lw $D,%lo(G)($B)`, dest != base)
+# and the store (`sw $src,%lo(G)($B)`). The retail codegen instead (a)
+# materializes the load base==dest (`lui $D,%hi(G); lw $D,%lo(G)($D)`) and (b)
+# rematerializes a SEPARATE `lui $at,%hi(G)` for the store. Plain un_hi_cse
+# handles only the load and would leave the store's base ($B) dangling, so this
+# pass does both together. Count-changing (one net extra `lui`) -> PRE_SIGMA.
+# --------------------------------------------------------------------------
+_SW_LO = re.compile(r"^(\s*)(s[bhw])\s+(\$\d+)\s*,\s*%lo\(([\w.$]+)\)\((\$\d+)\)")
+
+
+def target_store_remat_syms(tgt):
+    """Symbols the target stores through a rematerialized `$at` base: it carries
+    a base==dest `lui;lw` for S AND a `s? R,%lo(S)($at)` store of S."""
+    loads = target_remat_syms(tgt)
+    if not loads:
+        return set()
+    syms = set()
+    sw_re = re.compile(r"s[bhw]\s+\$\w+\s*,\s*%lo\(([\w.$]+)\)\(\$at\)")
+    for _w, dis in tgt:
+        m = sw_re.search(dis)
+        if m and m.group(1) in loads:
+            syms.add(m.group(1))
+    return syms
+
+
+def un_hi_cse_store_s(stext, remat_syms):
+    """Split a shared %hi base that feeds both a load and a store of the same
+    symbol S in `remat_syms`: fold the load to base==dest and give the store its
+    own `lui $at`. Fires only when our source has that exact shared shape. The
+    fresh `lui $at` is hoisted above a leading return, since cc1 often schedules
+    the store into the return's delay slot."""
+    if not remat_syms:
+        return stext
+    lines = stext.split("\n")
+    lui_idx = {}
+    for idx, ln in enumerate(lines):
+        m = _LUI_HI.match(ln)
+        if m and m.group(3) in remat_syms:
+            lui_idx.setdefault(m.group(3), (idx, m.group(2)))
+    out = list(lines)
+    changed = False
+    for sym, (li, base) in lui_idx.items():
+        lw_i = sw_i = None
+        lw_dst = sw_indent = sw_src = None
+        for idx, ln in enumerate(lines):
+            m = _LW_LO.match(ln)
+            if m and m.group(3) == sym and m.group(4) == base and m.group(2) != base:
+                lw_i, lw_dst = idx, m.group(2)
+            m = _SW_LO.match(ln)
+            if m and m.group(4) == sym and m.group(5) == base:
+                sw_i, sw_indent, sw_src = idx, m.group(1) or "\t", m.group(3)
+        if lw_i is None or sw_i is None:
+            continue
+        indent = (_LW_LO.match(lines[lw_i]).group(1) or "\t")
+        out[li] = None
+        out[lw_i] = ("%slui\t%s,%%hi(%s)\n%slw\t%s,%%lo(%s)(%s)"
+                     % (indent, lw_dst, sym, indent, lw_dst, sym, lw_dst))
+        out[sw_i] = "%ssw\t%s,%%lo(%s)($1)" % (sw_indent, sw_src, sym)
+        ins_at = sw_i
+        j = sw_i - 1
+        while j >= 0 and (not _is_insn_line(lines[j])):
+            j -= 1
+        if j >= 0 and _RET_S.match(lines[j]):
+            ins_at = j
+        out[ins_at] = "%slui\t$1,%%hi(%s)\n%s" % (sw_indent, sym, out[ins_at])
+        changed = True
+    if not changed:
+        return stext
+    return "\n".join(l for l in out if l is not None)
+
+
+def un_hi_cse_store_pass(stext, tgt):
+    return un_hi_cse_store_s(stext, target_store_remat_syms(tgt))
+
+
+# --------------------------------------------------------------------------
 # exit-merge: cc1 emits each return as its own `j $31` (with the return value in
 # the delay slot); retail funnels every return through ONE shared `jr $ra` laid
 # last, other paths reaching it by `j <EXIT>`. Rewrite the cc1 source so its
@@ -583,6 +661,7 @@ PASSES = {
     # list in the manifest still names it so the recipe is explicit and auditable.
     "reg_realloc": None,
     "un_hi_cse": un_hi_cse_pass,
+    "un_hi_cse_store": un_hi_cse_store_pass,
     "exit_merge": exit_merge_pass,
     "commutative_swap": commutative_swap_s,
     "operand_recolor": operand_recolor_s,
@@ -593,7 +672,7 @@ PASSES = {
 # (the register correspondence has to be built from count-aligned assembly). Any
 # such pass listed in a recipe is applied ahead of reg_realloc regardless of the
 # manifest order; the rest keep their listed order after sigma.
-PRE_SIGMA_PASSES = ("un_hi_cse", "exit_merge")
+PRE_SIGMA_PASSES = ("un_hi_cse", "un_hi_cse_store", "exit_merge")
 
 # --------------------------------------------------------------------------
 # WORD-LEVEL passes. The original PSY-Q assembler (aspsx) scheduled branch and
