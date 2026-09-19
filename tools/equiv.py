@@ -750,6 +750,118 @@ def _is_nop_insn(ins):
         return True
     return False
 
+def _term_index(insns):
+    ti = None
+    for k, ins in enumerate(insns):
+        if _is_term(ins.mnem):
+            ti = k
+    return ti
+
+_SIDE_EFFECT = set(_STORE) | {"swc2", "swl", "swr", "sc", "cache"}
+def _pure_single_def(ins):
+    """(dst) if `ins` writes exactly one GPR and has no other observable effect
+    (no memory/coprocessor/hi-lo/control), else None. Such an instruction on a path
+    where its dst is dead can be dropped without changing the observable result."""
+    if ins.mnem in _SIDE_EFFECT or ins.mnem in _COND_BR or ins.mnem in _UNCOND:
+        return None
+    if ins.mnem in ("jr", "jal", "jalr", "bal", "bltzal", "bgezal"):
+        return None
+    if ins.mnem in ("mult", "multu", "div", "divu", "mthi", "mtlo"):
+        return None
+    if re.fullmatch(r"[cm]tc[0-9]", ins.mnem):     # coprocessor write
+        return None
+    d, u = defs_uses(ins)
+    if len(d) != 1:
+        return None
+    (dst,) = tuple(d)
+    if dst in ("hi", "lo"):
+        return None
+    return dst
+
+def _copy_insn(ins):
+    c = Insn(ins.mnem, list(ins.ops), ins.raw)
+    c.label = None
+    return c
+
+def _suffix_live_in(insns, start, live_out):
+    """Live-register set entering position `start` of `insns`, given `live_out`."""
+    li = set(live_out)
+    for ins in reversed(insns[start:]):
+        d, u = defs_uses(ins)
+        li -= d
+        li |= u
+    return li
+
+def canonicalize_delays(blocks, succ):
+    """Normalize branch delay-slot placement so two functions that differ only in whether
+    a conditional/unconditional branch FILLS its delay slot (one compiler) or leaves it a
+    nop with the instruction in the successor body (the other) compare as isomorphic.
+
+    Transform (applied identically to BOTH sides): for each cond/uncond branch block whose
+    delay slot holds a real instruction D and ALL of whose successors have it as their sole
+    predecessor, remove D from the branch block and prepend a copy of D to the head of every
+    successor. Then drop any prepended copy whose destination register is DEAD on that
+    successor path (it computed a value used nowhere on that side of the branch).
+
+    Soundness: a delay-slot instruction executes on the path to every successor AFTER the
+    branch condition is evaluated (MIPS reads branch operands at issue, before the delay),
+    so sinking D to each successor head preserves the architectural effect; dropping a copy
+    whose dst is provably dead removes no observable effect. Sinking only into sole-predecessor
+    successors keeps D off any path that did not flow through this branch. Restricting D to a
+    single-GPR-def, side-effect-free instruction keeps the drop safe (stores/calls/cop writes
+    are never sunk-and-dropped). The per-block havoc proof still runs on the rebuilt blocks, so
+    a genuine difference in D or its placement is still caught. No-op when no branch fills its
+    delay, and symmetric, so equal functions stay equal.
+
+    Returns (new_blocks, new_succ) with the SAME edge structure (only block contents change)."""
+    npred = [0] * len(blocks)
+    for i in range(len(blocks)):
+        for s in succ[i]:
+            npred[s] += 1
+    sink = {}          # block i -> (term index, delay insn removed from i)
+    for i, b in enumerate(blocks):
+        if b.kind not in ("cond", "uncond"):
+            continue
+        if not succ[i]:
+            continue
+        ti = _term_index(b.insns)
+        if ti is None or ti + 2 != len(b.insns):   # need exactly one delay insn last
+            continue
+        delay = b.insns[ti + 1]
+        if _is_nop_insn(delay):
+            continue
+        if any(npred[s] != 1 for s in succ[i]):
+            continue
+        sink[i] = (ti, delay)
+    if not sink:
+        return blocks, succ
+    prepend = {j: None for j in range(len(blocks))}
+    for i, (ti, delay) in sink.items():
+        for s in succ[i]:
+            prepend[s] = delay                     # sole-pred -> at most one source
+    new_blocks = []
+    for i, b in enumerate(blocks):
+        body = list(b.insns)
+        if i in sink:
+            ti, _ = sink[i]
+            body = body[:ti + 1]                    # drop the delay from the branch block
+        if prepend[i] is not None:
+            body = [_copy_insn(prepend[i])] + body
+        new_blocks.append(_CBlock(body, b.kind))
+    # DCE: drop a prepended head whose dst is dead on that successor path.
+    lo = liveness(new_blocks, succ, exit_live=None)
+    for i in range(len(new_blocks)):
+        if prepend[i] is None:
+            continue
+        head = new_blocks[i].insns[0]
+        dst = _pure_single_def(head)
+        if dst is None:
+            continue
+        after = _suffix_live_in(new_blocks[i].insns, 1, lo[i])
+        if dst not in after:
+            new_blocks[i].insns = new_blocks[i].insns[1:]   # dead copy -> remove
+    return new_blocks, succ
+
 def canonicalize_exits(blocks, succ):
     """Fold a multi-exit tail into ONE shared `jr $ra` exit so two functions that differ
     only in exit structure (a `jr` per return path vs a single shared `jr` the other paths
@@ -828,7 +940,8 @@ def canonicalize_exits(blocks, succ):
             b.kind = "uncond"
     return new_blocks, new_succ
 
-def check_equiv(fa, fb, live=None, regmap=None, verbose=False, canon_exits=False):
+def check_equiv(fa, fb, live=None, regmap=None, verbose=False, canon_exits=False,
+                canon_delays=False):
     """Prove fa and fb compute the same observable effect. `regmap` (our-reg -> other-reg)
     lets the caller declare a register renaming; default identity. Sound method:
     require isomorphic CFGs, then prove each block pair equivalent from a havoc entry
@@ -837,7 +950,10 @@ def check_equiv(fa, fb, live=None, regmap=None, verbose=False, canon_exits=False
 
     `canon_exits`: when True, fold each side's multi-exit tail into one shared `jr $ra`
     exit before the isomorphism check (see canonicalize_exits), so functions equivalent
-    modulo single-exit/branch-merge structure verify. Default False."""
+    modulo single-exit/branch-merge structure verify. Default False.
+    `canon_delays`: when True, normalize branch delay-slot placement on both sides (see
+    canonicalize_delays) so a filled-vs-nop delay divergence does not spuriously break block
+    correspondence. Default False."""
     reset_globals()
     if regmap is None:
         regmap = {}
@@ -845,6 +961,9 @@ def check_equiv(fa, fb, live=None, regmap=None, verbose=False, canon_exits=False
     bb = build_blocks(fb)
     sa, _ = _succ(ba)
     sb, _ = _succ(bb)
+    if canon_delays:
+        ba, sa = canonicalize_delays(ba, sa)
+        bb, sb = canonicalize_delays(bb, sb)
     if canon_exits:
         ba, sa = canonicalize_exits(ba, sa)
         bb, sb = canonicalize_exits(bb, sb)

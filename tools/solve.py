@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """GCC-Enhanced Phase C: target-guided equivalence solver.
 
-Given our cc1 near-miss and the KNOWN target bytes, search a small set of
+Given the near-miss compiler output and the KNOWN target bytes, search a small set of
 semantics-preserving rewrites until the produced bytes equal the target, each gated by
 the Phase B verifier (equiv.py). This is guided search, not blind permutation: the
 target pins the answer.
@@ -119,8 +119,8 @@ def apply_sigma_to_s(stext, sigma):
 # ---------------------------------------------------------------------------
 # addr-form: split-form (%lo folded into each memory operand) -> la-form
 # (materialize the full address with an addiu, memory operands use 0(base)).
-# Both forms compute the same effective address; retail's private cc1 prefers
-# la-form for some single-symbol globals where our cc1 folds %lo. Target-guided:
+# Both forms compute the same effective address; the target compiler prefers
+# la-form for some single-symbol globals where the near-miss compiler folds %lo. Target-guided:
 # only fold the symbols the TARGET materializes with `addiu R,R,%lo(SYM)`.
 # ---------------------------------------------------------------------------
 def target_laform_syms(tgt):
@@ -181,27 +181,26 @@ def laform_fold_s(stext, syms):
 # ---------------------------------------------------------------------------
 # un-hi-cse: rematerialization of a %hi(SYM) base per access.
 #
-# Some GCC 2.8.x builds CSE the high part of a global address: they hoist ONE
-# `lui $B,%hi(SYM)` and keep $B live, reloading only `lw $D,%lo(SYM)($B)` before
-# each use (the pointer value itself is correctly reloaded; only the %hi
-# immediate is shared). Other private/patched builds do NOT share the %hi: they
-# REMATERIALIZE `lui R,%hi(SYM); lw R,%lo(SYM)(R)` (base == dest == R) fresh
+# Some GCC 2.8.x builds CSEs the high part of a global address: it hoists ONE
+# `lui $B,%hi(SYM)` and keeps $B live, reloading only `lw $D,%lo(SYM)($B)`
+# before each use (the pointer value itself is correctly reloaded; only the
+# %hi immediate is shared). Retail's private cc1 does NOT share the %hi: it
+# REMATERIALIZES `lui R,%hi(SYM); lw R,%lo(SYM)(R)` (base == dest == R) fresh
 # before every access.
 #
 # The transform is target-guided: for each SYM the TARGET remats (an adjacent
-# `lui R,%hi(SYM)` + `lw R,%lo(SYM)(R)` with the same R), delete the hoisted
-# `lui _,%hi(SYM)` lines and re-emit, at the FRONT of each access region (a run
-# of instructions ending in a store), the pair `lui $D,%hi(SYM); lw
-# $D,%lo(SYM)($D)` where $D is that load's own dest register. Placing the pair
-# at the region front lets the unshared %hi land first; the rhs value-compute
-# then falls into the lw->store load-delay slot exactly as the target schedules
-# it (the assembler inserts the load-delay nop where no independent instruction
-# is available). No separate scheduler pass is needed: the schedule divergence
-# is a consequence of the shared hoist, and disappears once it is removed.
+# `lui R,%hi(SYM)` + `lw R,%lo(SYM)(R)` with the same R), delete our hoisted
+# `lui _,%hi(SYM)` lines and re-emit, at the FRONT of each access region, the
+# pair `lui $D,%hi(SYM); lw $D,%lo(SYM)($D)` where $D is that load's own dest
+# register (so the old shared base dies and the naming collapses onto the
+# target's under sigma). Placing the pair at the region front lets the
+# unshared %hi land first; the rhs value-compute then falls into the lw->store
+# load-delay slot exactly as the target schedules it (the assembler inserts the
+# load-delay nop where no independent instruction is available).
 #
-# Legality is NOT assumed: the equivalence gate proves the ORIGINAL cc1 function
+# Legality is NOT assumed here: the equiv gate proves our ORIGINAL cc1 function
 # equivalent to the target. A pointer reload that an intervening aliasing store
-# could invalidate fails that proof rather than faking a match.
+# could invalidate would fail that proof rather than fake a match.
 # ---------------------------------------------------------------------------
 _STORE_MNEMS = {"sb", "sh", "sw", "swl", "swr", "swc1", "swc2", "sc1"}
 _LUI_HI = re.compile(r"^(\s*)lui\s+(\$\d+)\s*,\s*%hi\(([\w.$]+)\)")
@@ -239,9 +238,24 @@ def un_hi_cse_s(stext, remat_syms):
     if not remat_syms:
         return stext
     lines = stext.split("\n")
+    # Only un-CSE a symbol whose %hi the near-miss compiler actually HOISTED away from its load: a
+    # `lw $D,%lo(sym)($B)` whose base $B differs from its dest $D (the hoisted shared base).
+    # When the near-miss compiler already emits `lw $D,%lo(sym)($D)` (base == dest, the lui adjacent), the
+    # load is already in the rematerialized form -- undoing it would only duplicate the pair and
+    # corrupt the schedule (this bit func_8003ABC8, whose single-use globals the target also
+    # loads base == dest).
+    hoisted = set()
+    for l in lines:
+        m = _LW_LO.match(l)
+        if m and m.group(3) in remat_syms and m.group(2) != m.group(4):   # dest != base
+            hoisted.add(m.group(3))
+    remat_syms = hoisted
+    if not remat_syms:
+        return stext
+    # region id per instruction line (region increments AFTER a store)
     region_of = {}
     reg = 0
-    first_insn_line = {}
+    first_insn_line = {}   # region -> first original line index carrying an instruction
     saw_remat = False
     for idx, ln in enumerate(lines):
         if not _is_insn_line(ln):
@@ -255,6 +269,7 @@ def un_hi_cse_s(stext, remat_syms):
             reg += 1
     if not saw_remat:
         return stext
+    # per-region insertion list, built from the remat lw's in original order
     inserts = {}
     delete = set()
     for idx, ln in enumerate(lines):
@@ -262,7 +277,7 @@ def un_hi_cse_s(stext, remat_syms):
             continue
         mlui = _LUI_HI.match(ln)
         if mlui and mlui.group(3) in remat_syms:
-            delete.add(idx)
+            delete.add(idx)                       # drop the shared/old %hi materialization
             continue
         mlw = _LW_LO.match(ln)
         if mlw and mlw.group(3) in remat_syms:
@@ -271,7 +286,8 @@ def un_hi_cse_s(stext, remat_syms):
             inserts.setdefault(r, []).append(
                 ["%slui\t%s,%%hi(%s)" % (indent, dst, sym),
                  "%slw\t%s,%%lo(%s)(%s)" % (indent, dst, sym, dst)])
-            delete.add(idx)
+            delete.add(idx)                       # remove the original lo-load in place
+    # emit
     out = []
     emitted_region = set()
     for idx, ln in enumerate(lines):
@@ -286,7 +302,106 @@ def un_hi_cse_s(stext, remat_syms):
     return "\n".join(out)
 
 # ---------------------------------------------------------------------------
-# delay-slot fill POST pass (rule-general)
+# exit-merge: fold multiple `j $31` returns into one shared `jr $ra` exit.
+#
+# cc1 emits each return of a leaf/branch function as its own `j $31` (assembled to
+# `jr $ra`) with the return value in the delay slot; the target funnels every return
+# through ONE shared `jr $ra` laid last, the other paths reaching it by `j <EXIT>`.
+# Rewrite the cc1 gas .s: the LAST return in layout drops its `j $31` (its delay value
+# becomes a plain body insn that falls into the shared exit); every earlier return's
+# `j $31` becomes `j <EXIT>` keeping its delay; append `<EXIT>: j $31 / nop` last.
+#
+# Semantics-preserving (a jr delay always runs before return either way) -- proven by
+# equiv.canonicalize_exits and, ultimately, by hitting the known target bytes. Fires
+# only when target-guided detection says the target is single-exit and ours is not.
+# ---------------------------------------------------------------------------
+_EXIT_LABEL = "$Lgcce_exit"
+_RET_S = re.compile(r"^\s*(?:j\s+\$31|jr\s+\$(?:31|ra))\b")
+def _s_is_label(l):
+    s = l.strip()
+    return s.endswith(":") and not s.startswith(".")
+def _s_is_insn(l):
+    s = l.strip()
+    return bool(s) and not s.startswith("#") and not s.startswith(".") \
+        and not s.endswith(":") and bool(re.match(r"[a-z]", s))
+def _s_mnem(l):
+    return l.strip().split(None, 1)[0].lower()
+def _s_is_return(l):
+    return bool(_RET_S.match(l))
+
+def merge_exits_s(stext):
+    """Fold cc1's multi `j $31` returns into one shared exit. Returns (text, n_returns)."""
+    lines = stext.split("\n")
+    rets = [i for i, l in enumerate(lines) if _s_is_return(l)]
+    if len(rets) < 2:
+        return stext, len(rets)
+    last_i = rets[-1]
+    out = []
+    for i, l in enumerate(lines):
+        if i == last_i:
+            continue                       # drop the last return's `j $31` (keep its delay)
+        if _s_is_return(l):
+            out.append(re.sub(r"(?:j|jr)\s+\$(?:31|ra)\b", "j\t%s" % _EXIT_LABEL, l, count=1))
+        else:
+            out.append(l)
+    ins = len(out)
+    for k in range(len(out) - 1, -1, -1):
+        if out[k].strip().startswith(".end"):
+            ins = k; break
+    exitblk = ["%s:" % _EXIT_LABEL, "\t.set\tnoreorder", "\t.set\tnomacro",
+               "\tj\t$31", "\tnop", "\t.set\tmacro", "\t.set\treorder"]
+    out = out[:ins] + exitblk + out[ins:]
+    return "\n".join(out), len(rets)
+
+# cond-branch delay unfill (target-guided): where the target's k-th conditional branch
+# has a nop delay but the near-miss compiler filled it, move our fill instruction out to just after the
+# branch's noreorder block and restore the nop, so the delay-slot placement matches.
+_COND_S = re.compile(r"^(beq|bne|blez|bgtz|bltz|bgez|beqz|bnez)\b")
+def _target_cond_delay_nop(tgt):
+    res = []
+    for i, (_, dis) in enumerate(tgt):
+        if _COND_S.match(dis.split(None, 1)[0].lower()):
+            nxt = tgt[i + 1][1] if i + 1 < len(tgt) else ""
+            res.append(nxt.strip() in ("nop", "sll zero,zero,0", "sll zero,zero,0x0"))
+    return res
+
+def unfill_cond_delay_s(stext, tgt):
+    want_nop = _target_cond_delay_nop(tgt)
+    lines = stext.split("\n")
+    result, idx, k = [], 0, -1
+    while idx < len(lines):
+        l = lines[idx]
+        if _s_is_insn(l) and _COND_S.match(_s_mnem(l)):
+            k += 1
+            d = idx + 1
+            while d < len(lines) and not _s_is_insn(lines[d]):
+                if _s_is_label(lines[d]):
+                    d = None; break
+                d += 1
+            filled = d is not None and lines[d].strip() not in (
+                "nop", "sll zero,zero,0", "sll zero,zero,0x0")
+            if filled and k < len(want_nop) and want_nop[k]:
+                result.append(l)
+                indent = re.match(r"^(\s*)", lines[d]).group(1)
+                displaced = lines[d]
+                for m in range(idx + 1, d):
+                    result.append(lines[m])
+                result.append("%snop" % indent)
+                m = d + 1
+                tail = []
+                while m < len(lines) and lines[m].strip() in (
+                        ".set\tmacro", ".set macro", ".set\treorder", ".set reorder"):
+                    tail.append(lines[m]); m += 1
+                result.extend(tail)
+                result.append(displaced)
+                idx = m
+                continue
+        result.append(l)
+        idx += 1
+    return "\n".join(result)
+
+# ---------------------------------------------------------------------------
+# delay-slot fill POST pass (rule-general, target-guided)
 # ---------------------------------------------------------------------------
 _BRANCHY = re.compile(r"^(b|j|jr|jal|beq|bne|blez|bgtz|bltz|bgez|beqz|bnez)")
 def is_branch(disasm):
@@ -294,28 +409,42 @@ def is_branch(disasm):
 def is_nop(disasm):
     return disasm.strip() in ("nop", "sll zero,zero,0", "sll zero,zero,0x0")
 
-def delay_fill(words):
+def _target_branch_filled(tgt):
+    """For each control-flow instruction in the target (in order), whether its delay slot
+    holds a real instruction (True) or a nop (False). Used to keep delay_fill from filling
+    a slot the target leaves empty (e.g. one we deliberately unfilled)."""
+    res = []
+    for i, (_, dis) in enumerate(tgt):
+        if is_branch(dis):
+            nxt = tgt[i + 1][1] if i + 1 < len(tgt) else ""
+            res.append(bool(nxt.strip()) and not is_nop(nxt))   # no trailing word == nop slot
+    return res
+
+def delay_fill(words, tgt=None):
     """Fill a branch/jr delay slot (currently nop) with the immediately-preceding
     independent instruction, dropping the nop. Only moves an instruction that neither
     writes a register the branch reads nor is itself control flow -- the exact SN aspsx
-    schedule. Returns a new word list (possibly shorter)."""
+    schedule. When `tgt` is given, fill the k-th branch's slot only if the target's k-th
+    branch is itself filled (so an intentionally-empty slot is left as-is). Returns a new
+    word list (possibly shorter)."""
+    want = _target_branch_filled(tgt) if tgt is not None else None
     out = list(words)
     i = 0
+    k = -1
     while i < len(out) - 1:
         dis = out[i][1]
-        if is_branch(dis) and is_nop(out[i + 1][1]) and i >= 1:
-            prev = out[i - 1]
-            if not is_branch(prev[1]) and not is_nop(prev[1]):
-                # independence: branch must not read prev's destination register
-                pm, pr, ps = insn_parts(prev[1])
-                pdef = E.defs_uses(_mk_insn(prev[1]))[0]
-                bruse = E.defs_uses(_mk_insn(dis))[1]
-                if not (pdef & bruse):
-                    # move prev into the delay slot: [..., prev, br, nop] -> [..., br, prev]
-                    out[i - 1], out[i] = out[i], prev      # swap br above prev
-                    del out[i + 1]                          # drop the nop
-                    i += 1
-                    continue
+        if is_branch(dis):
+            k += 1
+            if is_nop(out[i + 1][1]) and i >= 1 and (want is None or (k < len(want) and want[k])):
+                prev = out[i - 1]
+                if not is_branch(prev[1]) and not is_nop(prev[1]):
+                    pdef = E.defs_uses(_mk_insn(prev[1]))[0]
+                    bruse = E.defs_uses(_mk_insn(dis))[1]
+                    if not (pdef & bruse):
+                        out[i - 1], out[i] = out[i], prev      # swap br above prev
+                        del out[i + 1]                          # drop the nop
+                        i += 1
+                        continue
         i += 1
     return out
 
@@ -333,6 +462,46 @@ def func_from_words(name, words):
     for _, dis in words:
         insns.append(_mk_insn(dis))
     return E.Func(name, insns, [])
+
+# objdump prints a branch/jump destination as a section address plus an auto-label
+# (`beq $a1,$v0,30 <LM8>`, `j 34 <LM9>`), never the source's `.L` labels. To hand
+# equiv.py a CFG with correct edges, resolve each such address to the instruction
+# index it lands on and give both the branch operand and the target instruction a
+# synthetic `.Lt<idx>` label. jr/jalr carry a register, not an address: no target.
+_OBJ_TGT = re.compile(r",?\s*([0-9a-fA-F]+)\s+<[^>]*>\s*$")
+def _branch_target_addr(dis):
+    p = dis.split(None, 1)
+    if not p:
+        return None
+    mn = p[0].lower()
+    if mn in ("jr", "jalr") or not is_branch(dis):
+        return None
+    if mn.startswith("jal"):        # a real call (jal sym): not an intra-function edge
+        if "<" in dis and re.search(r"<[A-Za-z_.$]", dis) and "+" not in dis:
+            # jal to a named function, not a local offset -> leave as call, no edge
+            return None
+    m = _OBJ_TGT.search(dis)
+    return int(m.group(1), 16) if m else None
+
+def func_from_reloc(name, triples):
+    """Build an equiv.Func from [(addr, be, disasm)] with intra-function branch edges
+    resolved to synthetic `.Lt<idx>` labels (see _branch_target_addr)."""
+    addr2idx = {a: i for i, (a, _, _) in enumerate(triples)}
+    tgt_idx = set()
+    for _, _, dis in triples:
+        off = _branch_target_addr(dis)
+        if off is not None and off in addr2idx:
+            tgt_idx.add(addr2idx[off])
+    lab_of = {i: ".Lt%d" % i for i in tgt_idx}
+    insns = []
+    for i, (_, _, dis) in enumerate(triples):
+        off = _branch_target_addr(dis)
+        ins = _mk_insn(dis)
+        if off is not None and off in addr2idx:
+            ins.ops = ins.ops[:-1] + [lab_of[addr2idx[off]]]   # objdump addr -> label
+        ins.label = lab_of.get(i)
+        insns.append(ins)
+    return E.Func(name, insns, [lab_of[i] for i in sorted(lab_of)])
 
 # ---------------------------------------------------------------------------
 # compare helper
@@ -388,7 +557,7 @@ def solve_one(cfile, func, retty="void"):
     src = s0
 
     # 0a) un-hi-cse: rematerialize the %hi base of each global the target remats,
-    # so the count of address-materialization insns aligns with the target before
+    # so our count of address-materialization insns aligns with the target before
     # sigma. Runs first because it changes instruction counts (adds a lui per use,
     # drops the shared hoist).
     remat = target_remat_syms(tgt)
@@ -418,6 +587,26 @@ def solve_one(cfile, func, retty="void"):
                 our = _strip_trailing_pad(our2); src = s_la
                 r["addr_form"] = sorted(la_syms)
 
+    # 0c) exit-merge + cond-delay-unfill: when the target funnels every return through
+    # ONE shared `jr $ra` while the near-miss compiler emits a `jr` per return path, fold our returns into
+    # that funnel form (merge_exits_s) and unfill any conditional-branch delay the target
+    # leaves as nop (unfill_cond_delay_s). Target-guided: only when target is single-exit
+    # and ours is not. Runs on the .s before sigma so the reassembled words align to target.
+    n_ret_tgt = _count_returns(tgt)
+    n_ret_our = _count_returns(our)
+    canon = n_ret_tgt == 1 and n_ret_our > 1
+    r["exit_merge"] = canon
+    if canon:
+        stext_e = open(src, encoding="utf-8", errors="replace").read()
+        stext_e = unfill_cond_delay_s(stext_e, tgt)
+        merged, nret = merge_exits_s(stext_e)
+        if merged != open(src, encoding="utf-8", errors="replace").read():
+            s_ex = os.path.join(SCRATCH, func + ".exit.s")
+            open(s_ex, "w", encoding="utf-8").write(merged)
+            our_ex, err_ex = asmlib.assemble_words(s_ex, func)
+            if not err_ex:
+                our = _strip_trailing_pad(our_ex); src = s_ex
+
     # 1) reg-realloc
     sigma, conflicts = derive_sigma(our, tgt)
     r["sigma"] = sigma; r["conflicts"] = conflicts
@@ -429,18 +618,27 @@ def solve_one(cfile, func, retty="void"):
     if err:
         r["status"] = "error"; r["error"] = err; return r
 
-    # 2) delay-slot fill POST pass (needs the nop still present)
-    final = _strip_trailing_pad(delay_fill(renamed))
+    # 2) delay-slot fill POST pass (needs the nop still present); target-guided so it never
+    # re-fills a slot we intentionally unfilled for the exit-merge.
+    final = _strip_trailing_pad(delay_fill(renamed, tgt))
     match_ok, rows = cmp_words(tgt, final)
     r["bytes_ok"] = match_ok; r["rows"] = rows
 
-    # equivalence gate
-    our_sym, err = asmlib.assemble_words_reloc(s0, func)
+    # equivalence gate. Build our side from reloc'd objdump WITH resolved branch edges
+    # (func_from_reloc) so a branchy function's CFG is well-formed. canon_exits folds the
+    # single-exit tail; canon_delays normalizes branch-delay placement so a filled-vs-nop
+    # delay divergence in the body does not spuriously break block correspondence. Both are
+    # semantics-preserving and applied identically to each side (see equiv.py); enabled
+    # target-guided (only the exit-merge case) so same-shape functions keep the exact CFG.
+    trip, err = asmlib.assemble_reloc_addr(s0, func)
     if err:
         r["status"] = "error"; r["error"] = err; return r
-    fa = func_from_words(func, _strip_trailing_pad(our_sym))
+    while trip and trip[-1][2].strip() == "nop":     # triple = (addr, be, disasm)
+        trip = trip[:-1]
+    fa = func_from_reloc(func, trip)
     fb = E.parse_s(os.path.join(asmlib.TARGET_DIR, func + ".s"), func)
-    res = E.check_equiv(fa, fb, live=live, regmap=sigma)
+    res = E.check_equiv(fa, fb, live=live, regmap=sigma,
+                        canon_exits=canon, canon_delays=canon)
     r["equiv_ok"] = res.equal
     r["equiv_reason"] = res.reason
 
@@ -486,6 +684,15 @@ def _strip_trailing_pad(words):
     while words and words[-1][1].strip() == "nop":
         words = words[:-1]
     return words
+
+def _count_returns(words):
+    """Number of `jr $ra` (return) instructions in a word list."""
+    n = 0
+    for _, dis in words:
+        p = dis.split(None, 1)
+        if p[0].lower() == "jr" and len(p) > 1 and E.norm_reg(p[1].strip()) == "ra":
+            n += 1
+    return n
 
 if __name__ == "__main__":
     main()

@@ -132,6 +132,48 @@ def assemble_words_reloc(sfile, fn):
             last = len(out) - 1
     return out, None
 
+def assemble_reloc_addr(sfile, fn):
+    """Like assemble_words_reloc but keeps each instruction's section address, returning
+    [(addr_int, be_hex, disasm)]. The address lets a caller resolve objdump's numeric branch
+    targets (`beq ..,30 <LM8>`) back to instruction indices and rebuild a CFG with correct
+    edges -- objdump emits branch destinations as addresses/auto-labels, not the source's `.L`
+    labels, so an equivalence checker's label-based successor resolution needs them mapped."""
+    obj = sfile + ".o"
+    rc, o, e = run(_maspsx_cmd(sfile, obj))
+    if rc:
+        return None, "MASPSX:\n" + o + e
+    rc, o, e = run([OBJDUMP, "-dr", obj])
+    if rc:
+        return None, "OBJDUMP:\n" + o + e
+    out, in_fn, last = [], False, None
+    for line in o.splitlines():
+        if re.match(r'^[0-9a-f]+ <%s>:' % re.escape(fn), line):
+            in_fn = True
+            continue
+        if not in_fn:
+            continue
+        m2 = re.match(r'^[0-9a-f]+ <([A-Za-z_.$][\w.$]*)>:', line)
+        if m2 and m2.group(1) != fn and not re.match(r'^(L|\.L|LM|\$L)', m2.group(1)):
+            break
+        rm = re.search(r'R_MIPS_(HI16|LO16)\s+(\S+)', line)
+        if rm and last is not None:
+            kind = "%hi" if rm.group(1) == "HI16" else "%lo"
+            sym = rm.group(2)
+            addr, be, dis = out[last]
+            relop = "%s(%s)" % (kind, sym)
+            if "(" in dis.split(",")[-1]:
+                dis = re.sub(r"(,\s*)-?(?:0x)?[0-9a-f]+(\()", r"\1%s\2" % relop, dis, count=1)
+            else:
+                dis = re.sub(r",\s*-?(?:0x)?[0-9a-f]+\s*$", "," + relop, dis)
+            out[last] = (addr, be, dis)
+            continue
+        m = re.match(r'^\s*([0-9a-f]+):\s+([0-9a-f]{8})\s+(.*)', line)
+        if m:
+            out.append((int(m.group(1), 16), m.group(2).lower(), m.group(3).strip()))
+            last = len(out) - 1
+    return out, None
+
+
 def target_words(fn):
     """splat-style target .s -> [(be_hex, disasm)] (little-endian column converted to BE).
     Expects lines of the form `/* off addr <le_bytes> */  mnem operands` between

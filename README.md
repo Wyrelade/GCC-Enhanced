@@ -102,12 +102,20 @@ study, but the method is general to any PSX-era GCC 2.x matching decomp.
   state, branch and load-delay ordering. Splits each function into basic blocks, requires the
   two control-flow graphs isomorphic, then proves each block pair equivalent from a havoc entry
   state over that block's live-out set. Handles register renaming (via a supplied correspondence
-  map), dead-temp differences, and loops without unrolling. Unmodelled instructions become
-  uninterpreted functions of their operands, so it can never prove equivalence across a genuine
-  change. Run `equiv.py a.s b.s` for a pair or `equiv.py --selftest DIR` for the corpus test.
+  map), dead-temp differences, and loops without unrolling. Two optional, semantics-preserving
+  CFG canonicalizations let functions that differ only in tail or scheduling structure still
+  verify: `canonicalize_exits` folds a multi-exit tail into one shared `jr $ra`, and
+  `canonicalize_delays` normalizes branch delay-slot placement (sink each branch's delay
+  instruction into its sole-predecessor successors, then drop copies proven dead). Both are
+  applied identically to both sides and validated to keep the full corpus self-test green.
+  Unmodelled instructions become uninterpreted functions of their operands, so it can never
+  prove equivalence across a genuine change. Run `equiv.py a.s b.s` for a pair or
+  `equiv.py --selftest DIR` for the corpus test.
 - `tools/solve.py` - Phase C target-guided solver. Derives the register correspondence from the
   known target, applies it to the cc1 assembly, rebuilds through maspsx and the assembler, runs
-  the delay-slot-fill pass, compares to the target bytes, and gates the result on `equiv.py`.
+  the address-form, un-hi-cse, exit-merge, delay-unfill and delay-slot-fill passes (each fired
+  target-guided), compares to the target bytes, and gates the result on `equiv.py`. Builds the
+  gate's control-flow graph from resolved branch addresses so branchy functions verify correctly.
 - `tools/batch.py` - batch driver over the solver. Takes a JSON job list or a directory of
   `f<FUNC>.c` stubs, reports verified / bytes-only / not-solved / error per function, and writes
   the verified wins to `solved_manifest.json`. A bytes-only result forces a nonzero exit so a
