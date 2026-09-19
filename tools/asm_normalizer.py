@@ -613,7 +613,8 @@ PRE_SIGMA_PASSES = ("un_hi_cse", "exit_merge")
 # under `.set noreorder` (one instruction per line, verbatim source) to stop the
 # assembler re-scheduling it. padnop needs neither (a trailing nop cannot be
 # rescheduled).
-WORD_PASSES = ("delay_fill", "epilogue_unfill", "reorder_indep", "padnop")
+WORD_PASSES = ("delay_fill", "epilogue_unfill", "reorder_indep", "padnop",
+               "prologue_save_hoist")
 
 # minimal register def/use for the delay_fill dependency guard (gas `$reg` syntax)
 _STORE_MN = {"sb", "sh", "sw", "swl", "swr", "swc1", "swc2", "sd", "sdc1", "sdc2"}
@@ -960,6 +961,34 @@ def _pure_alu(disasm):
     return bool(p) and p[0].lower() in _PURE_ALU
 
 
+def _frame_store(disasm):
+    """A store whose base register is the stack pointer, e.g. `sw $ra,0x10($sp)`.
+    Such a store touches only the current frame; swapping it past a pure-ALU insn
+    (which has no memory effect) can never alias, so the pair is safe to reorder
+    when register-independent. Retail's cc1 emits the prologue register-save store
+    right after the `addiu $sp` allocation, before evaluating call arguments; our
+    cc1 interleaves the arg setup ahead of the save, so this lets reorder_indep
+    hoist the save back to the target's position."""
+    p = disasm.split(None, 1)
+    if not p or p[0].lower() not in _STORE_MN or len(p) < 2:
+        return False
+    ops = split_ops(p[1])
+    if not ops:
+        return False
+    mm = re.fullmatch(r".*\((\$?\w+)\)", ops[-1].strip())
+    return bool(mm) and _reg(mm.group(1)) == "sp"
+
+
+def _reorder_swappable(a, b):
+    """True when adjacent instructions a,b may be transposed on aliasing grounds
+    (register-independence is checked separately). Two pure-ALU insns qualify (no
+    memory, no control flow); so does a frame store paired with a pure-ALU insn."""
+    pa, pb = _pure_alu(a), _pure_alu(b)
+    if pa and pb:
+        return True
+    return (pa and _frame_store(b)) or (pb and _frame_store(a))
+
+
 def _word_eq(our_w, tgt_w, tgt_dis):
     """Words equal, tolerating a relocated low-16 immediate: when the target insn
     carries a `%hi`/`%lo`/`%gp_rel` relocation its low half is symbol-dependent
@@ -971,18 +1000,37 @@ def _word_eq(our_w, tgt_w, tgt_dis):
     return False
 
 
+def _indep(a, b):
+    """Two instructions have no register data dependency in either direction and do
+    not both write the same register, so their relative order does not affect
+    results."""
+    ad, au = defs_uses(a)
+    bd, bu = defs_uses(b)
+    return not ((ad & bu) or (bd & au) or (ad & bd))
+
+
 def reorder_indep_src(span, tgt, our_words):
-    """Swap adjacent independent pure-ALU instructions to match the target's
-    schedule. Retail's cc1 sometimes emits two data-independent register ops (e.g.
-    an immediate load and a `lui` address setup) in the opposite order to ours;
-    swapping them is semantics-preserving. Target-guided: reorder only so our
-    assembled word stream lines up with the target, and only across a run where a
-    single adjacent transposition per step is enough. Requires a 1:1 source-insn to
-    word mapping (no macro expansion in the span) and register-independence of every
-    swapped pair. Returns (new_span, fired)."""
-    if len(our_words) != len(tgt):
-        return span, False
-    n = len(tgt)
+    """Reorder independent instructions to match the target's schedule. Retail's cc1
+    sometimes emits data-independent instructions in a different order to ours -- an
+    immediate load and a `lui` address setup transposed, or (the common wrapper case)
+    the prologue register-save `sw $ra,K($sp)` scheduled ahead of the call-argument
+    setup where our cc1 interleaves it later. Relocating one instruction across a run
+    of others it is independent of and cannot alias is semantics-preserving.
+
+    Target-guided and left-to-right: at the first position whose assembled word does
+    not match the target, find the later instruction that belongs there and move it
+    up, provided every instruction it passes is pairwise reorderable (`_reorder_swappable`
+    -- pure-ALU pairs, or a frame store paired with pure-ALU) and register-independent
+    of it. One instruction relocated per step (a single adjacent swap is the length-1
+    case). Stops at the first position it cannot resolve so a later pass (e.g.
+    epilogue_unfill) owns the tail. Requires a 1:1 source-insn to word mapping (no
+    macro expansion). The touched positions are wrapped in `.set noreorder` so the
+    assembler keeps the schedule. Returns (new_span, fired).
+
+    Our and target word counts may differ (e.g. our epilogue is still delay-filled
+    while the target's is not); this pass only aligns the common prefix and stops at
+    the first position it cannot resolve, leaving the tail to epilogue_unfill."""
+    n = len(our_words)
     lines = span.split("\n")
     ins = [(i, l) for i, l in enumerate(lines) if _s_is_insn(l)]
     if len(ins) != n:                       # macro expansion -> mapping unsafe
@@ -991,25 +1039,27 @@ def reorder_indep_src(span, tgt, our_words):
     order = list(range(n))                  # order[p] = original source index at p
     swapped = set()
     pos = 0
-    while pos < n - 1:
+    while pos < n - 1 and pos < len(tgt):
         if _word_eq(ow[pos][0], tgt[pos][0], tgt[pos][1]):
             pos += 1
             continue
-        if (_word_eq(ow[pos + 1][0], tgt[pos][0], tgt[pos][1])
-                and _word_eq(ow[pos][0], tgt[pos + 1][0], tgt[pos + 1][1])):
-            a, b = ow[pos][1], ow[pos + 1][1]
-            if not (_pure_alu(a) and _pure_alu(b)):
-                return span, False
-            ad, au = defs_uses(a)
-            bd, bu = defs_uses(b)
-            if (ad & bu) or (bd & au) or (ad & bd):
-                return span, False          # data dependency: not swappable
-            ow[pos], ow[pos + 1] = ow[pos + 1], ow[pos]
-            order[pos], order[pos + 1] = order[pos + 1], order[pos]
-            swapped |= {pos, pos + 1}
-            pos += 2
-            continue
-        return span, False                  # not a single-adjacent-swap fix
+        # find the instruction that belongs at `pos` further down the stream
+        j = None
+        for k in range(pos + 1, n):
+            if _word_eq(ow[k][0], tgt[pos][0], tgt[pos][1]):
+                j = k
+                break
+        if j is None:
+            break                           # word not produced by a mere reorder
+        mover = ow[j][1]
+        # every instruction the mover hops over must be safe + independent
+        if not all(_reorder_swappable(mover, ow[k][1]) and _indep(mover, ow[k][1])
+                   for k in range(pos, j)):
+            break
+        ow.insert(pos, ow.pop(j))
+        order.insert(pos, order.pop(j))
+        swapped |= set(range(pos, j + 1))
+        pos += 1
     if not swapped:
         return span, False
     final = [ins[order[p]][1].strip() for p in range(n)]
@@ -1029,10 +1079,79 @@ def reorder_indep_src(span, tgt, our_words):
     return "\n".join(out), True
 
 
+def _src_ra_save_idx(ins):
+    """Index in the source insn list of the prologue `sw $ra,K($sp)` register-save,
+    or None."""
+    for p, l in enumerate(ins):
+        m = re.match(r"\s*sw\s+(\$\w+)\s*,\s*-?(?:0x)?[0-9a-fA-F]+\((\$\w+)\)\s*$", l)
+        if m and _src_reg(m.group(1)) == "ra" and _src_reg(m.group(2)) == "sp":
+            return p
+    return None
+
+
+def _tgt_ra_save_idx(tgt):
+    """Index in the target word stream of the `sw $ra,...($sp)` register-save, or
+    None."""
+    for i, (_w, dis) in enumerate(tgt):
+        p = dis.split(None, 1)
+        if not p or p[0].lower() != "sw":
+            continue
+        d, u = defs_uses(dis)
+        if "ra" in u and "sp" in u:
+            return i
+    return None
+
+
+def prologue_save_hoist_src(span, tgt):
+    """Hoist the prologue register-save `sw $ra,K($sp)` up to the position the target
+    puts it (immediately after the stack allocation). Retail's cc1 emits the save right
+    after the `addiu/subu $sp` allocation, before evaluating the call arguments; our cc1
+    schedules the argument setup first and saves `$ra` later. Moving the save earlier is
+    semantics-preserving: it stores to the freshly allocated frame and the instructions
+    it passes are register-independent of it and never touch memory (a frame store can
+    only alias another memory op, and there are none between). The moved region is
+    wrapped in `.set noreorder`. Target-guided: fires only when the target actually
+    places the save earlier than we do, and only across hop-safe independent insns.
+    Word-level 1:1 mapping is NOT required (unlike reorder_indep), so it is robust to
+    the load-delay nops maspsx inserts later in the body. Returns (new_span, fired)."""
+    desired = _tgt_ra_save_idx(tgt)
+    if desired is None:
+        return span, False
+    lines = span.split("\n")
+    idxs = [i for i, l in enumerate(lines) if _s_is_insn(l)]
+    ins = [lines[i] for i in idxs]
+    s_ra = _src_ra_save_idx(ins)
+    if s_ra is None or desired >= s_ra:
+        return span, False
+    mover = ins[s_ra].strip()
+    for k in range(desired, s_ra):
+        if not (_reorder_swappable(mover, ins[k].strip()) and _indep(mover, ins[k].strip())):
+            return span, False
+    # rebuild the insn order with the save relocated to `desired`
+    new_ins = list(ins)
+    new_ins.insert(desired, new_ins.pop(s_ra))
+    reordered = set(range(desired, s_ra + 1))
+    out = []
+    ip = 0
+    for i, l in enumerate(lines):
+        if i in idxs:
+            indent = _src_indent(l)
+            if ip in reordered and (ip - 1) not in reordered:
+                out.append(indent + ".set\tnoreorder")
+            out.append(indent + new_ins[ip].strip())
+            if ip in reordered and (ip + 1) not in reordered:
+                out.append(indent + ".set\treorder")
+            ip += 1
+        else:
+            out.append(l)
+    return "\n".join(out), True
+
+
 _REORDER_SRC = {
     "epilogue_unfill": epilogue_unfill_src,
     "delay_fill": delay_fill_src,
     "reorder_indep": reorder_indep_src,
+    "prologue_save_hoist": prologue_save_hoist_src,
 }
 
 
@@ -1273,7 +1392,8 @@ def normalize_s(s_file, ctx, manifest=None):
             if name not in word_funcs:
                 continue
             reorder = [p for p in manifest[name]["passes"]
-                       if p in ("delay_fill", "epilogue_unfill", "reorder_indep")]
+                       if p in ("delay_fill", "epilogue_unfill", "reorder_indep",
+                                "prologue_save_hoist")]
             if not reorder:
                 continue
             our, err = assemble_words(ctx, s_file, name)
