@@ -281,6 +281,247 @@ PASSES = {
     "laform": laform_fold_pass,
 }
 
+# --------------------------------------------------------------------------
+# WORD-LEVEL passes. The original PSY-Q assembler (aspsx) scheduled branch and
+# load delay slots in ways modern GNU as does not reproduce, so a few classes
+# cannot be expressed by a register/operand text rewrite alone: the same source
+# assembles to a differently-scheduled word stream. These passes decide the fix
+# on the ASSEMBLED words (guided by the retail target) and re-emit the source so
+# the assembler keeps the schedule we chose:
+#   * padnop           -- append the trailing section-alignment nop(s) the retail
+#                         object carried after the function but the C compile omits
+#                         (pure text append; the count comes from the target file).
+#   * delay_fill       -- move the instruction before a branch/jr into its (nop)
+#                         delay slot, matching aspsx's fill (target-guided).
+#   * epilogue_unfill  -- move the stack-dealloc out of the jr delay slot to just
+#                         before the jr, restoring an empty slot (target-guided).
+# delay_fill / epilogue_unfill reorder instructions, so their span is re-emitted
+# under `.set noreorder` (one instruction per line, verbatim source) to stop the
+# assembler re-scheduling it. padnop needs neither (a trailing nop cannot be
+# rescheduled).
+WORD_PASSES = ("delay_fill", "epilogue_unfill", "padnop")
+
+# minimal register def/use for the delay_fill dependency guard (gas `$reg` syntax)
+_STORE_MN = {"sb", "sh", "sw", "swl", "swr", "swc1", "swc2", "sd", "sdc1", "sdc2"}
+_COND_BR_MN = {"beq", "bne", "blez", "bgtz", "bltz", "bgez", "beqz", "bnez",
+               "bgtzl", "blezl", "bltzl", "bgezl", "beql", "bnel"}
+_UNCOND_MN = {"b", "j"}
+_CALL_CLOBBER = {"v0", "v1", "a0", "a1", "a2", "a3", "t0", "t1", "t2", "t3",
+                 "t4", "t5", "t6", "t7", "t8", "t9", "ra", "at", "hi", "lo"}
+
+
+def _reg(tok):
+    r = norm_reg(tok)
+    return r if r and r != "zero" else None
+
+
+def defs_uses(disasm):
+    """(defs, uses) register sets for one instruction's disassembly. Conservative:
+    only what delay_fill needs (does the moved insn write a register the branch
+    reads). Base register of a `off($b)` memory operand counts as a use."""
+    p = disasm.split(None, 1)
+    if not p:
+        return set(), set()
+    op = p[0].lower()
+    ops = split_ops(p[1]) if len(p) > 1 else []
+    defs, uses = set(), set()
+
+    def use(tok):
+        r = _reg(tok)
+        if r:
+            uses.add(r)
+        mm = re.fullmatch(r"(.*)\((\$?\w+)\)", tok.strip())
+        if mm:
+            r2 = _reg(mm.group(2))
+            if r2:
+                uses.add(r2)
+
+    if op in ("jal", "bal", "jalr", "bltzal", "bgezal"):
+        defs |= set(_CALL_CLOBBER)
+        uses |= {"a0", "a1", "a2", "a3"}
+        if op == "jalr" and ops:
+            use(ops[-1])
+        return defs, uses
+    if op in ("mult", "multu", "div", "divu"):
+        for t in ops:
+            use(t)
+        defs |= {"hi", "lo"}
+        return defs, uses
+    if op == "mflo" or op == "mfhi":
+        d = _reg(ops[0]) if ops else None
+        if d:
+            defs.add(d)
+        uses.add("lo" if op == "mflo" else "hi")
+        return defs, uses
+    if op == "mtlo" or op == "mthi":
+        if ops:
+            use(ops[0])
+        defs.add("lo" if op == "mtlo" else "hi")
+        return defs, uses
+    if op in _STORE_MN:
+        for t in ops:
+            use(t)
+        return defs, uses
+    if op in _COND_BR_MN:
+        for t in ops[:-1]:
+            use(t)
+        return defs, uses
+    if op in _UNCOND_MN:
+        return defs, uses
+    if op == "jr":
+        if ops:
+            use(ops[0])
+        return defs, uses
+    # default ALU/shift/load/lui/li/la/move: first operand is the destination.
+    if ops:
+        d = _reg(ops[0])
+        if d:
+            defs.add(d)
+        for t in ops[1:]:
+            use(t)
+    return defs, uses
+
+
+_BRANCHY = re.compile(r"^(b|j|jr|jal|beq|bne|blez|bgtz|bltz|bgez|beqz|bnez)")
+
+
+def is_branch(disasm):
+    return bool(_BRANCHY.match(disasm.split(None, 1)[0].lower()))
+
+
+def is_nop(disasm):
+    return disasm.strip() in ("nop", "sll zero,zero,0", "sll zero,zero,0x0")
+
+
+def _target_branch_filled(tgt):
+    """For each control-flow instruction in the target (in order), whether its
+    delay slot holds a real instruction (True) or a nop (False)."""
+    res = []
+    for i, (_, dis) in enumerate(tgt):
+        if is_branch(dis):
+            nxt = tgt[i + 1][1] if i + 1 < len(tgt) else ""
+            res.append(bool(nxt.strip()) and not is_nop(nxt))
+    return res
+
+
+def delay_fill(words, tgt):
+    """Fill a branch/jr delay slot (currently nop) with the immediately-preceding
+    independent instruction, dropping the nop -- the aspsx schedule. Target-guided:
+    fill the k-th branch's slot only if the target's k-th branch is filled. Returns
+    a new (word,disasm) list (possibly shorter)."""
+    want = _target_branch_filled(tgt)
+    out = list(words)
+    i, k = 0, -1
+    while i < len(out) - 1:
+        dis = out[i][1]
+        if is_branch(dis):
+            k += 1
+            if is_nop(out[i + 1][1]) and i >= 1 and k < len(want) and want[k]:
+                prev = out[i - 1]
+                if not is_branch(prev[1]) and not is_nop(prev[1]):
+                    pdef = defs_uses(prev[1])[0]
+                    bruse = defs_uses(dis)[1]
+                    if not (pdef & bruse):
+                        out[i - 1], out[i] = out[i], prev
+                        del out[i + 1]
+                        i += 1
+                        continue
+        i += 1
+    return out
+
+
+def _sp_delta(dis):
+    m = re.match(r"addiu\s+(\$?\w+)\s*,\s*(\$?\w+)\s*,\s*(-?(?:0x)?[0-9a-fA-F]+)\s*$", dis)
+    if not m or norm_reg(m.group(1)) != "sp" or norm_reg(m.group(2)) != "sp":
+        return None
+    try:
+        return int(m.group(3), 0)
+    except ValueError:
+        return None
+
+
+def _is_ret(dis):
+    p = dis.split(None, 1)
+    return len(p) > 1 and p[0].lower() == "jr" and norm_reg(p[1].strip()) == "ra"
+
+
+def _target_wants_sp_before_jr(tgt):
+    if len(tgt) < 2 or not _is_ret(tgt[-1][1]):
+        return False
+    d = _sp_delta(tgt[-2][1])
+    return d is not None and d > 0
+
+
+def epilogue_unfill(words, tgt):
+    """Move a positive `addiu $sp` out of the jr delay slot to just before the jr,
+    restoring an empty slot -- target-guided. Returns a new word list."""
+    if not _target_wants_sp_before_jr(tgt):
+        return words
+    out = list(words)
+    for j in range(len(out) - 1):
+        if not _is_ret(out[j][1]):
+            continue
+        d = _sp_delta(out[j + 1][1])
+        if d is None or d <= 0:
+            continue
+        if j >= 1 and is_nop(out[j - 1][1]):
+            out[j - 1], out[j + 1] = out[j + 1], out[j - 1]
+        else:
+            insn = out.pop(j + 1)
+            out.insert(j, insn)
+            out.insert(j + 2, ("00000000", "nop"))
+        break
+    return out
+
+
+# --------------------------------------------------------------------------
+# word-level re-emission: after a reordering word pass, emit the span verbatim
+# under `.set noreorder` so the assembler keeps the schedule we chose. The body
+# is taken from the ORIGINAL source lines reordered to the new schedule (so
+# relocations and symbol operands survive), not from disassembly.
+# --------------------------------------------------------------------------
+def target_words_full(asm_root, fn):
+    """Every word in the target .s file for fn, including the trailing pad after
+    endlabel (section-alignment nops). Returns a list of big-endian hex, or None."""
+    p = find_target_s(asm_root, fn)
+    if not p:
+        return None
+    pat = re.compile(r'/\*\s*[0-9A-Fa-f]+\s+[0-9A-Fa-f]{8}\s+([0-9A-Fa-f]{8})\s+\*/')
+    out = []
+    for line in open(p, encoding="utf-8", errors="replace"):
+        m = pat.search(line)
+        if m:
+            le = m.group(1)
+            out.append((le[6:8] + le[4:6] + le[2:4] + le[0:2]).lower())
+    return out
+
+
+def emit_noreorder_span(span, our_words, tgt_full, reorder_passes):
+    """Re-emit a function span under `.set noreorder` after a reordering word pass
+    (delay_fill / epilogue_unfill) so the assembler keeps the chosen schedule.
+    Implemented + empirically validated in a later step; guarded here so a manifest
+    can never silently ship an unproven reorder."""
+    raise NotImplementedError(
+        "reorder emitter (delay_fill/epilogue_unfill) not yet wired: %r"
+        % (reorder_passes,))
+
+
+def apply_padnop(span, our_words, tgt_full):
+    """Append the trailing pad nop(s) the retail object carried but the C compile
+    omitted. Count = target total words - our assembled words; only fires when the
+    extra target words are all nop (a pure section-alignment pad)."""
+    need = len(tgt_full) - len(our_words)
+    if need <= 0:
+        return span, False
+    if any(w != "00000000" for w in tgt_full[len(our_words):]):
+        return span, False          # tail is not pure padding: refuse
+    m = re.search(r'(?m)^([ \t]*)\.end[ \t]+\S+', span)
+    indent = m.group(1) if m else "\t"
+    pad = "".join("%snop\n" % indent for _ in range(need))
+    if m:
+        return span[:m.start()] + pad + span[m.start():], True
+    return span + pad, True
+
 
 # --------------------------------------------------------------------------
 # words: assemble our .s span, read the retail target .s
@@ -430,13 +671,17 @@ def normalize_s(s_file, ctx, manifest=None):
     spans = split_spans(text)
     out = text
     rewrote = []
-    # Splice from the tail so earlier (start,end) offsets stay valid; words are
-    # always assembled from the ON-DISK cc1 .s (unmodified until the final write).
+    # Pass 1 -- text passes (reg_realloc / commutative_swap / laform). Splice from
+    # the tail so earlier (start,end) offsets stay valid; words are always assembled
+    # from the ON-DISK cc1 .s (unmodified until the pass-1 write below).
     for name, start, end in sorted(spans, key=lambda x: -x[1]):
         if name not in manifest:
             continue
         passes = manifest[name].get("passes", [])
-        if not passes:
+        text_passes = [p for p in passes if p not in WORD_PASSES]
+        if not text_passes:
+            if any(p in WORD_PASSES for p in passes):
+                rewrote.append(name)
             continue
         our, err = assemble_words(ctx, s_file, name)
         if err:
@@ -448,8 +693,70 @@ def normalize_s(s_file, ctx, manifest=None):
         tgt = _strip_trailing_pad(tgt)
         our = _strip_trailing_pad(our)
         sigma, _conf = derive_sigma(our, tgt)
-        norm = normalize_span_text(out[start:end], tgt, sigma, passes)
+        norm = normalize_span_text(out[start:end], tgt, sigma, text_passes)
         out = out[:start] + norm + out[end:]
-        rewrote.append(name)
+        if name not in rewrote:
+            rewrote.append(name)
+
+    # Pass 2 -- word passes (padnop / delay_fill / epilogue_unfill). These need the
+    # ASSEMBLED words of the text-normalized code, so write pass 1 to disk first,
+    # then assemble each span from that state.
+    word_funcs = [n for n in manifest
+                  if any(p in WORD_PASSES for p in manifest[n].get("passes", []))]
+    if word_funcs:
+        _write_bytes_str(s_file, out)
+        spans2 = split_spans(out)
+        for name, start, end in sorted(spans2, key=lambda x: -x[1]):
+            if name not in word_funcs:
+                continue
+            wp = [p for p in manifest[name]["passes"] if p in WORD_PASSES]
+            our, err = assemble_words(ctx, s_file, name)
+            if err:
+                raise RuntimeError("assemble %s (word pass):\n%s" % (name, err))
+            tgt_full = target_words_full(ctx["asm_root"], name)
+            if tgt_full is None:
+                raise RuntimeError("no target .s found for %s under %s"
+                                   % (name, ctx["asm_root"]))
+            new_span = apply_word_passes(out[start:end], our, tgt_full, wp,
+                                         ctx, name)
+            out = out[:start] + new_span + out[end:]
+
     _write_bytes_str(s_file, out)
     return sorted(rewrote)
+
+
+def apply_word_passes(span, our_words, tgt_full, passes, ctx, name):
+    """Apply the requested word passes to one function span. padnop is a pure text
+    append; reordering passes (delay_fill / epilogue_unfill) rewrite the source and
+    wrap it in `.set noreorder`. Every pass is target-guided and deterministic.
+
+    `our_words` is the assembled word list of the (text-normalized) span in its
+    full-file context. Reordering passes change the span, so padnop re-measures."""
+    reorder = [p for p in passes if p in ("delay_fill", "epilogue_unfill")]
+    if reorder:
+        span = emit_noreorder_span(span, our_words, tgt_full, reorder)
+        our_words = None            # stale after re-emit; padnop re-assembles below
+    if "padnop" in passes:
+        if our_words is None:
+            our_words, err = assemble_span(ctx, span, name)
+            if err:
+                raise RuntimeError("assemble %s (padnop):\n%s" % (name, err))
+        span, _fired = apply_padnop(span, our_words, tgt_full)
+    return span
+
+
+def assemble_span(ctx, span, name):
+    """Assemble a single function span in isolation (write to a scratch .s, run the
+    maspsx pipeline, return its words). Used to re-measure a span after a reordering
+    pass changed it."""
+    tmp = os.path.join(os.path.dirname(ctx.get("scratch", ".")) or ".",
+                       "_asmnorm_span.s")
+    _write_bytes_str(tmp, span)
+    try:
+        words, err = assemble_words(ctx, tmp, name)
+    finally:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+    return words, err
