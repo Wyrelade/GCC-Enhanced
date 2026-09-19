@@ -67,6 +67,16 @@ Build the verifier before the solver so no rewrite is trusted without a proof.
 
 Acceptance: passes on all already-matched functions and rejects a deliberately corrupted variant.
 
+Implemented in `tools/equiv.py`. Two soundness lessons drove the final shape. First, executing a
+function straight through in text order is unsound: a later write on a not-taken path overwrites a
+register and hides a real difference on another path. The fix is a proper control-flow graph,
+required isomorphic between the two versions, with each block pair proven equivalent from a havoc
+entry state over that block's live-out set; loops need no unrolling and renamed dead temps drop
+out. Second, a call must not blindly wipe caller memory (that also hides differences): post-call
+state is an uninterpreted function of pre-call memory and argument registers, identical on both
+sides, so a value stored before a call and read after it stays observable. Validated on a
+911-function target corpus: 911 pass self-equivalence and 911 reject a corrupted variant.
+
 ## Phase C. Target-guided equivalence solver
 
 The primary early-win engine. Operates on assembly, using the known target to prune.
@@ -89,6 +99,18 @@ Build order from a typical corpus: register naming is usually the largest family
 register-reallocation solver first; then delay-slot; then address-form and `%hi` CSE together
 (same materialization machinery); then single-exit and epilogue-fill (control-flow tail and
 peephole).
+
+Implemented in `tools/solve.py` (with `tools/asmlib.py` as the toolchain harness). The
+register-reallocation and delay-slot-fill operators are proven end to end on a 0x20-byte
+struct-copy function: the solver derives the register correspondence the target implies, handling
+dead-register coalescing (a lui temporary and the base pointer both fold to one target register
+because the temporary is dead after the address add), applies it to the cc1 assembly, rebuilds
+through the real assembler, fills the return delay slot with the preceding independent store, and
+reaches byte-identical target output. The verifier then proves the original compile equivalent to
+the target under that register map and the declared void exit live-set, so the match is honest
+regardless of the transform path. One practical note: because the object file zeroes relocated
+immediates, the equivalence gate reads a symbol-faithful disassembly (relocations folded back into
+`%hi`/`%lo`) so both sides carry the same global address.
 
 ## Phase D. cc1 reproduction at the RTL level
 

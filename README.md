@@ -72,12 +72,40 @@ one function at a time, with the equivalence verifier as the correctness gate.
 
 ## Status
 
-Early. Phase A (divergence taxonomy) has a working classifier; Phases B and C are next. The tool
-was started while decompiling Digimon World 2 (PSX, SLUS-01193), which is the motivating case
+Phases A, B and the core of C are working.
+
+- A. Divergence taxonomy: classifier ranks the wall families (register naming is the largest,
+  so the register-reallocation solver is built first).
+- B. Equivalence verifier: done. `tools/equiv.py` is a z3-backed MIPS1 block-level checker.
+  Validated on a 911-function disassembled target corpus: every function verifies equivalent
+  to itself, and every deliberately corrupted variant is rejected as not-equivalent
+  (911/911, zero self-failures, zero missed corruptions).
+- C. Target-guided solver: `tools/solve.py` proven end to end on a 0x20-byte struct-copy
+  function. It derives the register correspondence the target implies (including dead-register
+  coalescing), rebuilds through the real toolchain, applies a rule-general delay-slot-fill
+  pass, reaches byte-identical target output, and the verifier independently proves the
+  original compile equivalent to the target under that register map. Address-form, exit-merge
+  and epilogue rewriters are next.
+
+The tool was started while decompiling Digimon World 2 (PSX, SLUS-01193), the motivating case
 study, but the method is general to any PSX-era GCC 2.x matching decomp.
 
 ## Tools
 
+- `tools/equiv.py` - Phase B semantic-equivalence verifier. Symbolic execution over a MIPS1
+  (R3000, no GTE) model with z3: register file, byte-addressed memory, hi/lo, coprocessor
+  state, branch and load-delay ordering. Splits each function into basic blocks, requires the
+  two control-flow graphs isomorphic, then proves each block pair equivalent from a havoc entry
+  state over that block's live-out set. Handles register renaming (via a supplied correspondence
+  map), dead-temp differences, and loops without unrolling. Unmodelled instructions become
+  uninterpreted functions of their operands, so it can never prove equivalence across a genuine
+  change. Run `equiv.py a.s b.s` for a pair or `equiv.py --selftest DIR` for the corpus test.
+- `tools/solve.py` - Phase C target-guided solver. Derives the register correspondence from the
+  known target, applies it to the cc1 assembly, rebuilds through maspsx and the assembler, runs
+  the delay-slot-fill pass, compares to the target bytes, and gates the result on `equiv.py`.
+- `tools/asmlib.py` - toolchain harness (compile C to cc1 assembly, assemble to instruction
+  words, read splat-style target `.s`). Configured by environment variables so it plugs into
+  any project's toolchain; see the module docstring.
 - `tools/classify_divergence.py` - Phase A classifier. Parses a project's parked-function journal
   into a structured divergence taxonomy and ranks the solver build order by wall-family
   frequency. Adapt the paths to your project.

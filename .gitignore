@@ -5,3 +5,4 @@ divergence.json
 *.s.tmp
 .venv/
 venv/
+gcce-scratch/
