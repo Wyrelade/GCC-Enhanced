@@ -132,6 +132,31 @@ study, but the method is general to any PSX-era GCC 2.x matching decomp.
 - `tools/classify_divergence.py` - Phase A classifier. Parses a project's parked-function journal
   into a structured divergence taxonomy and ranks the solver build order by wall-family
   frequency. Adapt the paths to your project.
+- `tools/phase_f.py` - build integration. Splice-normalizes a translation unit's cc1 `.s` in
+  place: it splits the file into `.ent NAME .. .end NAME` spans and, for each function named in a
+  manifest, applies the same solver `.s`-text operators to that span only, leaving every other
+  function byte-for-byte verbatim. An empty manifest rewrites the file byte-identically (a
+  round-trip proof). `honesty_gate` refuses to proceed unless the solver reports a verified match
+  for every manifest function, and the final linked-image checksum is the ship gate.
+
+## Integrating into a build (Phase F)
+
+The solver proves a rewrite per function; Phase F applies those proven rewrites inside a real
+build, between cc1 and the assembler, without forking the build script. Two ways to wire it:
+
+- Non-invasive: import your project's build module and reassign its per-file compile step to a
+  wrapper that calls `normalize_s(s_path, manifest)` after cc1 and before the assembler, then run
+  the build unchanged. Python resolves a module global at call time, so reassigning the build's
+  compile function takes effect and the tracked build file stays byte-untouched. Good when the
+  normalizer must stay out of the shipped tree.
+- Upstream: once stable, call `normalize_s` from the build directly so matches build from a clean
+  checkout.
+
+Two things that quietly cost bytes and are handled here: read and write the cc1 `.s` as raw bytes
+(it is frequently CRLF; a universal-newline read plus a `\n` write strips every `\r`, so unchanged
+regions stop round-tripping), and prove the normalizer is load-bearing by confirming the plain
+build without it produces a different checksum on the same tree. A match is only real when the
+normalizer is what closes the gap, not a function that already matched.
 
 ## License
 
