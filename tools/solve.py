@@ -552,6 +552,74 @@ def operand_recolor_s(stext, tgt):
     return stext
 
 # ---------------------------------------------------------------------------
+# commutative-operand-swap (operand-canon, target-guided, post-sigma).
+#
+# A commutative op writes the SAME destination on both sides but our cc1 and
+# the target's cc1 list the two source operands in the opposite order:
+#     ours:   op $D,$X,$Y
+#     target: op $D,$Y,$X        (same $D, sources swapped)
+# The op is commutative so the value and every effect are identical; only the
+# two source register FIELDS of this one instruction are transposed, which the
+# global register map (sigma) cannot express -- sigma has already unified the
+# registers (it canonicalizes commutative operands when building the map, so the
+# swap is invisible to it) yet the emitted word still differs by the rs/rt field
+# order. This is a pure in-place field swap: no destination changes, no other
+# instruction is touched, no liveness reasoning is needed. Runs POST-sigma so
+# both sides are in the same register-number space; target-guided (rewrite only
+# to the order the target uses) and the equiv gate proves EQUAL.
+#
+# Distinct from operand_recolor_s, which handles a DIFFERENT destination (the
+# accumulate lands in the wrong dead temp and must be renamed downstream). Here
+# the destination already agrees; the swap alone closes the byte gap.
+# ---------------------------------------------------------------------------
+def _commutatives_numeric(pairs, to_num):
+    """List of (op, dst, rs, rt) commutative 3-register insns with both sources real
+    non-zero registers, in order. Excludes the `op rd,rs,zero` move-pseudo form so the
+    two sides stay positionally aligned (a move renders differently across cc1s)."""
+    zero = "$%d" % E.ABI2NUM["zero"] if "zero" in E.ABI2NUM else "$0"
+    out = []
+    for _, dis in pairs:
+        m = re.match(r"(\w+)\s+(\$?\w+)\s*,\s*(\$?\w+)\s*,\s*(\$?\w+)\s*$", dis)
+        if not m or m.group(1).lower() not in _COMMUTATIVE_ACC:
+            continue
+        d, s, t = to_num(m.group(2)), to_num(m.group(3)), to_num(m.group(4))
+        if d and s and t and s != zero and t != zero:
+            out.append((m.group(1).lower(), d, s, t))
+    return out
+
+def commutative_swap_s(stext, tgt):
+    """Transpose the two source operands of a commutative insn whose destination already
+    matches the target but whose rs/rt order does not. stext is sigma-applied (numeric
+    register space, same as target after _abi_to_num). Returns new text (unchanged if the
+    transform does not fire)."""
+    tgt_c = _commutatives_numeric(tgt, _abi_to_num)
+    if not tgt_c:
+        return stext
+    lines = stext.split("\n")
+    insn_ix = _s_insn_lines(lines)
+    zero = "$%d" % E.ABI2NUM["zero"] if "zero" in E.ABI2NUM else "$0"
+    our = []                                 # (line_index, op, dst, rs, rt)
+    for i in insn_ix:
+        m = _ACC_S.match(lines[i])
+        if m and m.group(2).lower() in _COMMUTATIVE_ACC \
+                and m.group(4) != zero and m.group(5) != zero:
+            our.append((i, m.group(2).lower(), m.group(3), m.group(4), m.group(5)))
+    if len(our) != len(tgt_c):
+        return stext                         # body not aligned: do not risk a swap
+    changed = False
+    for (li, op, od, os_, ot), (top, td, ts, tt) in zip(our, tgt_c):
+        # destination must already agree; sources must be the same pair in swapped order.
+        if op != top or od != td:
+            continue
+        if os_ == ts and ot == tt:
+            continue                         # already in target order
+        if os_ == tt and ot == ts:
+            indent = lines[li][:len(lines[li]) - len(lines[li].lstrip())]
+            lines[li] = "%s%s\t%s,%s,%s" % (indent, op, od, ts, tt)
+            changed = True
+    return "\n".join(lines) if changed else stext
+
+# ---------------------------------------------------------------------------
 # epilogue-unfill (FILL/UNFILL class, target-guided).
 #
 # Some PSX GCC 2.x builds deallocate the stack frame BEFORE the return:
@@ -796,8 +864,14 @@ def solve_one(cfile, func, retty="void"):
     r["sigma"] = sigma; r["conflicts"] = conflicts
 
     stext = open(src, encoding="utf-8", errors="replace").read()
+    sigma_text = apply_sigma_to_s(stext, sigma)
+    # 1b) commutative-operand-swap: transpose the rs/rt fields of a commutative insn whose
+    # destination already matches the target but whose source order does not (a pure
+    # in-place operand-canon swap, post-sigma so both sides share the register space).
+    swapped_text = commutative_swap_s(sigma_text, tgt)
+    r["commutative_swap"] = swapped_text != sigma_text
     s1 = os.path.join(SCRATCH, func + ".sigma.s")
-    open(s1, "w", encoding="utf-8").write(apply_sigma_to_s(stext, sigma))
+    open(s1, "w", encoding="utf-8").write(swapped_text)
     renamed, err = asmlib.assemble_words(s1, func)
     if err:
         r["status"] = "error"; r["error"] = err; return r

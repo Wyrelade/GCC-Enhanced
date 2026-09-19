@@ -187,6 +187,20 @@ miss reloads a pointer between two stores through it (a store may alias the poin
 caching the record pointer in a local removes the reload and the compiler then emits the target
 byte for byte, operand order included, with no rewrite at all.
 
+The commutative-operand-swap pass is a second, disjoint member of the operand-canon family. Here
+the two compilers agree on the destination register of a commutative instruction but list its two
+source operands in the opposite order, so only the two source fields of that one word differ. Unlike
+the recolor case there is no wrong destination and nothing downstream to rename: the fix is a pure
+in-place transpose of the two source fields to the target's order. It runs after the register map is
+applied, so both sides are already in the same register space (the map itself is blind to the swap,
+because deriving it canonicalizes commutative operands, yet the emitted word still carries the field
+order). The two sides are aligned the same way as the recolor, counting only commutative instructions
+whose two sources are real non-zero registers, and the verifier proves the result equal. A companion
+lesson: the association of a multi-term commutative chain such as a packet or flags builder is a free
+source choice, not a codegen wall. Grouping a constant with the operand the target folds it into
+first makes the compiler emit the target byte for byte with no rewrite; try both associations before
+attributing an operand-order difference to the compiler.
+
 ## Phase D. cc1 reproduction at the RTL level
 
 Optional but principled. Build GCC 2.8.1 from source for the target, confirm baseline parity

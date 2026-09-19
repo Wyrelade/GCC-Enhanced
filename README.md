@@ -116,8 +116,9 @@ study, but the method is general to any PSX-era GCC 2.x matching decomp.
   `equiv.py --selftest DIR` for the corpus test.
 - `tools/solve.py` - Phase C target-guided solver. Derives the register correspondence from the
   known target, applies it to the cc1 assembly, rebuilds through maspsx and the assembler, runs
-  the address-form, un-hi-cse, exit-merge, delay-unfill, delay-slot-fill, epilogue-unfill and
-  operand-recolor passes (each fired target-guided), compares to the target bytes, and gates the
+  the address-form, un-hi-cse, exit-merge, delay-unfill, delay-slot-fill, epilogue-unfill,
+  operand-recolor and commutative-operand-swap passes (each fired target-guided), compares to the
+  target bytes, and gates the
   result on `equiv.py`. Builds the gate's control-flow graph from resolved branch addresses
   (including jal relocations folded back to their symbol) so branchy functions and calls verify
   correctly.
