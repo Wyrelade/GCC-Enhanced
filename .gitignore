@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+divergence.json
+*.o
+*.s.tmp
+.venv/
+venv/
