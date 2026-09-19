@@ -274,6 +274,107 @@ def laform_fold_pass(stext, tgt):
 
 
 # --------------------------------------------------------------------------
+# un-hi-cse (rematerialize): our cc1 hoists a global's `lui %hi` once and shares
+# the base across several `%lo` loads; retail's cc1 rematerializes the `lui %hi`
+# at EACH use (`lui R,%hi(S); lw R,%lo(S)(R)`, base == dest). This is a COUNT-
+# changing pass (adds a lui per use, drops the shared hoist), so it must run
+# BEFORE sigma derivation so the register correspondence is built from the
+# count-aligned assembly. Target-guided (only symbols the target rematerializes).
+# --------------------------------------------------------------------------
+_LUI_HI = re.compile(r"^(\s*)lui\s+(\$\d+)\s*,\s*%hi\(([\w.$]+)\)")
+_LW_LO = re.compile(r"^(\s*)lw\s+(\$\d+)\s*,\s*%lo\(([\w.$]+)\)\((\$\d+)\)")
+
+
+def _is_insn_line(line):
+    s = line.strip()
+    if not s or s.startswith("#") or s.startswith(".") or s.endswith(":"):
+        return False
+    return bool(re.match(r"[a-z][\w.]*", s))
+
+
+def _line_mnem(line):
+    return line.strip().split(None, 1)[0].lower()
+
+
+def target_remat_syms(tgt):
+    """Symbols the target materializes inline as `lui R,%hi(S); lw R,%lo(S)(R)`
+    (base == dest) -- the globals whose %hi retail rematerializes per access."""
+    syms = set()
+    lui_re = re.compile(r"lui\s+(\$?\w+)\s*,\s*%hi\(([\w.$]+)\)")
+    lw_re = re.compile(r"lw\s+(\$?\w+)\s*,\s*%lo\(([\w.$]+)\)\((\$?\w+)\)")
+    for i in range(len(tgt) - 1):
+        a = lui_re.search(tgt[i][1])
+        b = lw_re.search(tgt[i + 1][1])
+        if not a or not b:
+            continue
+        rd, ld, lb = norm_reg(a.group(1)), norm_reg(b.group(1)), norm_reg(b.group(3))
+        if a.group(2) == b.group(2) and rd == ld == lb:
+            syms.add(a.group(2))
+    return syms
+
+
+def un_hi_cse_s(stext, remat_syms):
+    """Un-CSE the %hi base of each `remat_syms` symbol: rematerialize `lui;lw` at
+    each use and drop the shared hoist. Returns new text (unchanged if inert)."""
+    if not remat_syms:
+        return stext
+    lines = stext.split("\n")
+    # only un-CSE a symbol our cc1 actually HOISTED (`lw $D,%lo(S)($B)`, dest != base);
+    # one already in base==dest remat form must not be duplicated.
+    hoisted = set()
+    for l in lines:
+        m = _LW_LO.match(l)
+        if m and m.group(3) in remat_syms and m.group(2) != m.group(4):
+            hoisted.add(m.group(3))
+    remat_syms = hoisted
+    if not remat_syms:
+        return stext
+    region_of, reg, first_insn_line, saw = {}, 0, {}, False
+    for idx, ln in enumerate(lines):
+        if not _is_insn_line(ln):
+            continue
+        region_of[idx] = reg
+        first_insn_line.setdefault(reg, idx)
+        m = _LW_LO.match(ln)
+        if m and m.group(3) in remat_syms:
+            saw = True
+        if _line_mnem(ln) in _STORE_MN:
+            reg += 1
+    if not saw:
+        return stext
+    inserts, delete = {}, set()
+    for idx, ln in enumerate(lines):
+        if idx not in region_of:
+            continue
+        mlui = _LUI_HI.match(ln)
+        if mlui and mlui.group(3) in remat_syms:
+            delete.add(idx)
+            continue
+        mlw = _LW_LO.match(ln)
+        if mlw and mlw.group(3) in remat_syms:
+            indent, dst, sym = mlw.group(1) or "\t", mlw.group(2), mlw.group(3)
+            inserts.setdefault(region_of[idx], []).append(
+                ["%slui\t%s,%%hi(%s)" % (indent, dst, sym),
+                 "%slw\t%s,%%lo(%s)(%s)" % (indent, dst, sym, dst)])
+            delete.add(idx)
+    out, emitted = [], set()
+    for idx, ln in enumerate(lines):
+        r = region_of.get(idx)
+        if r is not None and r not in emitted and idx == first_insn_line[r]:
+            for pair in inserts.get(r, []):
+                out.extend(pair)
+            emitted.add(r)
+        if idx in delete:
+            continue
+        out.append(ln)
+    return "\n".join(out)
+
+
+def un_hi_cse_pass(stext, tgt):
+    return un_hi_cse_s(stext, target_remat_syms(tgt))
+
+
+# --------------------------------------------------------------------------
 # operand-recolor: a commutative accumulate our cc1 computes into the INDEX temp
 # while the target computes into the BASE temp (`op $I,$I,$B` vs `op $B,$B,$I`).
 # The op is commutative so the value and the memory effect are identical and both
@@ -360,10 +461,17 @@ PASSES = {
     # reg_realloc is applied specially (it needs sigma from words); the ordered
     # list in the manifest still names it so the recipe is explicit and auditable.
     "reg_realloc": None,
+    "un_hi_cse": un_hi_cse_pass,
     "commutative_swap": commutative_swap_s,
     "operand_recolor": operand_recolor_s,
     "laform": laform_fold_pass,
 }
+
+# Passes that CHANGE the instruction count and so must run BEFORE sigma is derived
+# (the register correspondence has to be built from count-aligned assembly). Any
+# such pass listed in a recipe is applied ahead of reg_realloc regardless of the
+# manifest order; the rest keep their listed order after sigma.
+PRE_SIGMA_PASSES = ("un_hi_cse",)
 
 # --------------------------------------------------------------------------
 # WORD-LEVEL passes. The original PSY-Q assembler (aspsx) scheduled branch and
@@ -919,18 +1027,31 @@ def normalize_s(s_file, ctx, manifest=None):
             if any(p in WORD_PASSES for p in passes):
                 rewrote.append(name)
             continue
-        our, err = assemble_words(ctx, s_file, name)
-        if err:
-            raise RuntimeError("assemble %s:\n%s" % (name, err))
         tgt = target_words(ctx["asm_root"], name)
         if tgt is None:
             raise RuntimeError("no target .s found for %s under %s"
                                % (name, ctx["asm_root"]))
         tgt = _strip_trailing_pad(tgt)
+
+        # Split the recipe around sigma: count-changing PRE_SIGMA passes (e.g.
+        # un_hi_cse) run first so sigma is derived from count-aligned assembly.
+        pre = [p for p in text_passes if p in PRE_SIGMA_PASSES]
+        rest = [p for p in text_passes if p not in PRE_SIGMA_PASSES]
+        span = out[start:end]
+        for p in pre:
+            span = PASSES[p](span, tgt)
+        if pre:                             # re-assemble to align sigma to remat form
+            out_pre = out[:start] + span + out[end:]
+            _write_bytes_str(s_file, out_pre)
+        our, err = assemble_words(ctx, s_file, name)
+        if err:
+            raise RuntimeError("assemble %s:\n%s" % (name, err))
         our = _strip_trailing_pad(our)
         sigma, _conf = derive_sigma(our, tgt)
-        norm = normalize_span_text(out[start:end], tgt, sigma, text_passes)
+        norm = normalize_span_text(span, tgt, sigma, rest)
         out = out[:start] + norm + out[end:]
+        if pre:                             # keep disk in sync for the next span
+            _write_bytes_str(s_file, out)
         if name not in rewrote:
             rewrote.append(name)
 
