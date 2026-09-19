@@ -208,11 +208,77 @@ def commutative_swap_s(stext, tgt):
     return "\n".join(lines) if changed else stext
 
 
+# --------------------------------------------------------------------------
+# la-form fold: rewrite the split form (`lui $B,%hi(SYM)` + `%lo(SYM)($B)`) into
+# the la form (`lui;addiu $B,$B,%lo(SYM)` + `0($B)`). Both compute the same
+# address; the original toolchain prefers la-form for some single-symbol
+# globals. Target-guided: only fold symbols the target materializes with
+# `addiu R,R,%lo(SYM)`.
+# --------------------------------------------------------------------------
+def target_laform_syms(tgt):
+    """Symbols the target builds via an explicit la (lui;addiu %lo) then 0(base)."""
+    syms = set()
+    pat = re.compile(r"addiu\s+(\$?\w+)\s*,\s*(\$?\w+)\s*,\s*%lo\(([\w.$]+)\)")
+    for _, dis in tgt:
+        m = pat.search(dis)
+        if m and norm_reg(m.group(1)) == norm_reg(m.group(2)):
+            syms.add(m.group(3))
+    return syms
+
+
+def laform_fold_s(stext, syms):
+    """In the cc1 gas .s, rewrite `lui $B,%hi(SYM)` + `%lo(SYM)($B)` split-form
+    into la-form: insert `addiu $B,$B,%lo(SYM)` after the lui and change each
+    `%lo(SYM)($B)` operand to `0($B)`. Only fires for SYM in `syms` and only when
+    every use of $B in its live range is a `%lo(SYM)($B)` memory operand of that
+    same SYM, so materializing the address and zeroing the offsets preserves
+    every access. Rewrites one lui/base at a time."""
+    lines = stext.split("\n")
+    lui_re = re.compile(r"^(\s*)lui\s+(\$\d+)\s*,\s*%hi\(([\w.$]+)\)")
+    for sym in syms:
+        i = 0
+        while i < len(lines):
+            m = lui_re.match(lines[i])
+            if not m or m.group(3) != sym:
+                i += 1; continue
+            indent, base = m.group(1), m.group(2)
+            reg_re = re.compile(r"(?<![\w$])" + re.escape(base) + r"(?![\w])")
+            lo_here = re.compile(r"%lo\(" + re.escape(sym) + r"\)\(" + re.escape(base) + r"\)")
+            j = i + 1
+            legal = True
+            hits = []
+            while j < len(lines):
+                body = lines[j].split("#", 1)[0]
+                mdef = re.match(r"\s*[a-z][\w.]*\s+" + re.escape(base) + r"\s*,", body)
+                if mdef:
+                    break
+                if reg_re.search(body):
+                    if lo_here.search(body):
+                        hits.append(j)
+                    else:
+                        legal = False
+                        break
+                j += 1
+            if legal and hits:
+                for j in hits:
+                    lines[j] = lo_here.sub("0(%s)" % base, lines[j])
+                lines.insert(i + 1, "%saddiu\t%s,%s,%%lo(%s)" % (indent, base, base, sym))
+                i = j + 2
+            else:
+                i += 1
+    return "\n".join(lines)
+
+
+def laform_fold_pass(stext, tgt):
+    return laform_fold_s(stext, target_laform_syms(tgt))
+
+
 PASSES = {
     # reg_realloc is applied specially (it needs sigma from words); the ordered
     # list in the manifest still names it so the recipe is explicit and auditable.
     "reg_realloc": None,
     "commutative_swap": commutative_swap_s,
+    "laform": laform_fold_pass,
 }
 
 
