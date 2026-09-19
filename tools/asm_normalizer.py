@@ -375,6 +375,127 @@ def un_hi_cse_pass(stext, tgt):
 
 
 # --------------------------------------------------------------------------
+# exit-merge: cc1 emits each return as its own `j $31` (with the return value in
+# the delay slot); retail funnels every return through ONE shared `jr $ra` laid
+# last, other paths reaching it by `j <EXIT>`. Rewrite the cc1 source so its
+# layout matches. Also unfill any conditional-branch delay the target leaves as a
+# nop. Count-changing (adds the exit block), so it runs BEFORE sigma. Fires only
+# when target is single-exit and ours is not.
+# --------------------------------------------------------------------------
+_EXIT_LABEL = "$Lgcce_exit"
+_RET_S = re.compile(r"^\s*(?:j\s+\$31|jr\s+\$(?:31|ra))\b")
+_COND_S = re.compile(r"^(beq|bne|blez|bgtz|bltz|bgez|beqz|bnez)\b")
+
+
+def _s_is_label(l):
+    s = l.strip()
+    return s.endswith(":") and not s.startswith(".")
+
+
+def _s_mnem(l):
+    return l.strip().split(None, 1)[0].lower()
+
+
+def _s_is_return(l):
+    return bool(_RET_S.match(l))
+
+
+def _count_returns_words(words):
+    n = 0
+    for _, dis in words:
+        p = dis.split(None, 1)
+        if p[0].lower() == "jr" and len(p) > 1 and norm_reg(p[1].strip()) == "ra":
+            n += 1
+    return n
+
+
+def merge_exits_s(stext):
+    """Fold cc1's multiple `j $31` returns into one shared exit. Returns new text."""
+    lines = stext.split("\n")
+    rets = [i for i, l in enumerate(lines) if _s_is_return(l)]
+    if len(rets) < 2:
+        return stext
+    last_i = rets[-1]
+    out = []
+    for i, l in enumerate(lines):
+        if i == last_i:
+            continue                       # drop the last return (keep its delay insn)
+        if _s_is_return(l):
+            out.append(re.sub(r"(?:j|jr)\s+\$(?:31|ra)\b",
+                              "j\t%s" % _EXIT_LABEL, l, count=1))
+        else:
+            out.append(l)
+    ins = len(out)
+    for k in range(len(out) - 1, -1, -1):
+        if out[k].strip().startswith(".end"):
+            ins = k
+            break
+    exitblk = ["%s:" % _EXIT_LABEL, "\t.set\tnoreorder", "\t.set\tnomacro",
+               "\tj\t$31", "\tnop", "\t.set\tmacro", "\t.set\treorder"]
+    return "\n".join(out[:ins] + exitblk + out[ins:])
+
+
+def _target_cond_delay_nop(tgt):
+    res = []
+    for i, (_, dis) in enumerate(tgt):
+        if _COND_S.match(dis.split(None, 1)[0].lower()):
+            nxt = tgt[i + 1][1] if i + 1 < len(tgt) else ""
+            res.append(is_nop(nxt))
+    return res
+
+
+def unfill_cond_delay_s(stext, tgt):
+    """Where the target's k-th conditional branch has a nop delay but our cc1 filled
+    it, move our fill out to just after the branch and restore the nop."""
+    want_nop = _target_cond_delay_nop(tgt)
+    lines = stext.split("\n")
+    result, idx, k = [], 0, -1
+    while idx < len(lines):
+        l = lines[idx]
+        if _s_is_insn(l) and _COND_S.match(_s_mnem(l)):
+            k += 1
+            d = idx + 1
+            while d < len(lines) and not _s_is_insn(lines[d]):
+                if _s_is_label(lines[d]):
+                    d = None
+                    break
+                d += 1
+            filled = d is not None and not _src_is_nop(lines[d])
+            if filled and k < len(want_nop) and want_nop[k]:
+                result.append(l)
+                indent = re.match(r"^(\s*)", lines[d]).group(1)
+                displaced = lines[d]
+                for m in range(idx + 1, d):
+                    result.append(lines[m])
+                result.append("%snop" % indent)
+                m = d + 1
+                tail = []
+                while m < len(lines) and lines[m].strip() in (
+                        ".set\tmacro", ".set macro", ".set\treorder", ".set reorder"):
+                    tail.append(lines[m])
+                    m += 1
+                result.extend(tail)
+                result.append(displaced)
+                idx = m
+                continue
+        result.append(l)
+        idx += 1
+    return "\n".join(result)
+
+
+def exit_merge_pass(stext, tgt):
+    """Combined pre-sigma pass: when the target is single-exit and ours is not,
+    unfill any target-nop conditional delay, then funnel our returns to one exit."""
+    if _count_returns_words(tgt) != 1:
+        return stext
+    our_rets = sum(1 for l in stext.split("\n") if _s_is_return(l))
+    if our_rets <= 1:
+        return stext
+    stext = unfill_cond_delay_s(stext, tgt)
+    return merge_exits_s(stext)
+
+
+# --------------------------------------------------------------------------
 # operand-recolor: a commutative accumulate our cc1 computes into the INDEX temp
 # while the target computes into the BASE temp (`op $I,$I,$B` vs `op $B,$B,$I`).
 # The op is commutative so the value and the memory effect are identical and both
@@ -462,6 +583,7 @@ PASSES = {
     # list in the manifest still names it so the recipe is explicit and auditable.
     "reg_realloc": None,
     "un_hi_cse": un_hi_cse_pass,
+    "exit_merge": exit_merge_pass,
     "commutative_swap": commutative_swap_s,
     "operand_recolor": operand_recolor_s,
     "laform": laform_fold_pass,
@@ -471,7 +593,7 @@ PASSES = {
 # (the register correspondence has to be built from count-aligned assembly). Any
 # such pass listed in a recipe is applied ahead of reg_realloc regardless of the
 # manifest order; the rest keep their listed order after sigma.
-PRE_SIGMA_PASSES = ("un_hi_cse",)
+PRE_SIGMA_PASSES = ("un_hi_cse", "exit_merge")
 
 # --------------------------------------------------------------------------
 # WORD-LEVEL passes. The original PSY-Q assembler (aspsx) scheduled branch and
