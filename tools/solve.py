@@ -57,11 +57,13 @@ def insn_parts(disasm):
     regs, skel = [], []
     for op in ops:
         mm = re.fullmatch(r"(.*)\((\$?\w+)\)", op)
-        if mm:                                  # off(base)
+        if mm and E.norm_reg(mm.group(2)) is not None:   # off(base): inner is a real reg
             skel.append(mm.group(1).strip() + "(#)")
-            r = E.norm_reg(mm.group(2))
-            regs.append(r if r else mm.group(2))
+            regs.append(E.norm_reg(mm.group(2)))
         else:
+            # NOT a register-indexed memory operand: %hi(sym)/%lo(sym) and bare
+            # symbols look like off(base) to the regex but carry no register, so they
+            # stay pure skeleton (keeps operand arity aligned with the other side).
             r = E.norm_reg(op)
             if r is not None:
                 regs.append(r)
@@ -179,6 +181,69 @@ def show(rows, limit=100):
         print("%2d  T %s %-24s | G %s %-24s%s" % (i, t[0], t[1], g[0], g[1], mark))
 
 # ---------------------------------------------------------------------------
+def solve_one(cfile, func, retty="void"):
+    """Run the full solve pipeline for one (cfile, func). Returns a result dict:
+      status   : 'verified' | 'bytes-only' | 'not-solved' | 'already' | 'error'
+      sigma    : register correspondence our->target
+      conflicts: sigma conflicts (empty for a pure correspondence)
+      bytes_ok : produced words equal the target
+      equiv_ok : our-original == target under sigma + live-set (the honesty gate)
+      rows     : per-word compare rows (for display)
+      error    : message when status == 'error'
+    """
+    r = {"func": func, "cfile": cfile, "retty": retty, "sigma": {}, "conflicts": [],
+         "bytes_ok": False, "equiv_ok": False, "rows": [], "error": None,
+         "status": "not-solved"}
+    live = VOID_LIVE if retty == "void" else None
+
+    s0 = os.path.join(SCRATCH, func + ".s")
+    ok, err = asmlib.compile_to_s(cfile, s0)
+    if not ok:
+        r["status"] = "error"; r["error"] = err; return r
+    our, err = asmlib.assemble_words(s0, func)
+    if err:
+        r["status"] = "error"; r["error"] = err; return r
+    tgt = _strip_trailing_pad(asmlib.target_words(func))
+    our = _strip_trailing_pad(our)
+
+    base_ok, _ = cmp_words(tgt, our)
+    if base_ok:
+        r["status"] = "already"; r["bytes_ok"] = True; return r
+
+    # 1) reg-realloc
+    sigma, conflicts = derive_sigma(our, tgt)
+    r["sigma"] = sigma; r["conflicts"] = conflicts
+
+    stext = open(s0, encoding="utf-8", errors="replace").read()
+    s1 = os.path.join(SCRATCH, func + ".sigma.s")
+    open(s1, "w", encoding="utf-8").write(apply_sigma_to_s(stext, sigma))
+    renamed, err = asmlib.assemble_words(s1, func)
+    if err:
+        r["status"] = "error"; r["error"] = err; return r
+
+    # 2) delay-slot fill POST pass (needs the nop still present)
+    final = _strip_trailing_pad(delay_fill(renamed))
+    match_ok, rows = cmp_words(tgt, final)
+    r["bytes_ok"] = match_ok; r["rows"] = rows
+
+    # equivalence gate
+    our_sym, err = asmlib.assemble_words_reloc(s0, func)
+    if err:
+        r["status"] = "error"; r["error"] = err; return r
+    fa = func_from_words(func, _strip_trailing_pad(our_sym))
+    fb = E.parse_s(os.path.join(asmlib.TARGET_DIR, func + ".s"), func)
+    res = E.check_equiv(fa, fb, live=live, regmap=sigma)
+    r["equiv_ok"] = res.equal
+    r["equiv_reason"] = res.reason
+
+    if match_ok and res.equal:
+        r["status"] = "verified"
+    elif match_ok:
+        r["status"] = "bytes-only"          # bytes match but gate did not prove it: suspect
+    else:
+        r["status"] = "not-solved"
+    return r
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("cfile")
@@ -187,65 +252,27 @@ def main():
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args()
 
-    live = VOID_LIVE if args.retty == "void" else None
-
-    s0 = os.path.join(SCRATCH, args.func + ".s")
-    ok, err = asmlib.compile_to_s(args.cfile, s0)
-    if not ok:
-        print(err); sys.exit(2)
-    our, err = asmlib.assemble_words(s0, args.func)
-    if err:
-        print(err); sys.exit(2)
-    tgt = asmlib.target_words(args.func)
-    tgt = _strip_trailing_pad(tgt)
-    our = _strip_trailing_pad(our)
-
-    print("== baseline (our cc1 vs target) ==")
-    base_ok, rows = cmp_words(tgt, our)
-    if base_ok:
+    r = solve_one(args.cfile, args.func, args.retty)
+    if r["status"] == "error":
+        print(r["error"]); sys.exit(2)
+    if r["status"] == "already":
         print("ALREADY MATCHES"); sys.exit(0)
 
-    # 1) reg-realloc
-    sigma, conflicts = derive_sigma(our, tgt)
-    if conflicts:
+    if r["conflicts"]:
         print("sigma conflicts (not a pure register correspondence):")
-        for c in conflicts[:10]:
+        for c in r["conflicts"][:10]:
             print("  ", c)
-    print("sigma:", {("$%s" % k): ("$%s" % v) for k, v in sorted(sigma.items())})
-
-    stext = open(s0, encoding="utf-8", errors="replace").read()
-    s1 = os.path.join(SCRATCH, args.func + ".sigma.s")
-    open(s1, "w", encoding="utf-8").write(apply_sigma_to_s(stext, sigma))
-    renamed, err = asmlib.assemble_words(s1, args.func)
-    if err:
-        print(err); sys.exit(2)
-
-    # 2) delay-slot fill POST pass (needs the nop still present, so run before stripping)
-    final = _strip_trailing_pad(delay_fill(renamed))
-
-    match_ok, rows = cmp_words(tgt, final)
+    print("sigma:", {("$%s" % k): ("$%s" % v) for k, v in sorted(r["sigma"].items())})
     print("\n== after reg-realloc + delay-fill ==")
-    show(rows)
-    print("\nBYTES:", "MATCH" if match_ok else "NO MATCH (len %d vs %d)" % (len(tgt), len(final)))
-
-    # equivalence gate: our ORIGINAL cc1 function must be equivalent to the target under
-    # sigma and the declared exit live-set. If bytes match AND this holds, the transform
-    # sequence is a verified, rule-general match.
-    our_sym, err = asmlib.assemble_words_reloc(s0, args.func)   # symbol-faithful disasm
-    if err:
-        print(err); sys.exit(2)
-    fa = func_from_words(args.func, _strip_trailing_pad(our_sym))   # our original cc1
-    fb_path = os.path.join(asmlib.TARGET_DIR, args.func + ".s")
-    fb = E.parse_s(fb_path, args.func)
-    res = E.check_equiv(fa, fb, live=live, regmap=sigma)
+    show(r["rows"])
+    print("\nBYTES:", "MATCH" if r["bytes_ok"] else "NO MATCH")
     print("EQUIV(our_original vs target, sigma, live=%s): %s"
-          % (args.retty, ("EQUAL" if res.equal else "NOT-EQUAL")))
-    if not res.equal:
-        print("  reason:", res.reason)
-
-    verified = match_ok and res.equal
-    print("\nRESULT:", "VERIFIED MATCH" if verified else "not solved")
-    sys.exit(0 if verified else 1)
+          % (args.retty, ("EQUAL" if r["equiv_ok"] else "NOT-EQUAL")))
+    if not r["equiv_ok"] and r.get("equiv_reason"):
+        print("  reason:", r["equiv_reason"])
+    print("\nRESULT:", "VERIFIED MATCH" if r["status"] == "verified"
+          else ("BYTES-ONLY (unproven)" if r["status"] == "bytes-only" else "not solved"))
+    sys.exit(0 if r["status"] == "verified" else 1)
 
 def _strip_trailing_pad(words):
     while words and words[-1][1].strip() == "nop":

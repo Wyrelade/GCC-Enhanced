@@ -46,13 +46,17 @@ ABI2NUM["s8"] = 30           # fp alias
 ABI2NUM["r0"] = 0
 
 def norm_reg(tok):
-    """'$a2' / '$4' / 'a2' / '$s8' -> canonical ABI name."""
-    t = tok.strip().lstrip("$")
+    """'$a2' / '$4' / 'a2' / '$s8' -> canonical ABI name; a bare number is an
+    IMMEDIATE, not a register (objdump prints small shift amounts as bare decimals
+    like `sll v0,v0,8`), so only a $-prefixed number names a register."""
+    s = tok.strip()
+    had_dollar = s.startswith("$")
+    t = s.lstrip("$")
     if t in ABI2NUM:
         return NUM2ABI[ABI2NUM[t]]
-    if re.fullmatch(r"\d+", t):
+    if had_dollar and re.fullmatch(r"\d+", t) and int(t) < 32:
         return NUM2ABI[int(t)]
-    if re.fullmatch(r"r\d+", t):
+    if re.fullmatch(r"r\d+", t) and int(t[1:]) < 32:
         return NUM2ABI[int(t[1:])]
     return None
 
@@ -280,11 +284,36 @@ def imm_val(tok, m):
     try:
         v = int(t, 16) if t.lower().startswith("0x") else int(t, 0)
     except ValueError:
+        # splat writes lui/ori/andi immediates as constant C-expressions, e.g.
+        # `(0xFFFFFF >> 16)` / `(0xFF000000 & 0xFFFF)`. Evaluate them to a concrete
+        # value so they agree with objdump's already-folded immediate on the other
+        # side; anything containing a real symbol stays an uninterpreted const.
+        ce = _const_expr(tok)
+        if ce is not None:
+            return z3.BitVecVal(ce & 0xffffffff, 32)
         # bare symbol name used as an immediate -> treat as its symbol const
         return m.sym(tok)
     if neg:
         v = -v
     return z3.BitVecVal(v & 0xffffffff, 32)
+
+# A constant integer expression as emitted by splat for split immediates:
+# only integer literals and the C bit/arith operators, no identifiers.
+_CONST_EXPR_CHARS = re.compile(r"[\s0-9a-fA-FxX()<>&|^+\-*~]+")
+def _const_expr(tok):
+    s = tok.strip()
+    if not s or not _CONST_EXPR_CHARS.fullmatch(s):
+        return None
+    # every maximal alnum run must be a valid integer literal (guards a stray symbol)
+    for run in re.findall(r"[0-9a-fA-FxX]+", s):
+        try:
+            int(run, 0)
+        except ValueError:
+            return None
+    try:
+        return int(eval(s, {"__builtins__": {}}, {}))
+    except Exception:
+        return None
 
 def mem_addr(tok, m):
     """'0x4($a2)' or '($a2)' or 'sym' -> BV32 effective address, or None."""

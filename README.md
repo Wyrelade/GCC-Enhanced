@@ -80,12 +80,17 @@ Phases A, B and the core of C are working.
   Validated on a 911-function disassembled target corpus: every function verifies equivalent
   to itself, and every deliberately corrupted variant is rejected as not-equivalent
   (911/911, zero self-failures, zero missed corruptions).
-- C. Target-guided solver: `tools/solve.py` proven end to end on a 0x20-byte struct-copy
-  function. It derives the register correspondence the target implies (including dead-register
-  coalescing), rebuilds through the real toolchain, applies a rule-general delay-slot-fill
-  pass, reaches byte-identical target output, and the verifier independently proves the
-  original compile equivalent to the target under that register map. Address-form, exit-merge
-  and epilogue rewriters are next.
+- C. Target-guided solver: `tools/solve.py` proven end to end. It derives the register
+  correspondence the target implies (including dead-register coalescing), rebuilds through the
+  real toolchain, applies a rule-general delay-slot-fill pass, reaches byte-identical target
+  output, and the verifier independently proves the original compile equivalent to the target
+  under that register map. Demonstrated on both a reg-realloc-plus-delay-fill struct copy and,
+  in isolation, the pure register-naming class (a straight-line bit-merge whose only divergence
+  was a constant-to-register coloring swap, closed by the register correspondence alone).
+  `tools/batch.py` runs the solver over a list of functions, classifies each as verified,
+  bytes-only (bytes match but the verifier did not prove it, a suspect that never counts as a
+  match), or not-solved, and caches verified wins in a manifest so a solved function is never
+  re-searched. Address-form, exit-merge and epilogue rewriters are next.
 
 The tool was started while decompiling Digimon World 2 (PSX, SLUS-01193), the motivating case
 study, but the method is general to any PSX-era GCC 2.x matching decomp.
@@ -103,6 +108,10 @@ study, but the method is general to any PSX-era GCC 2.x matching decomp.
 - `tools/solve.py` - Phase C target-guided solver. Derives the register correspondence from the
   known target, applies it to the cc1 assembly, rebuilds through maspsx and the assembler, runs
   the delay-slot-fill pass, compares to the target bytes, and gates the result on `equiv.py`.
+- `tools/batch.py` - batch driver over the solver. Takes a JSON job list or a directory of
+  `f<FUNC>.c` stubs, reports verified / bytes-only / not-solved / error per function, and writes
+  the verified wins to `solved_manifest.json`. A bytes-only result forces a nonzero exit so a
+  would-be fake match can never pass a CI run silently.
 - `tools/asmlib.py` - toolchain harness (compile C to cc1 assembly, assemble to instruction
   words, read splat-style target `.s`). Configured by environment variables so it plugs into
   any project's toolchain; see the module docstring.
