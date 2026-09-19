@@ -112,6 +112,26 @@ regardless of the transform path. One practical note: because the object file ze
 immediates, the equivalence gate reads a symbol-faithful disassembly (relocations folded back into
 `%hi`/`%lo`) so both sides carry the same global address.
 
+The address-form family is extended by two more operators. The split-to-la fold rewrites a
+split-form global (`lui`, then `%lo(SYM)(base)` in each memory operand) into la-form (an explicit
+`addiu base,base,%lo(SYM)` then `0(base)` operands) for exactly the symbols the target
+materializes with an explicit la, and only when every use of the base in its live range is a
+`%lo(SYM)` operand of that same symbol, so the address is preserved. The un-hi-cse operator is its
+mirror: when the near-miss compiler CSEs the high part of a global (hoists one `lui B,%hi(SYM)` and
+reuses `B` for each `lw D,%lo(SYM)(B)`) but the target rematerializes `lui R,%hi(SYM); lw
+R,%lo(SYM)(R)` (base equal to dest) before every access, it deletes the hoisted `lui`s and re-emits
+the pair at the front of each access region (a run of instructions ending in a store), using the
+load's own dest register as the base. A useful observation fell out of this: the schedule
+divergence people attribute to the delay-slot family (which instruction fills the `lw`-to-store
+load-delay) is often a consequence of the shared hoist rather than an independent wall. The
+hoisted `lui` for the next symbol was what filled the slot; once the hoists are gone and the fresh
+pair sits at the region front, the right-hand-side value computation falls into the slot exactly as
+the target schedules, and the assembler inserts a load-delay nop only where no independent
+instruction is available. So no separate scheduler pass was needed. Legality is proven, not
+assumed: the gate checks the original compile against the target, so an intervening aliasing store
+that invalidated a reload fails the proof instead of faking a match. Proven end to end on a
+seven-store function that writes through four global pointer slots.
+
 ## Phase D. cc1 reproduction at the RTL level
 
 Optional but principled. Build GCC 2.8.1 from source for the target, confirm baseline parity

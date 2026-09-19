@@ -179,6 +179,113 @@ def laform_fold_s(stext, syms):
     return "\n".join(lines)
 
 # ---------------------------------------------------------------------------
+# un-hi-cse: rematerialization of a %hi(SYM) base per access.
+#
+# Some GCC 2.8.x builds CSE the high part of a global address: they hoist ONE
+# `lui $B,%hi(SYM)` and keep $B live, reloading only `lw $D,%lo(SYM)($B)` before
+# each use (the pointer value itself is correctly reloaded; only the %hi
+# immediate is shared). Other private/patched builds do NOT share the %hi: they
+# REMATERIALIZE `lui R,%hi(SYM); lw R,%lo(SYM)(R)` (base == dest == R) fresh
+# before every access.
+#
+# The transform is target-guided: for each SYM the TARGET remats (an adjacent
+# `lui R,%hi(SYM)` + `lw R,%lo(SYM)(R)` with the same R), delete the hoisted
+# `lui _,%hi(SYM)` lines and re-emit, at the FRONT of each access region (a run
+# of instructions ending in a store), the pair `lui $D,%hi(SYM); lw
+# $D,%lo(SYM)($D)` where $D is that load's own dest register. Placing the pair
+# at the region front lets the unshared %hi land first; the rhs value-compute
+# then falls into the lw->store load-delay slot exactly as the target schedules
+# it (the assembler inserts the load-delay nop where no independent instruction
+# is available). No separate scheduler pass is needed: the schedule divergence
+# is a consequence of the shared hoist, and disappears once it is removed.
+#
+# Legality is NOT assumed: the equivalence gate proves the ORIGINAL cc1 function
+# equivalent to the target. A pointer reload that an intervening aliasing store
+# could invalidate fails that proof rather than faking a match.
+# ---------------------------------------------------------------------------
+_STORE_MNEMS = {"sb", "sh", "sw", "swl", "swr", "swc1", "swc2", "sc1"}
+_LUI_HI = re.compile(r"^(\s*)lui\s+(\$\d+)\s*,\s*%hi\(([\w.$]+)\)")
+_LW_LO = re.compile(r"^(\s*)lw\s+(\$\d+)\s*,\s*%lo\(([\w.$]+)\)\((\$\d+)\)")
+
+def target_remat_syms(tgt):
+    """Symbols the target materializes with an inline `lui R,%hi(S); lw R,%lo(S)(R)`
+    (base == dest). These are the globals whose %hi the target rematerializes per access."""
+    syms = set()
+    lui_re = re.compile(r"lui\s+(\$?\w+)\s*,\s*%hi\(([\w.$]+)\)")
+    lw_re = re.compile(r"lw\s+(\$?\w+)\s*,\s*%lo\(([\w.$]+)\)\((\$?\w+)\)")
+    for i in range(len(tgt) - 1):
+        a = lui_re.search(tgt[i][1]); b = lw_re.search(tgt[i + 1][1])
+        if not a or not b:
+            continue
+        rd = E.norm_reg(a.group(1)); ld = E.norm_reg(b.group(1)); lb = E.norm_reg(b.group(3))
+        if a.group(2) == b.group(2) and rd == ld == lb:
+            syms.add(a.group(2))
+    return syms
+
+def _is_insn_line(line):
+    s = line.strip()
+    if not s or s.startswith("#") or s.startswith("."):
+        return False
+    if s.endswith(":"):
+        return False
+    return bool(re.match(r"[a-z][\w.]*", s))
+
+def _line_mnem(line):
+    return line.strip().split(None, 1)[0].lower()
+
+def un_hi_cse_s(stext, remat_syms):
+    """Rewrite the cc1 gas .s to un-CSE the %hi base of each `remat_syms` symbol.
+    Returns new text (unchanged if the transform does not fire)."""
+    if not remat_syms:
+        return stext
+    lines = stext.split("\n")
+    region_of = {}
+    reg = 0
+    first_insn_line = {}
+    saw_remat = False
+    for idx, ln in enumerate(lines):
+        if not _is_insn_line(ln):
+            continue
+        region_of[idx] = reg
+        first_insn_line.setdefault(reg, idx)
+        m = _LW_LO.match(ln)
+        if m and m.group(3) in remat_syms:
+            saw_remat = True
+        if _line_mnem(ln) in _STORE_MNEMS:
+            reg += 1
+    if not saw_remat:
+        return stext
+    inserts = {}
+    delete = set()
+    for idx, ln in enumerate(lines):
+        if idx not in region_of:
+            continue
+        mlui = _LUI_HI.match(ln)
+        if mlui and mlui.group(3) in remat_syms:
+            delete.add(idx)
+            continue
+        mlw = _LW_LO.match(ln)
+        if mlw and mlw.group(3) in remat_syms:
+            indent, dst, sym = mlw.group(1) or "\t", mlw.group(2), mlw.group(3)
+            r = region_of[idx]
+            inserts.setdefault(r, []).append(
+                ["%slui\t%s,%%hi(%s)" % (indent, dst, sym),
+                 "%slw\t%s,%%lo(%s)(%s)" % (indent, dst, sym, dst)])
+            delete.add(idx)
+    out = []
+    emitted_region = set()
+    for idx, ln in enumerate(lines):
+        r = region_of.get(idx)
+        if r is not None and r not in emitted_region and idx == first_insn_line[r]:
+            for pair in inserts.get(r, []):
+                out.extend(pair)
+            emitted_region.add(r)
+        if idx in delete:
+            continue
+        out.append(ln)
+    return "\n".join(out)
+
+# ---------------------------------------------------------------------------
 # delay-slot fill POST pass (rule-general)
 # ---------------------------------------------------------------------------
 _BRANCHY = re.compile(r"^(b|j|jr|jal|beq|bne|blez|bgtz|bltz|bgez|beqz|bnez)")
@@ -278,13 +385,30 @@ def solve_one(cfile, func, retty="void"):
     if base_ok:
         r["status"] = "already"; r["bytes_ok"] = True; return r
 
-    # 0) addr-form: fold our split-form globals to la-form for the symbols the target
+    src = s0
+
+    # 0a) un-hi-cse: rematerialize the %hi base of each global the target remats,
+    # so the count of address-materialization insns aligns with the target before
+    # sigma. Runs first because it changes instruction counts (adds a lui per use,
+    # drops the shared hoist).
+    remat = target_remat_syms(tgt)
+    if remat:
+        stext_r = open(src, encoding="utf-8", errors="replace").read()
+        uncsed = un_hi_cse_s(stext_r, remat)
+        if uncsed != stext_r:
+            s_rm = os.path.join(SCRATCH, func + ".remat.s")
+            open(s_rm, "w", encoding="utf-8").write(uncsed)
+            our_rm, err_rm = asmlib.assemble_words(s_rm, func)
+            if not err_rm:
+                our = _strip_trailing_pad(our_rm); src = s_rm
+                r["hi_cse"] = sorted(remat)
+
+    # 0b) addr-form: fold our split-form globals to la-form for the symbols the target
     # materializes with an explicit la. Runs before sigma so the register
     # correspondence is derived from the (now count-aligned) la-form assembly.
-    src = s0
     la_syms = target_laform_syms(tgt)
     if la_syms:
-        stext0 = open(s0, encoding="utf-8", errors="replace").read()
+        stext0 = open(src, encoding="utf-8", errors="replace").read()
         folded = laform_fold_s(stext0, la_syms)
         if folded != stext0:
             s_la = os.path.join(SCRATCH, func + ".la.s")
