@@ -496,14 +496,87 @@ def target_words_full(asm_root, fn):
     return out
 
 
-def emit_noreorder_span(span, our_words, tgt_full, reorder_passes):
-    """Re-emit a function span under `.set noreorder` after a reordering word pass
-    (delay_fill / epilogue_unfill) so the assembler keeps the chosen schedule.
-    Implemented + empirically validated in a later step; guarded here so a manifest
-    can never silently ship an unproven reorder."""
-    raise NotImplementedError(
-        "reorder emitter (delay_fill/epilogue_unfill) not yet wired: %r"
-        % (reorder_passes,))
+# --- source-line helpers for the reordering passes -------------------------
+# The reordering passes rewrite the cc1 gas SOURCE (not the disassembly) so
+# relocations and symbol operands survive, then wrap the touched instructions in
+# `.set noreorder` / `.set reorder` so the assembler keeps the schedule.
+def _src_indent(line):
+    return line[:len(line) - len(line.lstrip())]
+
+
+def _src_reg(tok):
+    return norm_reg(tok.strip())
+
+
+def _src_is_ret(line):
+    """Source return: `j $31` / `jr $31` / `jr $ra` (cc1 emits `j $31`)."""
+    m = re.match(r"\s*(j|jr)\s+(\$\w+)\s*$", line)
+    return bool(m and _src_reg(m.group(2)) == "ra")
+
+
+def _src_sp_delta(line):
+    """`addu/addiu $sp,$sp,IMM` -> signed IMM, else None (cc1 uses addu here)."""
+    m = re.match(r"\s*addi?u\s+(\$\w+)\s*,\s*(\$\w+)\s*,\s*(-?(?:0x)?[0-9a-fA-F]+)\s*$",
+                 line)
+    if not m or _src_reg(m.group(1)) != "sp" or _src_reg(m.group(2)) != "sp":
+        return None
+    try:
+        return int(m.group(3), 0)
+    except ValueError:
+        return None
+
+
+def epilogue_unfill_src(span, tgt):
+    """Move the stack-dealloc (`addu $sp,$sp,+N`) out of the return's delay slot to
+    just before the return, restoring an empty (nop) slot, and wrap the three
+    instructions in `.set noreorder`. Target-guided: only when the target ends
+    `addiu $sp,$sp,+N ; jr $ra ; (nop)`. Returns (new_span, fired)."""
+    if not _target_wants_sp_before_jr(tgt):
+        return span, False
+    lines = span.split("\n")
+    ins = [(i, l) for i, l in enumerate(lines) if _s_is_insn(l)]
+    for k in range(len(ins) - 1):
+        li, ll = ins[k]
+        if not _src_is_ret(ll):
+            continue
+        ni, nl = ins[k + 1]
+        if _src_sp_delta(nl) is None or _src_sp_delta(nl) <= 0:
+            continue
+        indent = _src_indent(ll)
+        block = [indent + ".set\tnoreorder",
+                 indent + nl.strip(),          # dealloc moved before the return
+                 ll,                            # the return (jr/j $ra)
+                 indent + "nop",                # empty delay slot
+                 indent + ".set\treorder"]
+        out = []
+        for idx, l in enumerate(lines):
+            if idx == li:
+                out.extend(block)
+            elif idx == ni:
+                continue                        # dealloc removed from the slot
+            else:
+                out.append(l)
+        return "\n".join(out), True
+    return span, False
+
+
+_REORDER_SRC = {
+    "epilogue_unfill": epilogue_unfill_src,
+}
+
+
+def emit_noreorder_span(span, tgt, reorder_passes):
+    """Apply the reordering source passes (delay_fill / epilogue_unfill) to a span
+    in order. Each rewrites the cc1 source and wraps the touched instructions in
+    `.set noreorder` so the assembler keeps the schedule. `tgt` is the target's
+    (pad-stripped) [(word, disasm)] list, for guidance."""
+    txt = span
+    for name in reorder_passes:
+        fn = _REORDER_SRC.get(name)
+        if fn is None:
+            raise NotImplementedError("reorder pass not wired: %s" % name)
+        txt, _fired = fn(txt, tgt)
+    return txt
 
 
 def apply_padnop(span, our_words, tgt_full):
@@ -714,10 +787,12 @@ def normalize_s(s_file, ctx, manifest=None):
             if err:
                 raise RuntimeError("assemble %s (word pass):\n%s" % (name, err))
             tgt_full = target_words_full(ctx["asm_root"], name)
-            if tgt_full is None:
+            tgt = target_words(ctx["asm_root"], name)
+            if tgt_full is None or tgt is None:
                 raise RuntimeError("no target .s found for %s under %s"
                                    % (name, ctx["asm_root"]))
-            new_span = apply_word_passes(out[start:end], our, tgt_full, wp,
+            tgt = _strip_trailing_pad(tgt)
+            new_span = apply_word_passes(out[start:end], our, tgt, tgt_full, wp,
                                          ctx, name)
             out = out[:start] + new_span + out[end:]
 
@@ -725,16 +800,17 @@ def normalize_s(s_file, ctx, manifest=None):
     return sorted(rewrote)
 
 
-def apply_word_passes(span, our_words, tgt_full, passes, ctx, name):
+def apply_word_passes(span, our_words, tgt, tgt_full, passes, ctx, name):
     """Apply the requested word passes to one function span. padnop is a pure text
     append; reordering passes (delay_fill / epilogue_unfill) rewrite the source and
     wrap it in `.set noreorder`. Every pass is target-guided and deterministic.
 
     `our_words` is the assembled word list of the (text-normalized) span in its
-    full-file context. Reordering passes change the span, so padnop re-measures."""
+    full-file context. `tgt` is the pad-stripped target [(word, disasm)] list.
+    Reordering passes change the span, so padnop re-measures."""
     reorder = [p for p in passes if p in ("delay_fill", "epilogue_unfill")]
     if reorder:
-        span = emit_noreorder_span(span, our_words, tgt_full, reorder)
+        span = emit_noreorder_span(span, tgt, reorder)
         our_words = None            # stale after re-emit; padnop re-assembles below
     if "padnop" in passes:
         if our_words is None:
