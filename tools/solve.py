@@ -29,7 +29,13 @@ import equiv as E
 SCRATCH = os.environ.get("GCCE_SCRATCH", os.path.join(asmlib.ROOT, "gcce-scratch"))
 os.makedirs(SCRATCH, exist_ok=True)
 
-VOID_LIVE = ["s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7", "gp", "sp", "fp", "ra"]
+_CALLEE_SAVED = ["s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7", "gp", "sp", "fp", "ra"]
+# void: neither v0 nor v1 observable at return. int (32-bit): v0 only -- v1 is a
+# caller-saved scratch register, DEAD at exit (only a 64-bit/struct return makes it
+# live). Using the precise set matters for addr-form and other transforms that leave
+# different-but-dead garbage in a scratch base register.
+VOID_LIVE = list(_CALLEE_SAVED)
+INT_LIVE = ["v0"] + _CALLEE_SAVED
 
 # ---------------------------------------------------------------------------
 # operand parsing on objdump / target disassembly
@@ -109,6 +115,68 @@ def apply_sigma_to_s(stext, sigma):
         return "$%d" % num.get(n, n)
     # only touch register operands ($<digits>), not e.g. section sizes
     return re.sub(r"\$(\d+)\b", repl, stext)
+
+# ---------------------------------------------------------------------------
+# addr-form: split-form (%lo folded into each memory operand) -> la-form
+# (materialize the full address with an addiu, memory operands use 0(base)).
+# Both forms compute the same effective address; retail's private cc1 prefers
+# la-form for some single-symbol globals where our cc1 folds %lo. Target-guided:
+# only fold the symbols the TARGET materializes with `addiu R,R,%lo(SYM)`.
+# ---------------------------------------------------------------------------
+def target_laform_syms(tgt):
+    """Symbols the target builds via an explicit la (lui;addiu %lo) then 0(base)."""
+    syms = set()
+    pat = re.compile(r"addiu\s+(\$?\w+)\s*,\s*(\$?\w+)\s*,\s*%lo\(([\w.$]+)\)")
+    for _, dis in tgt:
+        m = pat.search(dis)
+        if m and E.norm_reg(m.group(1)) == E.norm_reg(m.group(2)):
+            syms.add(m.group(3))
+    return syms
+
+def laform_fold_s(stext, syms):
+    """In the cc1 gas .s, rewrite `lui $B,%hi(SYM)` + `%lo(SYM)($B)` split-form into
+    la-form: insert `addiu $B,$B,%lo(SYM)` after the lui and change each
+    `%lo(SYM)($B)` operand to `0($B)`. Only fires for SYM in `syms` and only when
+    every use of $B in its live range is a `%lo(SYM)($B)` memory operand of that same
+    SYM (so materializing the address and zeroing the offsets preserves every access).
+    Rewrites one lui/base at a time; returns the new text (unchanged if not legal)."""
+    lines = stext.split("\n")
+    lui_re = re.compile(r"^(\s*)lui\s+(\$\d+)\s*,\s*%hi\(([\w.$]+)\)")
+    for sym in syms:
+        i = 0
+        while i < len(lines):
+            m = lui_re.match(lines[i])
+            if not m or m.group(3) != sym:
+                i += 1; continue
+            indent, base = m.group(1), m.group(2)
+            reg_re = re.compile(r"(?<![\w$])" + re.escape(base) + r"(?![\w])")
+            lo_here = re.compile(r"%lo\(" + re.escape(sym) + r"\)\(" + re.escape(base) + r"\)")
+            # scan the live range of $base: from the lui to where $base is redefined
+            j = i + 1
+            legal = True
+            hits = []
+            while j < len(lines):
+                ln = lines[j]
+                body = ln.split("#", 1)[0]
+                # base redefined (destination of an instruction) ends the range
+                mdef = re.match(r"\s*[a-z][\w.]*\s+" + re.escape(base) + r"\s*,", body)
+                if mdef:
+                    break
+                if reg_re.search(body):
+                    if lo_here.search(body):
+                        hits.append(j)
+                    else:
+                        legal = False       # $base used in some other form -> unsafe
+                        break
+                j += 1
+            if legal and hits:
+                for j in hits:
+                    lines[j] = lo_here.sub("0(%s)" % base, lines[j])
+                lines.insert(i + 1, "%saddiu\t%s,%s,%%lo(%s)" % (indent, base, base, sym))
+                i = j + 2
+            else:
+                i += 1
+    return "\n".join(lines)
 
 # ---------------------------------------------------------------------------
 # delay-slot fill POST pass (rule-general)
@@ -194,7 +262,7 @@ def solve_one(cfile, func, retty="void"):
     r = {"func": func, "cfile": cfile, "retty": retty, "sigma": {}, "conflicts": [],
          "bytes_ok": False, "equiv_ok": False, "rows": [], "error": None,
          "status": "not-solved"}
-    live = VOID_LIVE if retty == "void" else None
+    live = VOID_LIVE if retty == "void" else INT_LIVE
 
     s0 = os.path.join(SCRATCH, func + ".s")
     ok, err = asmlib.compile_to_s(cfile, s0)
@@ -210,11 +278,27 @@ def solve_one(cfile, func, retty="void"):
     if base_ok:
         r["status"] = "already"; r["bytes_ok"] = True; return r
 
+    # 0) addr-form: fold our split-form globals to la-form for the symbols the target
+    # materializes with an explicit la. Runs before sigma so the register
+    # correspondence is derived from the (now count-aligned) la-form assembly.
+    src = s0
+    la_syms = target_laform_syms(tgt)
+    if la_syms:
+        stext0 = open(s0, encoding="utf-8", errors="replace").read()
+        folded = laform_fold_s(stext0, la_syms)
+        if folded != stext0:
+            s_la = os.path.join(SCRATCH, func + ".la.s")
+            open(s_la, "w", encoding="utf-8").write(folded)
+            our2, err2 = asmlib.assemble_words(s_la, func)
+            if not err2:
+                our = _strip_trailing_pad(our2); src = s_la
+                r["addr_form"] = sorted(la_syms)
+
     # 1) reg-realloc
     sigma, conflicts = derive_sigma(our, tgt)
     r["sigma"] = sigma; r["conflicts"] = conflicts
 
-    stext = open(s0, encoding="utf-8", errors="replace").read()
+    stext = open(src, encoding="utf-8", errors="replace").read()
     s1 = os.path.join(SCRATCH, func + ".sigma.s")
     open(s1, "w", encoding="utf-8").write(apply_sigma_to_s(stext, sigma))
     renamed, err = asmlib.assemble_words(s1, func)
