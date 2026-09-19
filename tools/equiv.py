@@ -735,21 +735,121 @@ def _prove_eq(ea, eb):
     r = s.check()
     return r == z3.unsat, r
 
-def check_equiv(fa, fb, live=None, regmap=None, verbose=False):
+class _CBlock:
+    """A canonicalized block: exposes only .insns and .kind, the attributes the
+    equivalence proof and liveness read."""
+    __slots__ = ("insns", "kind")
+    def __init__(self, insns, kind):
+        self.insns = insns
+        self.kind = kind
+
+def _is_nop_insn(ins):
+    if ins.mnem == "nop":
+        return True
+    if ins.mnem == "sll" and ins.ops and norm_reg(ins.ops[0]) == "zero":
+        return True
+    return False
+
+def canonicalize_exits(blocks, succ):
+    """Fold a multi-exit tail into ONE shared `jr $ra` exit so two functions that differ
+    only in exit structure (a `jr` per return path vs a single shared `jr` the other paths
+    branch to) compare as isomorphic. Applied identically to BOTH sides.
+
+    Semantics-preserving per side: a `jr $ra` delay-slot instruction ALWAYS executes before
+    control returns, so lowering it into the block body ahead of an unconditional transfer to
+    a canonical `[jr $ra; nop]` exit keeps the architectural effect; and merging pure
+    `[jr $ra; nop]` blocks preserves return-to-caller semantics. The per-block havoc-entry
+    proof still runs on every block, so a genuine difference in a lowered body or delay
+    instruction is still caught -- canonicalization only removes a spurious STRUCTURAL
+    mismatch, it never hides a semantic one. Returns (new_blocks, new_succ).
+
+    LIMITATION: the per-block proof runs each block from a havoc entry and compares block-local
+    live-out, so an exit-merge verifies only when the return value is computed on CORRESPONDING
+    blocks on both sides (the common pattern: the value is preset in the shared decision block
+    and only the `jr` structure differs). A form that recomputes the value on a different block
+    than the other side will fail the proof rather than pass falsely."""
+    ret_idxs = [i for i, b in enumerate(blocks) if b.kind == "return"]
+    if not ret_idxs:
+        return blocks, succ
+    pure = set()
+    lowered = {}
+    for i in ret_idxs:
+        insns = blocks[i].insns
+        ti = None
+        for k, ins in enumerate(insns):
+            if ins.mnem == "jr" and ins.ops and norm_reg(ins.ops[0]) == "ra":
+                ti = k
+        if ti is None:
+            continue
+        body = insns[:ti]
+        delay = insns[ti + 1] if ti + 1 < len(insns) else None
+        if not body and (delay is None or _is_nop_insn(delay)):
+            pure.add(i)
+        else:
+            low = list(body)
+            if delay is not None and not _is_nop_insn(delay):
+                low.append(delay)
+            lowered[i] = low
+    jr = Insn("jr", ["$ra"], "jr $ra")
+    nop = Insn("nop", [], "nop")
+    idx_map = {}
+    new_blocks = []
+    for i, b in enumerate(blocks):
+        if i in pure:
+            continue
+        idx_map[i] = len(new_blocks)
+        if i in lowered:
+            new_blocks.append(_CBlock(lowered[i], "uncond"))
+        else:
+            new_blocks.append(b)
+    exit_idx = len(new_blocks)
+    new_blocks.append(_CBlock([jr, nop], "return"))
+    new_succ = []
+    for i, b in enumerate(blocks):
+        if i in pure:
+            continue
+        if i in lowered:
+            new_succ.append([exit_idx])
+            continue
+        ns = []
+        for t in succ[i]:
+            if t in pure:
+                ns.append(exit_idx)
+            elif t in idx_map:
+                ns.append(idx_map[t])
+        new_succ.append(ns)
+    new_succ.append([])
+    for k in range(len(new_blocks)):
+        if new_succ[k] == [exit_idx] and new_blocks[k].kind in ("fall", "uncond"):
+            b = new_blocks[k]
+            if not isinstance(b, _CBlock):
+                b = _CBlock(list(b.insns), b.kind)
+                new_blocks[k] = b
+            b.kind = "uncond"
+    return new_blocks, new_succ
+
+def check_equiv(fa, fb, live=None, regmap=None, verbose=False, canon_exits=False):
     """Prove fa and fb compute the same observable effect. `regmap` (our-reg -> other-reg)
     lets the caller declare a register renaming; default identity. Sound method:
     require isomorphic CFGs, then prove each block pair equivalent from a havoc entry
     state over that block's live-out set (+ memory + coprocessor + branch condition +
-    successor structure). Loops need no unrolling; renamed dead temps are excluded."""
+    successor structure). Loops need no unrolling; renamed dead temps are excluded.
+
+    `canon_exits`: when True, fold each side's multi-exit tail into one shared `jr $ra`
+    exit before the isomorphism check (see canonicalize_exits), so functions equivalent
+    modulo single-exit/branch-merge structure verify. Default False."""
     reset_globals()
     if regmap is None:
         regmap = {}
     ba = build_blocks(fa)
     bb = build_blocks(fb)
-    if len(ba) != len(bb):
-        return Result(False, "CFG block count %d != %d" % (len(ba), len(bb)))
     sa, _ = _succ(ba)
     sb, _ = _succ(bb)
+    if canon_exits:
+        ba, sa = canonicalize_exits(ba, sa)
+        bb, sb = canonicalize_exits(bb, sb)
+    if len(ba) != len(bb):
+        return Result(False, "CFG block count %d != %d" % (len(ba), len(bb)))
     for i in range(len(ba)):
         if ba[i].kind != bb[i].kind:
             return Result(False, "block %d kind %s != %s" % (i, ba[i].kind, bb[i].kind))

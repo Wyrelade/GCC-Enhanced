@@ -132,6 +132,26 @@ assumed: the gate checks the original compile against the target, so an interven
 that invalidated a reload fails the proof instead of faking a match. Proven end to end on a
 seven-store function that writes through four global pointer slots.
 
+The single-exit (branch-merge) family is handled by a canonicalization step in the verifier
+rather than a byte rewrite alone. When a target funnels every return through one shared `jr $ra`
+that the other paths branch to, while the near-miss compiler emits a `jr` per return path (common
+in leaf functions with no frame), the two control-flow graphs are not isomorphic and the gate
+refuses them before any proof runs. Behind a flag, the verifier folds each side's exit tail into
+one canonical `[jr $ra; nop]` exit: pure `jr` blocks are merged and their predecessors redirected;
+an impure `[body; jr; delay]` block is lowered to `[body then delay]` with an unconditional edge to
+the shared exit, which is sound because a jump-register delay-slot instruction always executes
+before control returns; and a block whose only successor is the shared exit is relabelled as an
+unconditional transfer so a path that jumps to the exit and a path that falls into it compare as
+the same edge. This is applied identically to both sides and the per-block proof still runs on
+every block, so a real difference in a lowered body is still caught. One limitation follows from
+the per-block havoc-entry method: an exit merge verifies only when the return value is computed on
+corresponding blocks on both sides, which is the usual pattern (the value is preset in the shared
+decision block and only the return structure differs); a form that recomputes the value on a
+different block than the target does will fail the proof rather than pass falsely. The flag
+defaults off and the solver enables it only when it detects the situation from the target (the
+target has one return, the near-miss has several), so no same-shape function is affected and the
+whole-corpus self-test is unchanged.
+
 ## Phase D. cc1 reproduction at the RTL level
 
 Optional but principled. Build GCC 2.8.1 from source for the target, confirm baseline parity
