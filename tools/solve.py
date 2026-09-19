@@ -242,7 +242,7 @@ def un_hi_cse_s(stext, remat_syms):
     # `lw $D,%lo(sym)($B)` whose base $B differs from its dest $D (the hoisted shared base).
     # When the near-miss compiler already emits `lw $D,%lo(sym)($D)` (base == dest, the lui adjacent), the
     # load is already in the rematerialized form -- undoing it would only duplicate the pair and
-    # corrupt the schedule (this bit func_8003ABC8, whose single-use globals the target also
+    # corrupt the schedule (this bit a real branch function whose single-use globals the target also
     # loads base == dest).
     hoisted = set()
     for l in lines:
@@ -448,6 +448,73 @@ def delay_fill(words, tgt=None):
         i += 1
     return out
 
+# ---------------------------------------------------------------------------
+# epilogue-unfill (FILL/UNFILL class, target-guided).
+#
+# Some PSX GCC 2.x builds deallocate the stack frame BEFORE the return:
+#     lw   $ra,off($sp)
+#     addiu $sp,$sp,+N      # dealloc precedes jr
+#     jr   $ra
+#     nop                   # jr delay is empty
+# Another build fills the jr delay with the sp-restore instead:
+#     lw   $ra,off($sp)
+#     nop
+#     jr   $ra
+#     addiu $sp,$sp,+N      # dealloc in the jr delay slot
+# Both restore $sp before the caller resumes (a jr delay insn always executes
+# before control leaves), so the sp-dealloc commutes with the return + the nop:
+# transposing the pre-jr nop and the in-delay `addiu $sp` is semantics-preserving.
+# Target-guided: fire only when the target ends `addiu $sp,$sp,+N; jr $ra; (nop)`
+# and the near-miss output ends `nop; jr $ra; addiu $sp,$sp,+N`. The equiv gate
+# proves EQUAL. No verifier canon pass is needed: these are single-exit
+# straight-line functions (a jal is a call event, not a block split), so the
+# per-block havoc proof compares the same final live-out either way.
+# ---------------------------------------------------------------------------
+def _sp_delta(dis):
+    """If `dis` is `addiu $sp,$sp,IMM`, return IMM (signed); else None."""
+    m = re.match(r"addiu\s+(\$?\w+)\s*,\s*(\$?\w+)\s*,\s*(-?(?:0x)?[0-9a-fA-F]+)\s*$", dis)
+    if not m or E.norm_reg(m.group(1)) != "sp" or E.norm_reg(m.group(2)) != "sp":
+        return None
+    try:
+        return int(m.group(3), 0)
+    except ValueError:
+        return None
+
+def _is_ret(dis):
+    p = dis.split(None, 1)
+    return p and p[0].lower() == "jr" and len(p) > 1 and E.norm_reg(p[1].strip()) == "ra"
+
+def _target_wants_sp_before_jr(tgt):
+    """True when the (pad-stripped) target ends `addiu $sp,$sp,+N ; jr $ra` -- dealloc
+    before the return with an empty (stripped-nop) jr delay."""
+    if len(tgt) < 2:
+        return False
+    if not _is_ret(tgt[-1][1]):
+        return False
+    d = _sp_delta(tgt[-2][1])
+    return d is not None and d > 0
+
+def epilogue_unfill(words, tgt):
+    """Move a positive `addiu $sp` out of the jr delay slot to just before the jr,
+    restoring a nop in the delay -- target-guided. Returns a new word list."""
+    if not _target_wants_sp_before_jr(tgt):
+        return words
+    out = list(words)
+    for j in range(len(out) - 1):
+        if not _is_ret(out[j][1]):
+            continue
+        d = _sp_delta(out[j + 1][1])                     # addiu $sp in the jr delay slot
+        if d is None or d <= 0:
+            continue
+        if j >= 1 and is_nop(out[j - 1][1]):             # transpose the pre-jr nop <-> delay
+            out[j - 1], out[j + 1] = out[j + 1], out[j - 1]
+        else:                                            # no pre-jr filler: hoist + fresh nop
+            insn = out.pop(j + 1)
+            out.insert(j, insn)
+            out.insert(j + 2, ("00000000", "nop"))
+        break
+    return out
+
 def _mk_insn(disasm):
     mnem, _, _ = insn_parts(disasm)
     p = disasm.split(None, 1)
@@ -620,7 +687,12 @@ def solve_one(cfile, func, retty="void"):
 
     # 2) delay-slot fill POST pass (needs the nop still present); target-guided so it never
     # re-fills a slot we intentionally unfilled for the exit-merge.
-    final = _strip_trailing_pad(delay_fill(renamed, tgt))
+    filled = delay_fill(renamed, tgt)
+    # 3) epilogue-unfill: move the sp-dealloc out of the jr delay to before the jr when the
+    # target deallocates the frame before returning (target-guided, semantics-preserving).
+    epi = epilogue_unfill(filled, tgt)
+    r["epi_unfill"] = epi is not filled and epi != filled
+    final = _strip_trailing_pad(epi)
     match_ok, rows = cmp_words(tgt, final)
     r["bytes_ok"] = match_ok; r["rows"] = rows
 

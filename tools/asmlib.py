@@ -126,6 +126,12 @@ def assemble_words_reloc(sfile, fn):
                 dis = re.sub(r",\s*-?(?:0x)?[0-9a-f]+\s*$", "," + relop, dis)
             out[last] = (be, dis)
             continue
+        rj = re.search(r'R_MIPS_(26|JUMP)\S*\s+(\S+)', line)
+        if rj and last is not None:                  # jal/j target: .o zeroes it, reloc names it
+            be, dis = out[last]
+            mn = dis.split(None, 1)[0]
+            out[last] = (be, "%s\t%s" % (mn, rj.group(2)))
+            continue
         m = re.match(r'^\s*[0-9a-f]+:\s+([0-9a-f]{8})\s+(.*)', line)
         if m:
             out.append((m.group(1).lower(), m.group(2).strip()))
@@ -166,6 +172,12 @@ def assemble_reloc_addr(sfile, fn):
             else:
                 dis = re.sub(r",\s*-?(?:0x)?[0-9a-f]+\s*$", "," + relop, dis)
             out[last] = (addr, be, dis)
+            continue
+        rj = re.search(r'R_MIPS_(26|JUMP)\S*\s+(\S+)', line)
+        if rj and last is not None:                  # jal/j target: .o zeroes it, reloc names it
+            addr, be, dis = out[last]
+            mn = dis.split(None, 1)[0]
+            out[last] = (addr, be, "%s\t%s" % (mn, rj.group(2)))
             continue
         m = re.match(r'^\s*([0-9a-f]+):\s+([0-9a-f]{8})\s+(.*)', line)
         if m:

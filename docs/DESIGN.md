@@ -152,6 +152,24 @@ defaults off and the solver enables it only when it detects the situation from t
 target has one return, the near-miss has several), so no same-shape function is affected and the
 whole-corpus self-test is unchanged.
 
+The epilogue fill/unfill family is a pure byte reorder, no verifier flag required. Some PSX GCC
+2.x builds deallocate the stack frame before the return (`lw $ra; addiu $sp,+N; jr $ra; nop`),
+while another build fills the jump-register delay slot with the stack restore instead
+(`lw $ra; nop; jr $ra; addiu $sp,+N`). A delay-slot instruction always executes before control
+leaves, so both forms restore the stack pointer before the caller resumes: transposing the pre-jr
+nop and the in-delay `addiu $sp` is semantics-preserving. The operator fires target-guided, only
+when the pad-stripped target ends with the deallocation before the return and the near-miss output
+carries a positive `addiu $sp` in the jump-register delay slot. No canonicalization is needed for
+the proof because these are single-exit straight-line functions (a call is an event inside a block,
+not a split), so the per-block proof already compares the same final live-out on both sides. This
+also required folding the jump reloc: a call in an object file is a relocation whose target word is
+zeroed, and the disassembler renders it as a jump to offset zero inside the function's own section,
+so a symbolic call-trace comparison saw a placeholder on one side and the real symbol on the other
+and reported a spurious mismatch on every function with an external call. Reading the symbol back
+from the relocation table (a sound resolution, not a mask) makes the call trace compare faithfully
+while two functions calling different symbols at the same index still compare unequal. Proven end
+to end on three frame functions, including one with three sequential calls.
+
 ## Phase D. cc1 reproduction at the RTL level
 
 Optional but principled. Build GCC 2.8.1 from source for the target, confirm baseline parity

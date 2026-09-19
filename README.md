@@ -90,7 +90,10 @@ Phases A, B and the core of C are working.
   `tools/batch.py` runs the solver over a list of functions, classifies each as verified,
   bytes-only (bytes match but the verifier did not prove it, a suspect that never counts as a
   match), or not-solved, and caches verified wins in a manifest so a solved function is never
-  re-searched. Address-form, exit-merge and epilogue rewriters are next.
+  re-searched. Address-form, un-hi-cse, exit-merge and epilogue-unfill rewriters are proven;
+  the epilogue-unfill pass moves a stack deallocation out of the jump-register delay slot to
+  before the return when the target frees the frame first, a semantics-preserving reorder the
+  verifier confirms EQUAL.
 
 The tool was started while decompiling Digimon World 2 (PSX, SLUS-01193), the motivating case
 study, but the method is general to any PSX-era GCC 2.x matching decomp.
@@ -113,9 +116,10 @@ study, but the method is general to any PSX-era GCC 2.x matching decomp.
   `equiv.py --selftest DIR` for the corpus test.
 - `tools/solve.py` - Phase C target-guided solver. Derives the register correspondence from the
   known target, applies it to the cc1 assembly, rebuilds through maspsx and the assembler, runs
-  the address-form, un-hi-cse, exit-merge, delay-unfill and delay-slot-fill passes (each fired
-  target-guided), compares to the target bytes, and gates the result on `equiv.py`. Builds the
-  gate's control-flow graph from resolved branch addresses so branchy functions verify correctly.
+  the address-form, un-hi-cse, exit-merge, delay-unfill, delay-slot-fill and epilogue-unfill
+  passes (each fired target-guided), compares to the target bytes, and gates the result on
+  `equiv.py`. Builds the gate's control-flow graph from resolved branch addresses (including jal
+  relocations folded back to their symbol) so branchy functions and calls verify correctly.
 - `tools/batch.py` - batch driver over the solver. Takes a JSON job list or a directory of
   `f<FUNC>.c` stubs, reports verified / bytes-only / not-solved / error per function, and writes
   the verified wins to `solved_manifest.json`. A bytes-only result forces a nonzero exit so a
