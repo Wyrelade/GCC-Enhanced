@@ -132,12 +132,21 @@ study, but the method is general to any PSX-era GCC 2.x matching decomp.
 - `tools/classify_divergence.py` - Phase A classifier. Parses a project's parked-function journal
   into a structured divergence taxonomy and ranks the solver build order by wall-family
   frequency. Adapt the paths to your project.
-- `tools/phase_f.py` - build integration. Splice-normalizes a translation unit's cc1 `.s` in
-  place: it splits the file into `.ent NAME .. .end NAME` spans and, for each function named in a
-  manifest, applies the same solver `.s`-text operators to that span only, leaving every other
-  function byte-for-byte verbatim. An empty manifest rewrites the file byte-identically (a
-  round-trip proof). `honesty_gate` refuses to proceed unless the solver reports a verified match
-  for every manifest function, and the final linked-image checksum is the ship gate.
+- `tools/phase_f.py` - build integration with the local honesty gate. Splice-normalizes a
+  translation unit's cc1 `.s` in place: it splits the file into `.ent NAME .. .end NAME` spans and,
+  for each function named in a manifest, applies the same solver `.s`-text operators to that span
+  only, leaving every other function byte-for-byte verbatim. An empty manifest rewrites the file
+  byte-identically (a round-trip proof). `honesty_gate` refuses to proceed unless the solver reports
+  a verified match for every manifest function, and the final linked-image checksum is the ship gate.
+- `tools/asm_normalizer.py` - the zero-dependency version of the same seam, meant to be dropped
+  into a project's build tree and committed. It carries its own MIPS register table and the
+  `.s`-text operators, imports neither the solver nor the verifier, and takes the toolchain paths
+  and retail-asm root from the caller, so no project symbols or paths are baked in. The manifest is
+  `{"<function>": {"passes": [<pass name>, ...]}}` and lists the ordered rewrites to replay
+  deterministically (no search). Pass names: `reg_realloc` (apply the derived register
+  correspondence) and `commutative_swap` (transpose a commutative op's sources to the target order).
+  Keep the verified honesty gate in `phase_f.py`/`solve.py` as a pre-commit check; the shipped build
+  just replays the recorded passes and relies on the linked checksum.
 
 ## Integrating into a build (Phase F)
 
