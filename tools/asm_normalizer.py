@@ -273,11 +273,95 @@ def laform_fold_pass(stext, tgt):
     return laform_fold_s(stext, target_laform_syms(tgt))
 
 
+# --------------------------------------------------------------------------
+# operand-recolor: a commutative accumulate our cc1 computes into the INDEX temp
+# while the target computes into the BASE temp (`op $I,$I,$B` vs `op $B,$B,$I`).
+# The op is commutative so the value and the memory effect are identical and both
+# temps are caller-saved (dead at exit); the only difference is which dead temp
+# carries the address. sigma cannot express it (the temps keep their identity
+# everywhere else), so it is a LOCAL recolor: rewrite the accumulate to the
+# target's destination and rename our old destination downstream until it is
+# redefined. Target-guided; bail if the base temp is written before the old
+# index temp dies (unsafe merge).
+# --------------------------------------------------------------------------
+def _accs_numeric(pairs, to_num):
+    """(op, dst, rs, rt) commutative ACCUMULATES (dst==rs, rt a real non-zero reg)
+    in order. The accumulate form keeps both sides aligned (a `op rd,rs,zero`
+    renders as `move` in cc1 but `addu` in the target)."""
+    zero = "$%d" % ABI2NUM["zero"]
+    out = []
+    for _, dis in pairs:
+        m = re.match(r"(\w+)\s+(\$?\w+)\s*,\s*(\$?\w+)\s*,\s*(\$?\w+)\s*$", dis)
+        if not m or m.group(1).lower() not in _COMMUTATIVE_ACC:
+            continue
+        d, s, t = to_num(m.group(2)), to_num(m.group(3)), to_num(m.group(4))
+        if d and s and t and d == s and t != zero:
+            out.append((m.group(1).lower(), d, s, t))
+    return out
+
+
+def operand_recolor_s(stext, tgt):
+    """Recolor a commutative accumulate our cc1 computes into the index temp but the
+    target computes into the base temp (a local dead-temp swap). Returns new text
+    (unchanged if it does not fire). stext is sigma-applied (numeric reg space)."""
+    tgt_accs = _accs_numeric(tgt, _abi_to_num)
+    if not tgt_accs:
+        return stext
+    lines = stext.split("\n")
+    insn_ix = _s_insn_lines(lines)
+    zero = "$%d" % ABI2NUM["zero"]
+    our_accs = []
+    for i in insn_ix:
+        m = _ACC_S.match(lines[i])
+        if m and m.group(2).lower() in _COMMUTATIVE_ACC \
+                and m.group(3) == m.group(4) and m.group(5) != zero:
+            our_accs.append((i, m.group(2).lower(), m.group(3), m.group(4), m.group(5)))
+    if len(our_accs) != len(tgt_accs):
+        return stext
+    for (li, op, od, os_, ot), (top, td, ts, tt) in zip(our_accs, tgt_accs):
+        if op != top:
+            continue
+        # target accumulates S into B (`op $B,$B,$S`, td==ts, S==tt); ours is the
+        # swapped `op $S,$S,$B` (od==os_==tt, ot==td). Recolor od(=$S) -> $B(td).
+        if not (td == ts and od == os_ and od == tt and ot == td):
+            continue
+        newB, oldI = td, od
+        indent = lines[li][:len(lines[li]) - len(lines[li].lstrip())]
+        safe, redef_at = True, None
+        for j in insn_ix:
+            if j <= li:
+                continue
+            mm = re.match(r"\s*([a-z][\w.]*)\s+(\$\d+)\b", lines[j])
+            if not mm:
+                continue
+            mn, dst = mm.group(1).lower(), mm.group(2)
+            is_store = mn in _STORE_MN or mn.startswith(("sb", "sh", "sw"))
+            if not is_store and dst == newB:
+                safe = False
+                break
+            if not is_store and dst == oldI:
+                redef_at = j
+                break
+        if not safe:
+            continue
+        lines[li] = "%s%s\t%s,%s,%s" % (indent, op, newB, newB, oldI)
+        reg_re = re.compile(r"(?<![\w$])" + re.escape(oldI) + r"(?![\w])")
+        for j in insn_ix:
+            if j <= li:
+                continue
+            if redef_at is not None and j >= redef_at:
+                break
+            lines[j] = reg_re.sub(newB, lines[j])
+        return "\n".join(lines)
+    return stext
+
+
 PASSES = {
     # reg_realloc is applied specially (it needs sigma from words); the ordered
     # list in the manifest still names it so the recipe is explicit and auditable.
     "reg_realloc": None,
     "commutative_swap": commutative_swap_s,
+    "operand_recolor": operand_recolor_s,
     "laform": laform_fold_pass,
 }
 
