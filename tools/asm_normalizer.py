@@ -668,6 +668,9 @@ def merge_exits_s(stext):
     rets = [i for i, l in enumerate(lines) if _s_is_return(l)]
     if len(rets) < 2:
         return stext
+    # one exit label per function: several exit-merged functions share a file
+    ent = ENT_RE.search(stext)
+    label = _EXIT_LABEL + ("_" + ent.group(1) if ent else "")
     last_i = rets[-1]
     out = []
     for i, l in enumerate(lines):
@@ -675,7 +678,7 @@ def merge_exits_s(stext):
             continue                       # drop the last return (keep its delay insn)
         if _s_is_return(l):
             out.append(re.sub(r"(?:j|jr)\s+\$(?:31|ra)\b",
-                              "j\t%s" % _EXIT_LABEL, l, count=1))
+                              "j\t%s" % label, l, count=1))
         else:
             out.append(l)
     ins = len(out)
@@ -683,7 +686,7 @@ def merge_exits_s(stext):
         if out[k].strip().startswith(".end"):
             ins = k
             break
-    exitblk = ["%s:" % _EXIT_LABEL, "\t.set\tnoreorder", "\t.set\tnomacro",
+    exitblk = ["%s:" % label, "\t.set\tnoreorder", "\t.set\tnomacro",
                "\tj\t$31", "\tnop", "\t.set\tmacro", "\t.set\treorder"]
     return "\n".join(out[:ins] + exitblk + out[ins:])
 
@@ -703,8 +706,15 @@ def unfill_cond_delay_s(stext, tgt):
     want_nop = _target_cond_delay_nop(tgt)
     lines = stext.split("\n")
     result, idx, k = [], 0, -1
+    noreorder = False
     while idx < len(lines):
         l = lines[idx]
+        st = l.strip()
+        if st.startswith(".set"):
+            if "noreorder" in st:
+                noreorder = True
+            elif re.match(r"\.set\s+reorder\b", st):
+                noreorder = False
         if _s_is_insn(l) and _COND_S.match(_s_mnem(l)):
             k += 1
             d = idx + 1
@@ -713,7 +723,9 @@ def unfill_cond_delay_s(stext, tgt):
                     d = None
                     break
                 d += 1
-            filled = d is not None and not _src_is_nop(lines[d])
+            # only a branch cc1 scheduled itself (inside .set noreorder) has its
+            # next insn in the delay slot; in reorder mode the assembler pads it
+            filled = noreorder and d is not None and not _src_is_nop(lines[d])
             if filled and k < len(want_nop) and want_nop[k]:
                 result.append(l)
                 indent = re.match(r"^(\s*)", lines[d]).group(1)
@@ -1165,6 +1177,9 @@ def delay_fill_src(span, tgt, our_words):
     ins = [(i, l) for i, l in enumerate(lines) if _s_is_insn(l)]
     drop = set()
     move = {}                   # branch_line_idx -> (prev_line_idx, prev_text)
+    keep_nop = set()            # branch line idx whose filler leaves a load-delay nop
+    pre_fill = {}               # branch line idx -> macro expansion words kept ahead
+    tgt_br = [k for k, (_w, d) in enumerate(tgt) if is_branch(d)]
     kbr = -1
     for p in range(len(ins)):
         i, l = ins[p]
@@ -1182,9 +1197,32 @@ def delay_fill_src(span, tgt, our_words):
             continue
         # dependency: prev must not define a register the branch reads
         bmn = re.match(r"\s*([a-z]+)", l).group(1)
-        if not (defs_uses(pl.strip())[0] & defs_uses(l.strip())[1]):
+        bu = defs_uses(l.strip())[1]
+        if bmn in ("jal", "bal"):
+            # a call's slot runs before the transfer: an argument set up there still
+            # reaches the callee, so $a0-$a3 are not a hazard for the jal itself.
+            bu = bu - {"a0", "a1", "a2", "a3"}
+        if not (defs_uses(pl.strip())[0] & bu):
+            exp = _expand_sym(pl)
+            if exp is not None:
+                # aspsx expands the macro first and fills the slot with its LAST
+                # word; the address setup stays ahead of the branch.
+                pre_fill[i] = exp[:-1]
+                move[i] = exp[-1]
+                drop.add(pi)
+                continue
             move[i] = pl.strip()
             drop.add(pi)
+            # aspsx inserts a load-delay nop BEFORE it fills the slot: when the moved
+            # insn consumed the load right before it, that nop stays behind in its
+            # old place. Keep it explicitly when the target has it.
+            if p >= 2 and kbr < len(tgt_br) and tgt_br[kbr] >= 1 \
+                    and is_nop(tgt[tgt_br[kbr] - 1][1]):
+                ld = ins[p - 2][1].split("#", 1)[0].strip()
+                mn = ld.split(None, 1)[0].lower() if ld else ""
+                if mn in ("lb", "lbu", "lh", "lhu", "lw", "lwl", "lwr") and \
+                        (defs_uses(ld)[0] & defs_uses(pl.split("#", 1)[0].strip())[1]):
+                    keep_nop.add(i)
             # if the source already materialized a nop right after the branch, drop it
             if p + 1 < len(ins) and _src_is_nop(ins[p + 1][1]):
                 drop.add(ins[p + 1][0])
@@ -1197,8 +1235,15 @@ def delay_fill_src(span, tgt, our_words):
         if idx in move:
             indent = _src_indent(l)
             out.append(indent + ".set\tnoreorder")
+            if idx in pre_fill:
+                out.append(indent + ".set\tnoat")
+                out.extend(indent + w for w in pre_fill[idx])
+            if idx in keep_nop:
+                out.append(indent + "nop")      # the load-delay nop aspsx left
             out.append(l)                       # the branch
             out.append(indent + move[idx])      # preceding insn -> delay slot
+            if idx in pre_fill:
+                out.append(indent + ".set\tat")
             out.append(indent + ".set\treorder")
         else:
             out.append(l)
@@ -1243,7 +1288,37 @@ def _reorder_swappable(a, b):
     pa, pb = _pure_alu(a), _pure_alu(b)
     if pa and pb:
         return True
-    return (pa and _frame_store(b)) or (pb and _frame_store(a))
+    if (pa and _frame_store(b)) or (pb and _frame_store(a)):
+        return True
+    # an ALU insn and a load: no memory write, so only registers matter
+    if (pa and _is_load(b)) or (pb and _is_load(a)):
+        return True
+    # a stack-frame load and a store through the assembler temp ($at only ever
+    # holds a global symbol's %hi address) touch disjoint memory
+    return (_frame_load(a) and _at_store(b)) or (_frame_load(b) and _at_store(a))
+
+
+def _is_load(disasm):
+    p = disasm.split(None, 1)
+    return bool(p) and p[0].lower() in ("lb", "lbu", "lh", "lhu", "lw")
+
+
+def _mem_base(disasm):
+    p = disasm.split(None, 1)
+    if len(p) < 2:
+        return None
+    ops = split_ops(p[1])
+    mm = re.fullmatch(r".*\((\$?\w+)\)", ops[-1].strip()) if ops else None
+    return norm_reg(mm.group(1)) if mm else None
+
+
+def _frame_load(disasm):
+    return _is_load(disasm) and _mem_base(disasm) == "sp"
+
+
+def _at_store(disasm):
+    p = disasm.split(None, 1)
+    return bool(p) and p[0].lower() in _STORE_MN and _mem_base(disasm) == "at"
 
 
 def _word_eq(our_w, tgt_w, tgt_dis):
@@ -1254,6 +1329,10 @@ def _word_eq(our_w, tgt_w, tgt_dis):
         return True
     if "%hi" in tgt_dis or "%lo" in tgt_dis or "%gp_rel" in tgt_dis:
         return (int(our_w, 16) >> 16) == (int(tgt_w, 16) >> 16)
+    if re.match(r"\s*(jal|j)\s+[A-Za-z_.]", tgt_dis):
+        # symbolic jump target: its 26-bit field is a relocation, only the
+        # opcode is fixed before linking
+        return (int(our_w, 16) >> 26) == (int(tgt_w, 16) >> 26)
     return False
 
 
@@ -1290,9 +1369,21 @@ def reorder_indep_src(span, tgt, our_words):
     n = len(our_words)
     lines = span.split("\n")
     ins = [(i, l) for i, l in enumerate(lines) if _s_is_insn(l)]
-    if len(ins) != n:                       # macro expansion -> mapping unsafe
-        return span, False
-    ow = list(our_words)
+    if len(ins) != n:
+        # the assembler padded words the source does not spell (a load-delay or
+        # branch-slot nop) or expanded a macro: only the 1:1 prefix before the
+        # first such word is safe to reorder.
+        k = 0
+        while k < min(n, len(ins)):
+            if _src_nwords(ins[k][1]) != 1:
+                break
+            if is_nop(our_words[k][1]) and not _src_is_nop(ins[k][1]):
+                break
+            k += 1
+        if k < 2:
+            return span, False
+        n = k
+    ow = list(our_words[:n])
     order = list(range(n))                  # order[p] = original source index at p
     swapped = set()
     pos = 0
@@ -1572,6 +1663,84 @@ def _tgt_ra_save_idx(tgt):
     return None
 
 
+def _sym_operand(line):
+    """(op, has_index) when the insn's memory operand is a bare symbol (`S`,
+    `S+k`, `S($r)`): a cc1 no-split macro the assembler expands. Else None."""
+    b = line.split("#", 1)[0].strip()
+    p = b.split(None, 1)
+    if len(p) < 2:
+        return None
+    op = p[0].lower()
+    if op not in _STORE_MN and op not in ("lb", "lbu", "lh", "lhu", "lw", "lwl", "lwr"):
+        return None
+    ops = split_ops(p[1])
+    m = re.fullmatch(r"([A-Za-z_.][\w.$]*(?:\+\d+)?)(\(\$\w+\))?", ops[-1].strip())
+    if not m:
+        return None
+    return op, bool(m.group(2))
+
+
+def _expand_sym(line):
+    """The aspsx expansion (list of source insns) of a symbolic-address load/store
+    macro, or None when `line` is not one. Loads use the destination as the temp
+    unless it is the index register (then $at); stores always use $at."""
+    so = _sym_operand(line)
+    if not so:
+        return None
+    b = line.split("#", 1)[0].strip()
+    op, rest = b.split(None, 1)
+    ops = split_ops(rest)
+    r = ops[0].strip()
+    m = re.fullmatch(r"([A-Za-z_.][\w.$]*(?:\+\d+)?)(?:\((\$\w+)\))?", ops[-1].strip())
+    sym, idx = m.group(1), m.group(2)
+    is_load = not op.startswith("s")
+    t = r if (is_load and r != idx and op not in ("lwl", "lwr")) else "$1"
+    out = ["lui\t%s,%%hi(%s)" % (t, sym)]
+    if idx:
+        out.append("addu\t%s,%s,%s" % (t, t, idx))
+    out.append("%s\t%s,%%lo(%s)(%s)" % (op, r, sym, t))
+    return out
+
+
+def _src_nwords(line):
+    """Assembled word count of one cc1 source insn: symbolic-address loads/stores
+    expand to lui(+addu)+access, `la` and out-of-range `li` to two words."""
+    so = _sym_operand(line)
+    if so:
+        return 3 if so[1] else 2
+    b = line.split("#", 1)[0].strip()
+    p = b.split(None, 1)
+    if p and p[0] == "la":
+        return 2
+    if p and p[0] == "li" and len(p) > 1:
+        try:
+            v = int(split_ops(p[1])[-1], 0)
+        except ValueError:
+            return 1
+        return 1 if (-0x8000 <= v <= 0xFFFF) else 2
+    return 1
+
+
+def _frame_store_disjoint(a, b):
+    """Both are $sp-framed stores to non-overlapping slots."""
+    if not (_frame_store(a) and _frame_store(b)):
+        return False
+    ma, mb = _mem_operand(a), _mem_operand(b)
+    if ma is None or mb is None:
+        return False
+    return ma[1] + ma[2] <= mb[1] or mb[1] + mb[2] <= ma[1]
+
+
+def _global_load(line):
+    """A load from a global symbol's storage (symbolic operand), which can never
+    alias a store into the current stack frame."""
+    so = _sym_operand(line)
+    if so:
+        return not so[0].startswith("s")
+    b = line.split("#", 1)[0].strip()
+    return _is_load(b) and "%lo(" in b
+
+
 def prologue_save_hoist_src(span, tgt):
     """Hoist the prologue register-save `sw $ra,K($sp)` up to the position the target
     puts it (immediately after the stack allocation). Retail's cc1 emits the save right
@@ -1591,11 +1760,28 @@ def prologue_save_hoist_src(span, tgt):
     idxs = [i for i, l in enumerate(lines) if _s_is_insn(l)]
     ins = [lines[i] for i in idxs]
     s_ra = _src_ra_save_idx(ins)
-    if s_ra is None or desired >= s_ra:
+    if s_ra is None:
+        return span, False
+    # `desired` is a target WORD index; map it to a source insn index through each
+    # source insn's assembled length (symbolic-address macros expand to 2-3 words).
+    w, d_src = 0, None
+    for k, l in enumerate(ins):
+        if w >= desired:
+            d_src = k
+            break
+        w += _src_nwords(l)
+    if d_src is None or w != desired:
+        return span, False
+    desired = d_src
+    if desired >= s_ra:
         return span, False
     mover = ins[s_ra].strip()
     for k in range(desired, s_ra):
-        if not (_reorder_swappable(mover, ins[k].strip()) and _indep(mover, ins[k].strip())):
+        other = ins[k].strip()
+        if not _indep(mover, other):
+            return span, False
+        if not (_reorder_swappable(mover, other) or _frame_store_disjoint(mover, other)
+                or _global_load(other)):
             return span, False
     # rebuild the insn order with the save relocated to `desired`
     new_ins = list(ins)
@@ -1807,6 +1993,133 @@ def load_manifest(path=MANIFEST):
     return data or {}
 
 
+# --------------------------------------------------------------------------
+# nosplit (META pass, not a rewrite). The retail executable links translation
+# units built with DIFFERENT cc1 address-generation settings: some were compiled
+# with split addresses (cc1 itself emits `lui $r,%hi(S)` / `%lo(S)($r)` pairs and
+# CSEs/la-forms them), others with `-mno-split-addresses`, where cc1 emits the
+# symbolic macro operand (`lw $r,S($idx)`, `sw $r,S`) and the assembler (aspsx /
+# maspsx) expands it: `lui $dst,%hi(S)` + `addu` + `lw $dst,%lo(S)($dst)` for a
+# load, a fresh `lui $at` for a store or when the destination is the index. The
+# project may compile several retail units as one C file, so a function from a
+# no-split unit is recovered by
+# compiling the file a second time with -mno-split-addresses and splicing that
+# function's `.ent ... .end` span in place of the default one. It is still plain
+# cc1 output of the same C; the other passes in the recipe then run on it as usual.
+# Local `$L`/`LM` labels are renamed in the spliced span so its numbering (which
+# can drift between the two compiles) cannot collide with the rest of the file.
+#
+# Units also differ in who fills branch delay slots: some let cc1's delayed-branch
+# pass fill them (`.set noreorder` blocks in the cc1 output), others were built
+# with -fno-delayed-branch and left it to aspsx, which first inserts load-delay
+# nops and then fills a slot with the preceding insn (delay_fill models that). So
+# each META pass names one alternate compile ("flavor") of the same file.
+# --------------------------------------------------------------------------
+ALT_FLAVORS = {
+    "nosplit": ["-mno-split-addresses"],
+    "nosplit_nodb": ["-mno-split-addresses", "-fno-delayed-branch"],
+    "nodb": ["-fno-delayed-branch"],
+}
+META_PASSES = tuple(ALT_FLAVORS)
+
+
+def alt_flavors(manifest):
+    """The alternate-compile flavors a manifest needs."""
+    return sorted({p for v in manifest.values() for p in v.get("passes", [])
+                   if p in ALT_FLAVORS})
+
+
+def _lc_body(text, lc):
+    """The data lines of constant `lc` (from its label to the next label or
+    section directive), or None when it is not defined."""
+    m = re.search(r"(?m)^%s:\s*\n((?:[ \t]+\.(?:ascii|byte|half|word|space|align)"
+                  r"\b.*\n)*)" % re.escape(lc), text)
+    return m.group(1) if m else None
+
+
+def expand_sym_macros(span):
+    """Expand every symbolic-address load/store macro in a span into the explicit
+    words aspsx emits (see _expand_sym), so the source keeps a 1:1 insn<->word map
+    for the word-level passes. Inside a `.set noreorder` block the expansion is
+    left to the assembler (a macro there is already placed by cc1)."""
+    out, noreorder = [], False
+    for l in span.split("\n"):
+        s = l.strip()
+        if s.startswith(".set"):
+            if "noreorder" in s:
+                noreorder = True
+            elif re.match(r"\.set\s+reorder\b", s):
+                noreorder = False
+        exp = None if (noreorder or not _s_is_insn(l)) else _expand_sym(l)
+        if exp is None:
+            out.append(l)
+            continue
+        ind = _src_indent(l)
+        uses_at = any(re.search(r"\$1(?![0-9])", w) for w in exp)
+        if uses_at:
+            out.append(ind + ".set\tnoat")
+        out.extend(ind + w for w in exp)
+        if uses_at:
+            out.append(ind + ".set\tat")
+    return "\n".join(out)
+
+
+def aspsx_label_nops(span):
+    """aspsx puts a load-delay nop straight after the load, even when a label
+    separates the load from the insn that consumes it; maspsx emits `label: nop`,
+    which moves every branch into that label one word early. Spell the nop out
+    right after the load (reorder mode only) so maspsx sees no hazard left."""
+    lines = span.split("\n")
+    out, noreorder = [], False
+    for k, l in enumerate(lines):
+        out.append(l)
+        s = l.strip()
+        if s.startswith(".set"):
+            if "noreorder" in s:
+                noreorder = True
+            elif re.match(r"\.set\s+reorder\b", s):
+                noreorder = False
+        if noreorder or not _s_is_insn(l):
+            continue
+        b = l.split("#", 1)[0].strip()
+        if not _is_load(b):
+            continue
+        d = defs_uses(b)[0]
+        saw_label, j = False, k + 1
+        while j < len(lines) and not _s_is_insn(lines[j]):
+            if _s_is_label(lines[j]):
+                saw_label = True
+            j += 1
+        if saw_label and j < len(lines):
+            nb = lines[j].split("#", 1)[0].strip()
+            if d & defs_uses(nb)[1]:
+                out.append(_src_indent(l) + "nop")
+    return "\n".join(out)
+
+
+def splice_alt_spans(text, alt_text, names):
+    """Replace each function span in `names` with the same function's span from
+    `alt_text`. Returns (new_text, [spliced names])."""
+    alt = {n: alt_text[s:e] for n, s, e in split_spans(alt_text)}
+    done = []
+    for name, start, end in sorted(split_spans(text), key=lambda x: -x[1]):
+        if name not in names:
+            continue
+        if name not in alt:
+            raise RuntimeError("alt compile: %s missing" % name)
+        span = alt[name]
+        for lc in set(re.findall(r"\$LC\d+", span)):
+            if _lc_body(text, lc) is None or _lc_body(text, lc) != _lc_body(alt_text, lc):
+                raise RuntimeError("alt compile: %s references %s, which differs between "
+                                   "the two compiles" % (name, lc))
+        span = re.sub(r"\$L(?!C)(\w+)", r"$Lns_\1", span)
+        span = re.sub(r"(?<![\w$.])LM(\d+)\b", r"LMns\1", span)
+        span = aspsx_label_nops(expand_sym_macros(span))
+        text = text[:start] + span + text[end:]
+        done.append(name)
+    return text, done
+
+
 def normalize_s(s_file, ctx, manifest=None):
     """Splice-normalize the manifest functions in a cc1 .s in place. Reads once,
     rewrites once. Returns the sorted list of function names it rewrote.
@@ -1816,16 +2129,27 @@ def normalize_s(s_file, ctx, manifest=None):
     if manifest is None:
         manifest = load_manifest()
     text = _read_bytes_str(s_file)
+    rewrote = []
+    # Pass 0 -- alternate-compile flavors (nosplit, ...): take the function's span
+    # from that flavor's cc1 output before any other pass sees it.
+    for flavor in alt_flavors(manifest):
+        ns = [n for n in manifest if flavor in manifest[n].get("passes", [])]
+        alt = (ctx.get("alt_s") or {}).get(flavor)
+        if not alt or not os.path.exists(alt):
+            raise RuntimeError("%s functions %s need ctx['alt_s'][%r]"
+                               % (flavor, ns, flavor))
+        text, done = splice_alt_spans(text, _read_bytes_str(alt), ns)
+        _write_bytes_str(s_file, text)
+        rewrote.extend(done)
     spans = split_spans(text)
     out = text
-    rewrote = []
     # Pass 1 -- text passes (reg_realloc / commutative_swap / laform). Splice from
     # the tail so earlier (start,end) offsets stay valid; words are always assembled
     # from the ON-DISK cc1 .s (unmodified until the pass-1 write below).
     for name, start, end in sorted(spans, key=lambda x: -x[1]):
         if name not in manifest:
             continue
-        passes = manifest[name].get("passes", [])
+        passes = [p for p in manifest[name].get("passes", []) if p not in META_PASSES]
         text_passes = [p for p in passes if p not in WORD_PASSES]
         if not text_passes:
             if any(p in WORD_PASSES for p in passes):
@@ -1917,4 +2241,4 @@ def normalize_s(s_file, ctx, manifest=None):
             out = out[:start] + new_span + out[end:]
 
     _write_bytes_str(s_file, out)
-    return sorted(rewrote)
+    return sorted(set(rewrote))
