@@ -693,7 +693,7 @@ PRE_SIGMA_PASSES = ("un_hi_cse", "un_hi_cse_store", "exit_merge")
 # assembler re-scheduling it. padnop needs neither (a trailing nop cannot be
 # rescheduled).
 WORD_PASSES = ("delay_fill", "epilogue_unfill", "reorder_indep", "padnop",
-               "prologue_save_hoist")
+               "prologue_save_hoist", "delay_slot_select")
 
 # minimal register def/use for the delay_fill dependency guard (gas `$reg` syntax)
 _STORE_MN = {"sb", "sh", "sw", "swl", "swr", "swc1", "swc2", "sd", "sdc1", "sdc2"}
@@ -1158,6 +1158,81 @@ def reorder_indep_src(span, tgt, our_words):
     return "\n".join(out), True
 
 
+def delay_slot_select_src(span, tgt, our_words):
+    """Swap a jal's delay-slot instruction with the instruction immediately before
+    the jal when the target has exactly those two transposed. Retail's cc1 and ours
+    both compute two independent argument-setup instructions before a call but pick
+    a different one to sink into the branch delay slot; ours does the reverse. A
+    delay-slot instruction executes before control transfers, so both orderings
+    present identical argument registers to the callee -- swapping the two is
+    semantics-preserving when they are register-independent. reorder_indep cannot
+    express this because the move crosses the jal (a control transfer it will not
+    hop). Target-guided and minimal: fires only on an exact A<->B transposition around
+    a jal where both A and B are pure-ALU and mutually independent and the slot does
+    not already match.
+
+    Anchored on the jal, NOT on a global 1:1 source-word mapping: the assembler inserts
+    load-delay nops elsewhere in the body, so the source-insn and word counts differ.
+    But a jal's immediate word neighbours DO correspond to its immediate source
+    neighbours -- the pre insn is pure-ALU (we check) so no nop is inserted between it
+    and the jal, and the following word is the delay slot itself. So align the k-th jal
+    across our words, the target words and the source insns, and read A/B from the jal's
+    neighbours in each. The touched region is wrapped in `.set noreorder` so the
+    assembler keeps the schedule. Returns (new_span, fired)."""
+    def _is_call(dis):
+        p = dis.split(None, 1)
+        return bool(p) and p[0].lower() in ("jal", "bal", "jalr")
+    lines = span.split("\n")
+    ins = [(i, l) for i, l in enumerate(lines) if _s_is_insn(l)]
+    our_jal = [k for k, (_w, d) in enumerate(our_words) if _is_call(d)]
+    tgt_jal = [k for k, (_w, d) in enumerate(tgt) if _is_call(d)]
+    src_jal = [p for p, (_i, l) in enumerate(ins)
+               if re.match(r"\s*(jal|bal|jalr)\b", l)]
+    if not our_jal or len(our_jal) != len(tgt_jal) or len(our_jal) != len(src_jal):
+        return span, False
+    swaps = []                              # (pre_pos, jal_pos, slot_pos) in ins
+    for k in range(len(our_jal)):
+        jw, tw, sp = our_jal[k], tgt_jal[k], src_jal[k]
+        if jw < 1 or jw + 1 >= len(our_words):
+            continue
+        if tw < 1 or tw + 1 >= len(tgt):
+            continue
+        if sp < 1 or sp + 1 >= len(ins):
+            continue
+        aw, bw = our_words[jw - 1], our_words[jw + 1]
+        if _word_eq(bw[0], tgt[tw + 1][0], tgt[tw + 1][1]):
+            continue                        # slot already correct
+        if not (_word_eq(aw[0], tgt[tw + 1][0], tgt[tw + 1][1]) and
+                _word_eq(bw[0], tgt[tw - 1][0], tgt[tw - 1][1])):
+            continue                        # not a clean pre<->slot transposition
+        a = ins[sp - 1][1].strip()
+        b = ins[sp + 1][1].strip()
+        if not (_pure_alu(a) and _pure_alu(b) and _indep(a, b)):
+            continue
+        swaps.append((sp - 1, sp, sp + 1))
+    if not swaps:
+        return span, False
+    final = {p: ins[p][1].strip() for p in range(len(ins))}
+    wrapped = set()
+    for pre, j, slot in swaps:
+        final[pre], final[slot] = ins[slot][1].strip(), ins[pre][1].strip()
+        wrapped |= {pre, j, slot}
+    line_pos = {ins[p][0]: p for p in range(len(ins))}
+    out = []
+    for idx, l in enumerate(lines):
+        if idx in line_pos:
+            p = line_pos[idx]
+            indent = _src_indent(ins[p][1])
+            if p in wrapped and (p - 1) not in wrapped:
+                out.append(indent + ".set\tnoreorder")
+            out.append(indent + final[p])
+            if p in wrapped and (p + 1) not in wrapped:
+                out.append(indent + ".set\treorder")
+        else:
+            out.append(l)
+    return "\n".join(out), True
+
+
 def _src_ra_save_idx(ins):
     """Index in the source insn list of the prologue `sw $ra,K($sp)` register-save,
     or None."""
@@ -1231,21 +1306,31 @@ _REORDER_SRC = {
     "delay_fill": delay_fill_src,
     "reorder_indep": reorder_indep_src,
     "prologue_save_hoist": prologue_save_hoist_src,
+    "delay_slot_select": delay_slot_select_src,
 }
 
 
-def emit_noreorder_span(span, tgt, our_words, reorder_passes):
+def emit_noreorder_span(span, tgt, our_words, reorder_passes, reassemble=None):
     """Apply the reordering source passes (delay_fill / epilogue_unfill) to a span
     in order. Each rewrites the cc1 source and wraps the touched instructions in
     `.set noreorder` so the assembler keeps the schedule. `tgt` is the target's
-    (pad-stripped) [(word, disasm)] list; `our_words` is our assembled span."""
+    (pad-stripped) [(word, disasm)] list; `our_words` is our assembled span.
+
+    A word-consuming pass (delay_fill / reorder_indep / delay_slot_select) reads the
+    ASSEMBLED words of the CURRENT source. When an earlier pass in the recipe already
+    reordered the source (e.g. prologue_save_hoist ahead of delay_slot_select), the
+    words from before that pass are stale and the positional guidance is wrong. If a
+    `reassemble(txt) -> words` callback is supplied, refresh the words from the current
+    span text before each word-consuming pass; otherwise fall back to the words passed
+    in (correct when no earlier pass moved anything)."""
     txt = span
     for name in reorder_passes:
         fn = _REORDER_SRC.get(name)
         if fn is None:
             raise NotImplementedError("reorder pass not wired: %s" % name)
-        if name in ("delay_fill", "reorder_indep"):
-            txt, _fired = fn(txt, tgt, our_words)
+        if name in ("delay_fill", "reorder_indep", "delay_slot_select"):
+            words = reassemble(txt) if reassemble is not None else our_words
+            txt, _fired = fn(txt, tgt, words)
         else:
             txt, _fired = fn(txt, tgt)
     return txt
@@ -1472,7 +1557,7 @@ def normalize_s(s_file, ctx, manifest=None):
                 continue
             reorder = [p for p in manifest[name]["passes"]
                        if p in ("delay_fill", "epilogue_unfill", "reorder_indep",
-                                "prologue_save_hoist")]
+                                "prologue_save_hoist", "delay_slot_select")]
             if not reorder:
                 continue
             our, err = assemble_words(ctx, s_file, name)
@@ -1483,7 +1568,18 @@ def normalize_s(s_file, ctx, manifest=None):
                 raise RuntimeError("no target .s for %s under %s"
                                    % (name, ctx["asm_root"]))
             tgt = _strip_trailing_pad(tgt)
-            new_span = emit_noreorder_span(out[start:end], tgt, our, reorder)
+
+            def _reasm(span_txt, _s=start, _e=end, _n=name):
+                """Refresh the assembled words from the current (partially reordered)
+                span so a later word-consuming pass sees the real schedule."""
+                _write_bytes_str(s_file, out[:_s] + span_txt + out[_e:])
+                w, werr = assemble_words(ctx, s_file, _n)
+                if werr:
+                    raise RuntimeError("assemble %s (reorder-refresh):\n%s" % (_n, werr))
+                return _strip_trailing_pad(w)
+
+            new_span = emit_noreorder_span(out[start:end], tgt, our, reorder,
+                                           reassemble=_reasm)
             out = out[:start] + new_span + out[end:]
 
         # 2b -- padnop (pure text append; re-measure against post-reorder words)
