@@ -453,6 +453,181 @@ def un_hi_cse_store_pass(stext, tgt):
 
 
 # --------------------------------------------------------------------------
+# base-CSE-collapse: our cc1 accesses a global through the split form
+# `lui $B,%hi(S); ... sw $x,%lo(S)($B)` and THEN materializes the full address
+# `addiu $B,$B,%lo(S)` for a later pointer use (e.g. passing &S to a call), so the
+# early accesses use the hi-only base and the later ones the full base. Retail
+# materializes the full base ONCE, right after the lui, and every access uses a
+# plain `k($B)` offset. laform is the wrong tool here (it would insert a SECOND
+# `addiu %lo` because the full base already exists). This pass moves the existing
+# `addiu $B,$B,%lo(S)` up to just after its lui and rewrites each intervening
+# `%lo(S)($B)` / `%lo(S+k)($B)` operand to `0($B)` / `k($B)`. Semantics-preserving
+# when, between the lui and the addiu, $B is never redefined and is only read as
+# the base of those %lo(S) memory operands (so after the move every such access
+# still computes %hi(S)+%lo(S)+k), and the region is straight-line (no label, no
+# branch, no noreorder block). Count-preserving but order-changing, so it runs
+# PRE_SIGMA (sigma is then derived from the collapsed, position-aligned words).
+# Target-guided: only symbols the target itself materializes as an adjacent
+# `lui R,%hi(S); addiu R,R,%lo(S)` pair.
+# --------------------------------------------------------------------------
+def target_collapse_syms(tgt):
+    """Symbols the target materializes as an adjacent `lui R,%hi(S)` +
+    `addiu R,R,%lo(S)` full base."""
+    syms = set()
+    lui_re = re.compile(r"lui\s+(\$?\w+)\s*,\s*%hi\(([\w.$]+)\)")
+    add_re = re.compile(r"addiu\s+(\$?\w+)\s*,\s*(\$?\w+)\s*,\s*%lo\(([\w.$]+)\)")
+    for i in range(len(tgt) - 1):
+        a = lui_re.search(tgt[i][1])
+        b = add_re.search(tgt[i + 1][1])
+        if not a or not b:
+            continue
+        r = norm_reg(a.group(1))
+        if (a.group(2) == b.group(3) and norm_reg(b.group(1)) == r
+                and norm_reg(b.group(2)) == r):
+            syms.add(a.group(2))
+    return syms
+
+
+def _label_referenced(lines, name):
+    """Some instruction line references label `name` (a real branch target), as
+    opposed to cc1's `LMn:` line-marker labels, which nothing branches to."""
+    pat = re.compile(r"(?<![\w$.])" + re.escape(name) + r"(?![\w$])")
+    return any(_is_insn_line(l) and pat.search(l.split("#", 1)[0]) for l in lines)
+
+
+def base_cse_collapse_s(stext, syms):
+    """Fold split `%lo(S)($B)` accesses onto the full base `addiu $B,$B,%lo(S)` that
+    follows them, moving that addiu up to just after the lui. See block comment."""
+    if not syms:
+        return stext
+    lines = stext.split("\n")
+    changed = False
+    for sym in syms:
+        i = 0
+        while i < len(lines):
+            m = _LUI_HI.match(lines[i])
+            if not m or m.group(3) != sym:
+                i += 1
+                continue
+            indent, base = m.group(1) or "\t", m.group(2)
+            reg_re = re.compile(r"(?<![\w$])" + re.escape(base) + r"(?![\w])")
+            lo_re = re.compile(r"%lo\(" + re.escape(sym) + r"(?:\+(\d+))?\)\("
+                               + re.escape(base) + r"\)")
+            add_re = re.compile(r"^\s*addiu\s+" + re.escape(base) + r"\s*,\s*"
+                                + re.escape(base) + r"\s*,\s*%lo\(" + re.escape(sym)
+                                + r"\)\s*(#.*)?$")
+            hits, add_i, j = [], None, i + 1
+            while j < len(lines):
+                s = lines[j].strip()
+                if s.startswith(".set") and "noreorder" in s:
+                    break
+                if s.endswith(":") and not s.startswith(".") and \
+                        _label_referenced(lines, s[:-1]):
+                    break                       # branch target -> not straight-line
+                if not _is_insn_line(lines[j]):
+                    j += 1
+                    continue
+                if add_re.match(lines[j]):
+                    add_i = j
+                    break
+                body = lines[j].split("#", 1)[0]
+                mn = _line_mnem(lines[j])
+                if _COND_S.match(mn) or mn in ("j", "jr", "jal", "jalr", "b", "bal"):
+                    break
+                if re.match(r"\s*[a-z][\w.]*\s+" + re.escape(base) + r"\s*,", body) \
+                        and mn not in _STORE_MN:
+                    break                       # $B redefined
+                if reg_re.search(body):
+                    if len(lo_re.findall(body)) != 1 or \
+                            reg_re.search(lo_re.sub("", body)):
+                        break                   # $B read other than as %lo(S) base
+                    hits.append(j)
+                j += 1
+            if add_i is None or not hits:
+                i += 1
+                continue
+            for h in hits:
+                lines[h] = lo_re.sub(lambda mm: "%d(%s)" % (int(mm.group(1) or 0), base),
+                                     lines[h])
+            add_line = lines.pop(add_i)
+            lines.insert(i + 1, add_line)
+            changed = True
+            i = add_i + 1
+    return "\n".join(lines) if changed else stext
+
+
+def base_cse_collapse_pass(stext, tgt):
+    return base_cse_collapse_s(stext, target_collapse_syms(tgt))
+
+
+# --------------------------------------------------------------------------
+# shift-const-fold: our cc1's CSE sees a constant K already live in a register
+# (`li $r,K`, e.g. a value about to be stored) and substitutes that register for
+# the constant shift count, emitting `sll $d,$s,$r` (gas: sllv) where retail keeps
+# the immediate form `sll $d,$s,K`. Rewrite the register-count shift back to the
+# immediate form when the count register's straight-line reaching definition in
+# the span is `li $r,K` (or `addiu/ori $r,$0,K`) with 0 <= K <= 31. Semantics-
+# preserving: a variable shift uses the low 5 bits of the count register, which
+# equal K. Target-guided: only for (op, K) pairs the target itself emits as an
+# immediate shift. Count-preserving; runs PRE_SIGMA so sigma is not derived from a
+# sllv/sll opcode-field mismatch.
+# --------------------------------------------------------------------------
+_SHIFT_REG_S = re.compile(r"^(\s*)(sll|srl|sra)(v?)\s+(\$\w+)\s*,\s*(\$\w+)\s*,\s*(\$\w+)\s*(#.*)?$")
+_CONST_DEF_S = re.compile(
+    r"^\s*(?:li\s+(\$\w+)\s*,\s*(-?(?:0x[0-9a-fA-F]+|\d+))"
+    r"|(?:addiu|ori)\s+(\$\w+)\s*,\s*\$(?:0|zero)\s*,\s*(-?(?:0x[0-9a-fA-F]+|\d+)))\s*(#.*)?$")
+
+
+def target_imm_shifts(tgt):
+    """{(op, K)} immediate shifts the target emits, e.g. ("sll", 16)."""
+    out = set()
+    pat = re.compile(r"^(sll|srl|sra)\s+\S+\s*,\s*\S+\s*,\s*(0x[0-9a-fA-F]+|\d+)\s*$")
+    for _w, dis in tgt:
+        m = pat.match(dis.strip())
+        if m:
+            out.add((m.group(1), int(m.group(2), 0)))
+    return out
+
+
+def shift_const_fold_s(stext, allowed):
+    if not allowed:
+        return stext
+    lines = stext.split("\n")
+    ins = [(i, l) for i, l in enumerate(lines) if _s_is_insn(l)]
+    changed = False
+    for p, (li, l) in enumerate(ins):
+        m = _SHIFT_REG_S.match(l)
+        if not m:
+            continue
+        cnt = _src_reg(m.group(6))
+        if not cnt:
+            continue
+        k = None
+        for q in range(p - 1, -1, -1):
+            qi, ql = ins[q]
+            if _src_is_branch(ql) or any(_branch_target_label(lines, ins, x)
+                                        for x in lines[qi:li]):
+                break
+            d, _u = defs_uses(ql.split("#", 1)[0].strip())
+            if cnt in d:
+                c = _CONST_DEF_S.match(ql)
+                if c:
+                    reg = c.group(1) or c.group(3)
+                    if _src_reg(reg) == cnt:
+                        k = int(c.group(2) or c.group(4), 0)
+                break
+        if k is None or not (0 <= k <= 31) or (m.group(2), k) not in allowed:
+            continue
+        lines[li] = "%s%s\t%s,%s,%d" % (m.group(1), m.group(2), m.group(4), m.group(5), k)
+        changed = True
+    return "\n".join(lines) if changed else stext
+
+
+def shift_const_fold_pass(stext, tgt):
+    return shift_const_fold_s(stext, target_imm_shifts(tgt))
+
+
+# --------------------------------------------------------------------------
 # exit-merge: cc1 emits each return as its own `j $31` (with the return value in
 # the delay slot); retail funnels every return through ONE shared `jr $ra` laid
 # last, other paths reaching it by `j <EXIT>`. Rewrite the cc1 source so its
@@ -666,13 +841,16 @@ PASSES = {
     "commutative_swap": commutative_swap_s,
     "operand_recolor": operand_recolor_s,
     "laform": laform_fold_pass,
+    "base_cse_collapse": base_cse_collapse_pass,
+    "shift_const_fold": shift_const_fold_pass,
 }
 
 # Passes that CHANGE the instruction count and so must run BEFORE sigma is derived
 # (the register correspondence has to be built from count-aligned assembly). Any
 # such pass listed in a recipe is applied ahead of reg_realloc regardless of the
 # manifest order; the rest keep their listed order after sigma.
-PRE_SIGMA_PASSES = ("un_hi_cse", "un_hi_cse_store", "exit_merge")
+PRE_SIGMA_PASSES = ("un_hi_cse", "un_hi_cse_store", "exit_merge", "base_cse_collapse",
+                    "shift_const_fold")
 
 # --------------------------------------------------------------------------
 # WORD-LEVEL passes. The original PSY-Q assembler (aspsx) scheduled branch and
@@ -1158,6 +1336,134 @@ def reorder_indep_src(span, tgt, our_words):
     return "\n".join(out), True
 
 
+def _mem_operand(line):
+    """(base_reg, offset, size) of a load/store `op $r,off($b)` source/disasm line,
+    or None. Offset must be a plain integer (a %lo reloc operand returns None)."""
+    body = line.split("#", 1)[0].strip()
+    p = body.split(None, 1)
+    if len(p) < 2:
+        return None
+    size = {"sb": 1, "sh": 2, "sw": 4, "lb": 1, "lbu": 1, "lh": 2, "lhu": 2,
+            "lw": 4}.get(p[0].lower())
+    if size is None:
+        return None
+    ops = split_ops(p[1])
+    mm = (re.fullmatch(r"(-?(?:0x[0-9a-fA-F]+|\d+))\((\$?\w+)\)", ops[-1].strip())
+          if ops else None)
+    if not mm:
+        return None
+    return _src_reg(mm.group(2)), int(mm.group(1), 0), size
+
+
+def _global_base(ins, idx, reg):
+    """True when the most recent source definition of `reg` before insn `idx` is a
+    `lui reg,%hi(S)` or `addiu reg,reg,%lo(S)` -- i.e. reg holds a global's address,
+    which can never point into the current stack frame."""
+    for k in range(idx - 1, -1, -1):
+        d, _u = defs_uses(ins[k][1].split("#", 1)[0].strip())
+        if reg in d:
+            body = ins[k][1]
+            return bool(re.match(r"\s*lui\s+\S+\s*,\s*%hi\(", body) or
+                        re.match(r"\s*addiu\s+\S+\s*,\s*\S+\s*,\s*%lo\(", body))
+    return False
+
+
+def _no_alias(ins, ia, ib):
+    """Two source memory insns (by index) provably touch disjoint bytes: same base
+    register (not redefined between them) with disjoint [off, off+size) ranges, or
+    one is $sp-framed and the other's base holds a global address."""
+    ma, mb = _mem_operand(ins[ia][1]), _mem_operand(ins[ib][1])
+    if ma is None or mb is None:
+        return False
+    (ba, oa, sa), (bb, ob, sb) = ma, mb
+    if ba == bb:
+        lo, hi = min(ia, ib), max(ia, ib)
+        for k in range(lo + 1, hi):
+            if ba in defs_uses(ins[k][1].split("#", 1)[0].strip())[0]:
+                return False
+        return oa + sa <= ob or ob + sb <= oa
+    if ba == "sp" and _global_base(ins, ib, bb):
+        return True
+    if bb == "sp" and _global_base(ins, ia, ba):
+        return True
+    return False
+
+
+def _branch_target_label(lines, ins, l):
+    """`l` is a label some instruction in the span references (a real control-flow
+    join), as opposed to cc1's `LMn:` line-marker labels, which nothing branches to."""
+    if not _s_is_label(l):
+        return False
+    name = l.strip()[:-1]
+    pat = re.compile(r"(?<![\w$.])" + re.escape(name) + r"(?![\w$])")
+    return any(pat.search(il.split("#", 1)[0]) for _i, il in ins)
+
+
+def _slot_sink_mover(lines, ins, sp, our_words, jw, tgt_slot):
+    """For the jal at source index `sp` / word index `jw`, find the earlier source
+    insn A the target sinks into the delay slot (its word equals `tgt_slot`) and
+    return A's source index when moving it down past the intervening insns W and the
+    current slot insn B is semantics-preserving; else None.
+
+    The window A..jal must map 1:1 source<->word (only stores and non-macro pure-ALU
+    insns, which maspsx never pads), A must be a store or pure-ALU insn, register-
+    independent of every insn in W and of B, and -- when A is a store -- provably
+    non-aliasing with every memory insn in W. B must be pure-ALU (it only crosses the
+    jal, which it already preceded in execution as a delay-slot insn)."""
+    def _plain(line):
+        b = line.split("#", 1)[0].strip()
+        mn = b.split(None, 1)[0].lower() if b else ""
+        if mn in ("la",):
+            return False                    # macro -> multi-word
+        if mn == "li":
+            v = split_ops(b.split(None, 1)[1])[-1]
+            try:
+                n = int(v, 0)
+            except ValueError:
+                return False
+            return -0x8000 <= n <= 0xFFFF
+        return mn in _PURE_ALU or mn in _STORE_MN
+
+    def _clean(line):
+        return line.split("#", 1)[0].strip()
+
+    if sp + 1 >= len(ins):
+        return None
+    b = _clean(ins[sp + 1][1])
+    if not _pure_alu(b):
+        return None
+    if sp < 1 or not _plain(ins[sp - 1][1]):
+        return None
+    for d in range(2, jw + 1):
+        p, sa = jw - d, sp - d
+        if sa < 0:
+            return None
+        if not _plain(ins[sa][1]):
+            return None
+        if not _word_eq(our_words[p][0], tgt_slot[0], tgt_slot[1]):
+            continue
+        if sa >= 1 and _src_is_branch(ins[sa - 1][1]):
+            return None                     # A is another branch's delay slot
+        if any(_branch_target_label(lines, ins, l)
+               for l in lines[ins[sa][0]:ins[sp][0]]):
+            return None                     # a join point inside the window
+        a = _clean(ins[sa][1])
+        a_store = a.split(None, 1)[0].lower() in _STORE_MN
+        if not (a_store or _pure_alu(a)):
+            return None
+        for k in range(sa + 1, sp):
+            w = _clean(ins[k][1])
+            if not _indep(a, w):
+                return None
+            if a_store and w.split(None, 1)[0].lower() in _STORE_MN:
+                if not _no_alias(ins, sa, k):
+                    return None
+        if not _indep(a, b):
+            return None
+        return sa
+    return None
+
+
 def delay_slot_select_src(span, tgt, our_words):
     """Swap a jal's delay-slot instruction with the instruction immediately before
     the jal when the target has exactly those two transposed. Retail's cc1 and ours
@@ -1202,21 +1508,31 @@ def delay_slot_select_src(span, tgt, our_words):
         aw, bw = our_words[jw - 1], our_words[jw + 1]
         if _word_eq(bw[0], tgt[tw + 1][0], tgt[tw + 1][1]):
             continue                        # slot already correct
-        if not (_word_eq(aw[0], tgt[tw + 1][0], tgt[tw + 1][1]) and
-                _word_eq(bw[0], tgt[tw - 1][0], tgt[tw - 1][1])):
-            continue                        # not a clean pre<->slot transposition
-        a = ins[sp - 1][1].strip()
-        b = ins[sp + 1][1].strip()
-        if not (_pure_alu(a) and _pure_alu(b) and _indep(a, b)):
+        if not _word_eq(bw[0], tgt[tw - 1][0], tgt[tw - 1][1]):
+            continue                        # our slot insn is not the target's pre
+        if _word_eq(aw[0], tgt[tw + 1][0], tgt[tw + 1][1]):
+            a = ins[sp - 1][1].strip()
+            b = ins[sp + 1][1].strip()
+            if not (_pure_alu(a) and _pure_alu(b) and _indep(a, b)):
+                continue
+            swaps.append((sp - 1, sp, sp + 1))
             continue
-        swaps.append((sp - 1, sp, sp + 1))
+        # sink: the target's slot insn sits FURTHER back in ours (a store, e.g. a
+        # struct field init, that retail's scheduler sank into the call's slot).
+        m = _slot_sink_mover(lines, ins, sp, our_words, jw, tgt[tw + 1])
+        if m is not None:
+            swaps.append((m, sp, sp + 1))
     if not swaps:
         return span, False
-    final = {p: ins[p][1].strip() for p in range(len(ins))}
+    order = list(range(len(ins)))
     wrapped = set()
-    for pre, j, slot in swaps:
-        final[pre], final[slot] = ins[slot][1].strip(), ins[pre][1].strip()
-        wrapped |= {pre, j, slot}
+    for pre, j, slot in sorted(swaps, reverse=True):
+        # A (at `pre`) goes to the slot; B (the old slot) goes just before the jal;
+        # everything between keeps its order. The adjacent case is a transposition.
+        blk = order[pre:slot + 1]
+        order[pre:slot + 1] = blk[1:-2] + [blk[-1], blk[-2], blk[0]]
+        wrapped |= set(range(pre, slot + 1))
+    final = {p: ins[order[p]][1].strip() for p in range(len(ins))}
     line_pos = {ins[p][0]: p for p in range(len(ins))}
     out = []
     for idx, l in enumerate(lines):
