@@ -628,6 +628,142 @@ def shift_const_fold_pass(stext, tgt):
 
 
 # --------------------------------------------------------------------------
+# zero-remat: our cc1 copies a register it knows holds zero (`move $d,$s` right
+# after `move $s,$0`, e.g. two zero call arguments) where retail materializes the
+# zero again (`addu $d,$zero,$zero`). Rewrite the copy to `move $d,$0` when the
+# source register's straight-line reaching definition in the span is a zero
+# materialization. Semantics-preserving ($s is 0 there). Target-guided: rewrites
+# at most as many copies as the target has more zero materializations than ours,
+# in source order. Count-preserving; runs PRE_SIGMA with shift_const_fold.
+# --------------------------------------------------------------------------
+_MOVE_S = re.compile(r"^(\s*)move\s+(\$\w+)\s*,\s*(\$\w+)\s*(#.*)?$")
+_ZERO_DEF_S = re.compile(
+    r"^\s*(?:move\s+(\$\w+)\s*,\s*\$(?:0|zero)"
+    r"|li\s+(\$\w+)\s*,\s*0"
+    r"|(?:addu|or)\s+(\$\w+)\s*,\s*\$(?:0|zero)\s*,\s*\$(?:0|zero)"
+    r"|(?:addiu|ori)\s+(\$\w+)\s*,\s*\$(?:0|zero)\s*,\s*0)\s*(#.*)?$")
+_ZERO_TGT = re.compile(r"^(?:addu|or)\s+\S+\s*,\s*\$?zero\s*,\s*\$?zero\s*$"
+                       r"|^(?:addiu|ori)\s+\S+\s*,\s*\$?zero\s*,\s*0x0*\s*$"
+                       r"|^(?:move\s+\S+\s*,\s*\$?zero|li\s+\S+\s*,\s*0)\s*$")
+
+
+def zero_remat_s(stext, budget):
+    if budget <= 0:
+        return stext
+    lines = stext.split("\n")
+    ins = [(i, l) for i, l in enumerate(lines) if _s_is_insn(l)]
+    changed = False
+    for p, (li, l) in enumerate(ins):
+        if budget <= 0:
+            break
+        m = _MOVE_S.match(l)
+        if not m:
+            continue
+        src = _src_reg(m.group(3))
+        if not src or src == _src_reg("$0"):
+            continue
+        zero = False
+        for q in range(p - 1, -1, -1):
+            qi, ql = ins[q]
+            if q == p - 1 and _src_is_branch(ql):
+                continue            # we sit in its delay slot: it has not transferred yet
+            if _src_is_branch(ql) or any(_branch_target_label(lines, ins, x)
+                                        for x in lines[qi:li]):
+                break
+            d, _u = defs_uses(ql.split("#", 1)[0].strip())
+            if src in d:
+                z = _ZERO_DEF_S.match(ql)
+                zero = bool(z) and _src_reg(next(g for g in z.groups()[:4] if g)) == src
+                break
+        if not zero:
+            continue
+        lines[li] = "%smove\t%s,$0" % (m.group(1), m.group(2))
+        budget -= 1
+        changed = True
+    return "\n".join(lines) if changed else stext
+
+
+def _tail_count(dis_list, src=False):
+    """Words after the `lw $ra` restore that are not frame loads, stack adjusts,
+    returns or nops (the work the epilogue still does after reloading $ra).
+    src=True: the list is cc1 source insns, weighted by their assembled length."""
+    n = 0
+    for d in dis_list:
+        t = d.split("#", 1)[0].strip() if src else d.strip()
+        p = t.split(None, 1)
+        if not p:
+            continue
+        mn = p[0].lower()
+        if mn in ("jr", "j") or is_nop(t):
+            break
+        if _frame_load(t) or _src_sp_delta(t) is not None:
+            continue
+        n += _src_nwords(t) if src else 1
+    return n
+
+
+# --------------------------------------------------------------------------
+# ra-restore-sink: our cc1 (notably in no-split units, where a global store or an
+# `la` is one macro insn to the scheduler) reloads `$ra` early in the epilogue,
+# ahead of trailing global stores or the return-value setup; retail reloads it
+# after them. Sink our `lw $31,K($sp)` past as many trailing words as the target
+# still executes after its own `lw $ra`. Semantics-preserving: every insn passed is
+# checked not to read or write $31/$sp and not to store into the frame word K;
+# control flow and labels stop the move. Count-preserving text pass.
+# --------------------------------------------------------------------------
+def ra_restore_sink_pass(stext, tgt):
+    tl = [d for _w, d in tgt]
+    t_ra = [i for i, d in enumerate(tl) if re.match(r"\s*lw\s+\$?ra\s*,", d)]
+    if not t_ra:
+        return stext
+    want = _tail_count(tl[t_ra[-1] + 1:])
+    lines = stext.split("\n")
+    ins = [(i, l) for i, l in enumerate(lines) if _s_is_insn(l)]
+    o_ra = [p for p, (_i, l) in enumerate(ins)
+            if re.match(r"\s*lw\s+\$(?:31|ra)\s*,\s*(-?\d+)\(\$(?:sp|29)\)", l)]
+    if not o_ra:
+        return stext
+    p0 = o_ra[-1]
+    k = int(re.match(r"\s*lw\s+\S+\s*,\s*(-?\d+)", ins[p0][1]).group(1))
+    have = _tail_count([l for _i, l in ins[p0 + 1:]], src=True)
+    need = have - want
+    if need <= 0:
+        return stext
+    last = None
+    q = p0 + 1
+    while need > 0 and q < len(ins):
+        qi, ql = ins[q]
+        body = ql.split("#", 1)[0].strip()
+        if _src_is_branch(ql) or _src_is_ret(ql) or any(
+                _branch_target_label(lines, ins, x) for x in lines[ins[q - 1][0] + 1:qi]):
+            return stext
+        d, u = defs_uses(body)
+        if {"ra", "sp"} & (set(d) | set(u)) and not _frame_load(body):
+            return stext
+        mo = _mem_operand(body)
+        if mo and mo[0] == "sp" and body.split()[0].lower() in _STORE_MN \
+                and mo[1] < k + 4 and k < mo[1] + mo[2]:
+            return stext
+        if not (_frame_load(body) or _src_sp_delta(body) is not None):
+            need -= _src_nwords(ql)
+        last = q
+        q += 1
+    if need != 0 or last is None:
+        return stext
+    li = ins[p0][0]
+    moved = lines[li]
+    at = ins[last][0]
+    out = lines[:li] + lines[li + 1:at + 1] + [moved] + lines[at + 1:]
+    return "\n".join(out)
+
+
+def zero_remat_pass(stext, tgt):
+    want = sum(1 for _w, dis in tgt if _ZERO_TGT.match(dis.strip()))
+    have = sum(1 for l in stext.split("\n")
+               if _s_is_insn(l) and _ZERO_DEF_S.match(l))
+    return zero_remat_s(stext, want - have)
+
+# --------------------------------------------------------------------------
 # exit-merge: cc1 emits each return as its own `j $31` (with the return value in
 # the delay slot); retail funnels every return through ONE shared `jr $ra` laid
 # last, other paths reaching it by `j <EXIT>`. Rewrite the cc1 source so its
@@ -855,6 +991,8 @@ PASSES = {
     "laform": laform_fold_pass,
     "base_cse_collapse": base_cse_collapse_pass,
     "shift_const_fold": shift_const_fold_pass,
+    "zero_remat": zero_remat_pass,
+    "ra_restore_sink": ra_restore_sink_pass,
 }
 
 # Passes that CHANGE the instruction count and so must run BEFORE sigma is derived
@@ -862,7 +1000,7 @@ PASSES = {
 # such pass listed in a recipe is applied ahead of reg_realloc regardless of the
 # manifest order; the rest keep their listed order after sigma.
 PRE_SIGMA_PASSES = ("un_hi_cse", "un_hi_cse_store", "exit_merge", "base_cse_collapse",
-                    "shift_const_fold")
+                    "shift_const_fold", "zero_remat")
 
 # --------------------------------------------------------------------------
 # WORD-LEVEL passes. The original PSY-Q assembler (aspsx) scheduled branch and
