@@ -711,7 +711,343 @@ def _tail_count(dis_list, src=False):
 # checked not to read or write $31/$sp and not to store into the frame word K;
 # control flow and labels stop the move. Count-preserving text pass.
 # --------------------------------------------------------------------------
+_CALLEE_RS = {"s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7", "fp", "ra"}
+
+
+def _callee_restore(body):
+    """Dest reg of a callee-saved restore `lw $sN/$fp/$ra,K($sp)`, else None."""
+    if not _frame_load(body):
+        return None
+    d, _u = defs_uses(body)
+    d = set(d) & _CALLEE_RS
+    return next(iter(d)) if len(d) == 1 else None
+
+
+def _unit_permute(lines, blk, order):
+    """Rewrite the line range covered by units `blk` [(a, z, body), ...] so unit
+    order[k] occupies slot k; non-unit lines between units stay in place."""
+    texts = [lines[a:z + 1] for a, z, _b in blk]
+    seg = []
+    for k, (a, z, _b) in enumerate(blk):
+        seg.extend(texts[order[k]])
+        nxt = blk[k + 1][0] if k + 1 < len(blk) else z + 1
+        seg.extend(lines[z + 1:nxt])
+    lines[blk[0][0]:blk[-1][1] + 1] = seg
+
+
+def _unit_words(body):
+    return 2 if re.search(r"%lo\(", body) else _src_nwords(body)
+
+
+def callee_restore_sink_s(stext, tgt):
+    """Second phase of ra_restore_sink: the whole callee-saved restore group.
+    Retail can keep all `lw $sN/$ra` restores after trailing work (global stores,
+    return setup) where our cc1 interleaves them. Hoist our earliest trailing work
+    units above the first restore until the work left after it equals the
+    target's. Each hoisted unit must not read/write a register restored by a load
+    it passes, touch $sp, or store into the frame; labels/branches stop the move.
+    Units are single insns or `.set noat` expanded symbolic accesses (moved whole)."""
+    tl = [d for _w, d in tgt]
+    rets = [i for i, d in enumerate(tl) if re.match(r"\s*jr\s+\$?ra\s*$", d.strip())]
+    if not rets:
+        return stext
+    j = rets[-1]
+    first = None
+    for i in range(j - 1, -1, -1):
+        mn = tl[i].split(None, 1)[0].lower() if tl[i].strip() else ""
+        if mn.startswith("b") or mn in ("j", "jal", "jr", "jalr"):
+            break
+        if _callee_restore(tl[i].strip()):
+            first = i
+    if first is None:
+        return stext
+    want = _tail_count(tl[first + 1:])
+    lines = stext.split("\n")
+    ins = [(i, l) for i, l in enumerate(lines) if _s_is_insn(l)]
+    blocks = _sm_units(lines, ins)
+    orets = [i for i, l in ins if _src_is_ret(l)]
+    if not orets or not blocks:
+        return stext
+    # the block that ends right before the return (the `.set noreorder` return
+    # group starts the next block)
+    before = [b for b in blocks if b[-1][1] < orets[-1]]
+    if not before:
+        return stext
+    blk = before[-1]
+    if any(i > blk[-1][1] and i < orets[-1] and not lines[i].strip().startswith(".set")
+           for i, _l in ins):
+        return stext
+    bodies = [_sm_dep_body(b) for _a, _z, b in blk]
+    rest = [k for k, b in enumerate(bodies) if _callee_restore(b)]
+    if not rest:
+        return stext
+    k0 = rest[0]
+    have = sum(_unit_words(b) for b in bodies[k0 + 1:]
+               if not (_frame_load(b) or _src_sp_delta(b) is not None))
+    need = have - want
+    if need < 0:
+        return stext
+    hoist, passed = [], set()
+    for k in range(k0, len(blk)):
+        if need <= 0:
+            break
+        b = bodies[k]
+        r = _callee_restore(b)
+        if r:
+            passed.add(r)
+            continue
+        if _src_sp_delta(b) is not None or _frame_load(b):
+            return stext
+        d, u = defs_uses(b)
+        if (set(d) | set(u)) & (passed | {"sp"}):
+            return stext
+        hoist.append(k)
+        need -= _unit_words(b)
+    if need != 0:
+        return stext
+    if hoist:
+        order = list(range(k0)) + hoist + [k for k in range(k0, len(blk)) if k not in hoist]
+        _unit_permute(lines, blk, order)
+    return _restore_group_order("\n".join(lines), tl, first, j)
+
+
+def _restore_group_order(stext, tl, first, j):
+    """When our epilogue ends in a contiguous run of callee-saved restores holding
+    the same registers as the target's trailing run, emit them in the target's
+    order (loads from distinct frame words into distinct regs commute)."""
+    t_regs = [_callee_restore(tl[i].strip()) for i in range(first, j)]
+    if not t_regs or None in t_regs:
+        return stext
+    lines = stext.split("\n")
+    ins = [(i, l) for i, l in enumerate(lines) if _s_is_insn(l)]
+    orets = [p for p, (_i, l) in enumerate(ins) if _src_is_ret(l)]
+    if not orets:
+        return stext
+    pr = orets[-1]
+    grp = []
+    for p in range(pr - 1, -1, -1):
+        r = _callee_restore(ins[p][1].split("#", 1)[0].strip())
+        if not r:
+            break
+        grp.insert(0, (p, r))
+    if len(grp) != len(t_regs) or sorted(r for _p, r in grp) != sorted(t_regs):
+        return stext
+    if any(_branch_target_label(lines, ins, x)
+           for x in lines[ins[grp[0][0]][0] + 1:ins[grp[-1][0]][0]]):
+        return stext
+    by = {r: lines[ins[p][0]] for p, r in grp}
+    for (p, _r), tr in zip(grp, t_regs):
+        lines[ins[p][0]] = by[tr]
+    return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------
+# sched-match: retail sometimes keeps a straight-line block in source order where
+# our sched2 hoists some insns (e.g. global stores of s-regs moved up so the
+# restores can issue early). Match every insn of a straight-line source block to a
+# target insn by a canonical key (mnemonic, regs, immediate / symbol; symbolic
+# macros keyed by their symbol so `lui $at` halves are ignored), then emit the
+# block in target order when every transposed pair is independent: no register
+# RAW/WAR/WAW, and memory ops only transpose when neither stores or they touch
+# provably different places (distinct symbols, or $sp frame vs a symbol, or
+# disjoint $sp words). Blocks end at labels that are branch targets, branches,
+# calls and `.set noreorder` regions. Count-preserving text pass.
+# --------------------------------------------------------------------------
+_SYM_RE = re.compile(r"%(?:hi|lo)\(([^)]+)\)")
+
+
+def _sm_int(t):
+    try:
+        return int(t, 0)
+    except ValueError:
+        return None
+
+
+def _sm_key(body, target):
+    p = body.split(None, 1)
+    if not p:
+        return None
+    mn = p[0].lower()
+    ops = [o.strip() for o in split_ops(p[1])] if len(p) > 1 else []
+    if target:
+        syms = _SYM_RE.findall(body)
+        if syms:
+            if mn == "lui":
+                return "skip"
+            reg = norm_reg(ops[0]) if ops else None
+            if mn in ("addiu", "ori"):
+                return ("la", reg, syms[0])
+            return (mn, reg, syms[0])
+    else:
+        mo = _mem_operand(body)
+        if mn in _STORE_MN or mn in ("lw", "lh", "lhu", "lb", "lbu"):
+            if len(ops) == 2 and not mo and "(" not in ops[1]:
+                return (mn, norm_reg(ops[0]), ops[1])
+        if mn == "la" and len(ops) == 2:
+            return ("la", norm_reg(ops[0]), ops[1])
+        if mn == "move" and len(ops) == 2:
+            mn, ops = "addu", [ops[0], ops[1], "$0"]
+        elif mn == "li" and len(ops) == 2:
+            v = _sm_int(ops[1])
+            if v is None or not -0x8000 <= v < 0x8000:
+                return None
+            mn, ops = "addiu", [ops[0], "$0", ops[1]]
+        elif mn == "subu" and len(ops) == 3 and _sm_int(ops[2]) is not None:
+            mn, ops = "addiu", [ops[0], ops[1], str(-_sm_int(ops[2]))]
+        elif mn == "addu" and len(ops) == 3 and _sm_int(ops[2]) is not None:
+            mn = "addiu"
+    key = [mn]
+    for o in ops:
+        m = re.fullmatch(r"(-?(?:0x[0-9a-fA-F]+|\d+))\((\$?\w+)\)", o)
+        if m:
+            key += [int(m.group(1), 0), norm_reg(m.group(2))]
+        elif _sm_int(o) is not None:
+            key.append(_sm_int(o))
+        elif o.startswith("$"):
+            r = norm_reg(o)
+            key.append("zero" if r in ("zero", "0") else r)
+        else:
+            return None
+    return tuple(key)
+
+
+def _sm_mem(body):
+    """None (no memory), or (is_store, where) with where = ('sym', name) /
+    ('sp', off, size) / ('any',)."""
+    p = body.split(None, 1)
+    mn = p[0].lower() if p else ""
+    if not (mn in _STORE_MN or mn in ("lw", "lh", "lhu", "lb", "lbu", "lwl", "lwr")):
+        return None
+    st = mn in _STORE_MN
+    mo = _mem_operand(body)
+    if mo:
+        return (st, ("sp", mo[1], mo[2]) if mo[0] == "sp" else ("any",))
+    ops = split_ops(p[1]) if len(p) > 1 else []
+    if len(ops) == 2 and "(" not in ops[1]:
+        return (st, ("sym", re.split(r"[+-]", ops[1].strip())[0]))
+    return (st, ("any",))
+
+
+def _sm_indep(a, b):
+    da, ua = defs_uses(a)
+    db, ub = defs_uses(b)
+    da, ua, db, ub = set(da), set(ua), set(db), set(ub)
+    if da & (db | ub) or ua & db:
+        return False
+    ma, mb = _sm_mem(a), _sm_mem(b)
+    if ma and mb and (ma[0] or mb[0]):
+        wa, wb = ma[1], mb[1]
+        if "any" in (wa[0], wb[0]):
+            return False
+        if wa[0] == "sym" and wb[0] == "sym":
+            return wa[1] != wb[1]
+        if wa[0] == "sp" and wb[0] == "sp":
+            return wa[1] + wa[2] <= wb[1] or wb[1] + wb[2] <= wa[1]
+        return True                         # frame vs global symbol
+    return True
+
+
+def _sm_units(lines, ins):
+    """Straight-line blocks of movable units. A unit is one insn line, or an
+    explicitly expanded symbolic access `.set noat; lui $1,%hi(S); op ..%lo(S)($1);
+    .set at` (keyed and dependency-checked by its %lo insn). Returns
+    [[(first_line, last_line, key_body), ...], ...]."""
+    blocks, cur, noreo, prev_br = [], [], False, False
+    ins_at = {i for i, _l in ins}
+
+    def flush():
+        if len(cur) > 1:
+            blocks.append(list(cur))
+        del cur[:]
+    i = 0
+    while i < len(lines):
+        l = lines[i]
+        s = l.strip()
+        if s.startswith(".set") and s.split()[-1] == "noat" and not noreo:
+            j = i + 1
+            grp = []
+            while j < len(lines) and not (lines[j].strip().startswith(".set")
+                                          and lines[j].strip().split()[-1] == "at"):
+                if j in ins_at:
+                    grp.append(j)
+                j += 1
+            if (j < len(lines) and len(grp) == 2 and not prev_br
+                    and re.match(r"\s*lui\s+\$(?:1|at)\s*,\s*%hi\(", lines[grp[0]])):
+                cur.append((i, j, lines[grp[1]].split("#", 1)[0].strip()))
+                i = j + 1
+                continue
+            flush()
+            i = j + 1
+            prev_br = False
+            continue
+        if s.startswith(".set") and "noreorder" in s:
+            noreo = True
+        elif s.startswith(".set") and s.split()[-1] == "reorder":
+            noreo = False
+        if i in ins_at:
+            br = bool(_src_is_branch(l) or _src_is_ret(l) or re.match(r"\s*jalr?\b", l))
+            if noreo or br or prev_br:
+                flush()
+            else:
+                cur.append((i, i, l.split("#", 1)[0].strip()))
+            prev_br = br
+        elif _branch_target_label(lines, ins, l):
+            flush()
+        i += 1
+    flush()
+    return blocks
+
+
+def _sm_srckey(body):
+    m = re.match(r"(\w+)\s+(\$\w+)\s*,\s*%lo\(([^)]+)\)\(\$(?:1|at)\)\s*$", body)
+    if m:
+        return (m.group(1).lower(), norm_reg(m.group(2)), m.group(3))
+    return _sm_key(body, False)
+
+
+def _sm_dep_body(body):
+    """Body for dependency checks: an expanded `op $r,%lo(S)($1)` acts like the
+    macro `op $r,S` (the $at temp is private to its unit)."""
+    m = re.match(r"(\w+)\s+(\$\w+)\s*,\s*%lo\(([^)]+)\)\(\$(?:1|at)\)\s*$", body)
+    return "%s\t%s,%s" % m.groups() if m else body
+
+
+def sched_match_pass(stext, tgt):
+    tkeys = [_sm_key(d.strip(), True) for _w, d in tgt]
+    lines = stext.split("\n")
+    ins = [(i, l) for i, l in enumerate(lines) if _s_is_insn(l)]
+    used = set()
+    edits = []
+    for blk in _sm_units(lines, ins):
+        bodies = [_sm_dep_body(b) for _a, _z, b in blk]
+        pos = []
+        for (_a, _z, b) in blk:
+            k = _sm_srckey(b)
+            t = next((q for q, tk in enumerate(tkeys)
+                      if k is not None and tk == k and q not in used), None)
+            if t is None:
+                pos = None
+                break
+            pos.append(t)
+            used.add(t)
+        if pos is None:
+            continue
+        order = sorted(range(len(blk)), key=lambda x: pos[x])
+        if order == list(range(len(blk))):
+            continue
+        if not all(_sm_indep(bodies[x], bodies[y])
+                   for a_, x in enumerate(order) for y in order[a_ + 1:] if y < x):
+            continue
+        edits.append((blk, order))
+    if not edits:
+        return stext
+    for blk, order in sorted(edits, key=lambda e: -e[0][0][0]):
+        _unit_permute(lines, blk, order)
+    return "\n".join(lines)
+
+
 def ra_restore_sink_pass(stext, tgt):
+    stext = callee_restore_sink_s(stext, tgt)
     tl = [d for _w, d in tgt]
     t_ra = [i for i, d in enumerate(tl) if re.match(r"\s*lw\s+\$?ra\s*,", d)]
     if not t_ra:
@@ -993,6 +1329,7 @@ PASSES = {
     "shift_const_fold": shift_const_fold_pass,
     "zero_remat": zero_remat_pass,
     "ra_restore_sink": ra_restore_sink_pass,
+    "sched_match": sched_match_pass,
 }
 
 # Passes that CHANGE the instruction count and so must run BEFORE sigma is derived
