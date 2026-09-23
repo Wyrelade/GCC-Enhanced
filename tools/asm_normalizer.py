@@ -1254,6 +1254,153 @@ def fallthrough_fill_pass(stext, tgt):
     return "\n".join(lines)
 
 
+# --------------------------------------------------------------------------
+# taken-fill: retail's reorg filled a conditional branch's delay slot from the
+# TAKEN path (the first insn at the branch target, a pure 1-word ALU insn whose
+# destination is dead on the fall-through path) and retargeted the branch past
+# that insn; our cc1 left the slot empty. A later branch whose slot then holds
+# the same `move d,s` again is redundant (d already equals s on the only path
+# that reaches it), and retail leaves that slot a nop.
+# Target-guided: the k-th conditional branch of ours is paired with the k-th of
+# the target (counts must agree). Op A fires when the target's slot equals the
+# first insn of our branch target and our slot is empty/nop; Op B fires when the
+# target's slot is a nop and ours holds an insn identical to the most recent
+# straight-line def of its destination (no join, no write of its sources since).
+# Count-preserving text pass.
+# --------------------------------------------------------------------------
+def _tf_branches(lines):
+    """[(line index, in noreorder)] of every conditional branch."""
+    noreo, out = False, []
+    for i, l in enumerate(lines):
+        s = l.strip()
+        if s.startswith(".set") and "noreorder" in s:
+            noreo = True
+        elif s.startswith(".set") and s.split()[-1] == "reorder":
+            noreo = False
+        m = re.match(r"\s*([a-z]+)\b", l)
+        if _s_is_insn(l) and m and m.group(1) in _COND_BR_MN:
+            out.append((i, noreo))
+    return out
+
+
+def _tf_next_insn(lines, i):
+    for j in range(i + 1, len(lines)):
+        if _s_is_insn(lines[j]):
+            return j
+    return None
+
+
+def _tf_is_nop(body):
+    return body.split(None, 1)[0].lower() == "nop" if body else False
+
+
+def taken_fill_pass(stext, tgt):
+    if not tgt:
+        return stext
+    tb = [k for k, (_w, d) in enumerate(tgt) if d.split(None, 1)[0].lower() in _COND_BR_MN]
+    lines = stext.split("\n")
+    ours = _tf_branches(lines)
+    if len(ours) != len(tb):
+        return stext
+    nop_key = ("sll", "zero", "zero", 0)
+    n_new = 0
+    # Op A: fill from the taken path
+    for k in range(len(ours)):
+        ours = _tf_branches(lines)
+        bi, nr = ours[k]
+        tk = tb[k]
+        if tk + 1 >= len(tgt):
+            continue
+        tkey = _sm_key(tgt[tk + 1][1].strip(), True)
+        if tkey in (None, "skip", ("nop",), nop_key):
+            continue
+        slot = None
+        if nr:
+            slot = _tf_next_insn(lines, bi)
+            if slot is None or not _tf_is_nop(lines[slot].split("#", 1)[0].strip()):
+                continue
+        body = lines[bi].split("#", 1)[0]
+        lab = re.search(r"(\$L\w+)\s*$", body)
+        if not lab:
+            continue
+        at = next((x for x, l in enumerate(lines) if l.strip() == lab.group(1) + ":"), None)
+        if at is None:
+            continue
+        xi = _tf_next_insn(lines, at)
+        if xi is None:
+            continue
+        xb = lines[xi].split("#", 1)[0].strip()
+        form = _ff_word_form(xb)
+        if form is None or _sm_key(form, False) != tkey:
+            continue
+        d, u = defs_uses(form)
+        if len(d) != 1:
+            continue
+        reg = next(iter(d))
+        # the moved insn now also runs on the fall-through path: its destination
+        # must be dead there (probe label right after the branch / its slot)
+        probe = list(lines)
+        after = slot if slot is not None else bi
+        probe.insert(after + 1, "$Ltf_probe:")
+        pins = [(i, l) for i, l in enumerate(probe) if _s_is_insn(l)]
+        if not _ff_dead_on(probe, pins, "$Ltf_probe", reg):
+            continue
+        n_new += 1
+        newlab = "$Ltf%d_%d" % (bi, n_new)
+        lines.insert(xi + 1, newlab + ":")
+        ind = _src_indent(lines[bi])
+        nb = lines[bi][:lines[bi].rindex(lab.group(1))] + newlab
+        if nr:
+            lines[bi] = nb
+            lines[slot] = ind + form
+        else:
+            lines[bi:bi + 1] = [ind + ".set\tnoreorder", ind + ".set\tnomacro", nb,
+                                ind + form, ind + ".set\tmacro", ind + ".set\treorder"]
+    # Op B: a slot insn made redundant by an identical earlier def
+    ours = _tf_branches(lines)
+    if len(ours) != len(tb):
+        return "\n".join(lines)
+    ins = [(i, l) for i, l in enumerate(lines) if _s_is_insn(l)]
+    for (bi, nr), tk in zip(ours, tb):
+        if not nr or tk + 1 >= len(tgt):
+            continue
+        if _sm_key(tgt[tk + 1][1].strip(), True) not in (("nop",), nop_key):
+            continue
+        slot = _tf_next_insn(lines, bi)
+        if slot is None:
+            continue
+        yb = lines[slot].split("#", 1)[0].strip()
+        form = _ff_word_form(yb)
+        if form is None:
+            continue
+        d, u = defs_uses(form)
+        if len(d) != 1 or set(d) & set(u):
+            continue
+        key = _sm_key(form, False)
+        ok = False
+        for j in range(bi - 1, -1, -1):
+            l = lines[j]
+            if _s_is_label(l):
+                if _branch_target_label(lines, ins, l):
+                    break
+                continue
+            if not _s_is_insn(l):
+                continue
+            jb = l.split("#", 1)[0].strip()
+            if _src_is_ret(l) or re.match(r"\s*(jalr?|j|b)\b", l):
+                break
+            jf = _ff_word_form(jb)
+            if jf is not None and _sm_key(jf, False) == key:
+                ok = True
+                break
+            jd, _ju = defs_uses(jb)
+            if (set(d) | set(u)) & set(jd):
+                break
+        if ok:
+            lines[slot] = _src_indent(lines[slot]) + "nop"
+    return "\n".join(lines)
+
+
 def ra_restore_sink_pass(stext, tgt):
     stext = callee_restore_sink_s(stext, tgt)
     tl = [d for _w, d in tgt]
@@ -1539,6 +1686,7 @@ PASSES = {
     "ra_restore_sink": ra_restore_sink_pass,
     "sched_match": sched_match_pass,
     "fallthrough_fill": fallthrough_fill_pass,
+    "taken_fill": taken_fill_pass,
 }
 
 # Passes that CHANGE the instruction count and so must run BEFORE sigma is derived
