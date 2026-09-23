@@ -935,6 +935,17 @@ def _sm_mem(body):
     return (st, ("any",))
 
 
+def _sm_save_slot(body):
+    """A callee-saved register save/restore `sw/lw $sN|$fp|$ra,K($sp)`."""
+    mo = _mem_operand(body)
+    if not mo or mo[0] != "sp":
+        return False
+    p = body.split(None, 1)
+    if p[0].lower() not in ("sw", "lw"):
+        return False
+    return norm_reg(split_ops(p[1])[0].strip()) in _CALLEE_RS
+
+
 def _sm_indep(a, b, stable=frozenset()):
     """`stable`: registers no insn of the block redefines, so two accesses based
     on one of them at disjoint offsets cannot alias."""
@@ -950,6 +961,9 @@ def _sm_indep(a, b, stable=frozenset()):
         if (wa[0] == "any" and wb[0] == "any" and oa and ob and oa[0] == ob[0]
                 and oa[0] in stable):
             return oa[1] + oa[2] <= ob[1] or ob[1] + ob[2] <= oa[1]
+        if _sm_save_slot(a) or _sm_save_slot(b):
+            if wa[0] != "sp" or wb[0] != "sp":
+                return True
         if "any" in (wa[0], wb[0]):
             return False
         if wa[0] == "sym" and wb[0] == "sym":
@@ -1001,8 +1015,23 @@ def _sm_units(lines, ins):
             br = bool(_src_is_branch(l) or _src_is_ret(l) or re.match(r"\s*jalr?\b", l))
             if noreo or br or prev_br:
                 flush()
-            else:
-                cur.append((i, i, l.split("#", 1)[0].strip()))
+                prev_br = br
+                i += 1
+                continue
+            mh = re.match(r"\s*lui\s+(\$\w+)\s*,\s*%hi\(([^)]+)\)\s*$", l.split("#", 1)[0])
+            if mh and mh.group(1) not in ("$1", "$at"):
+                j = next((x for x, _l in ins if x > i), None)
+                if j is not None and not any(_s_is_label(lines[y]) for y in range(i + 1, j)):
+                    b2 = lines[j].split("#", 1)[0].strip()
+                    m2 = re.match(r"(\w+)\s+(\$\w+)\s*,\s*%lo\(([^)]+)\)\((\$\w+)\)$", b2)
+                    if (m2 and m2.group(3) == mh.group(2) and m2.group(4) == mh.group(1)
+                            and m2.group(2) == mh.group(1)
+                            and m2.group(1).lower() in ("lw", "lh", "lhu", "lb", "lbu")):
+                        cur.append((i, j, "%s\t%s,%s" % (m2.group(1), m2.group(2), m2.group(3))))
+                        prev_br = False
+                        i = j + 1
+                        continue
+            cur.append((i, i, l.split("#", 1)[0].strip()))
             prev_br = br
         elif _branch_target_label(lines, ins, l):
             flush()
