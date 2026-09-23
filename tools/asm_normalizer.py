@@ -857,6 +857,11 @@ _SYM_RE = re.compile(r"%(?:hi|lo)\(([^)]+)\)")
 
 
 def _sm_int(t):
+    """Integer operand; also splat's `(K >> 16)` / `(K & 0xFFFF)` hi/lo forms."""
+    m = re.fullmatch(r"\((-?0x[0-9A-Fa-f]+|-?\d+)\s*(>>\s*16|&\s*0xFFFF)\)", t.strip())
+    if m:
+        v = int(m.group(1), 0)
+        return (v >> 16) & 0xFFFF if ">>" in m.group(2) else v & 0xFFFF
     try:
         return int(t, 0)
     except ValueError:
@@ -1043,6 +1048,168 @@ def sched_match_pass(stext, tgt):
         return stext
     for blk, order in sorted(edits, key=lambda e: -e[0][0][0]):
         _unit_permute(lines, blk, order)
+    return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------
+# fallthrough-fill: in units assembled by aspsx with cc1 delay filling off
+# (`nosplit_nodb` / `nodb`), a conditional branch's delay slot is filled with the
+# FIRST instruction of the fall-through path when that instruction is harmless on
+# the taken path (a pure ALU/lui write of a register the taken path redefines
+# before reading). cc1 leaves those branches unfilled (the assembler pads a nop).
+# Target-guided: the k-th conditional branch of ours is paired with the k-th of
+# the target; fire only when the target's slot holds our fall-through insn.
+# Semantics: the moved insn now also runs on the taken path, so its destination
+# must be dead there (straight-line scan from the target label: written before
+# read; a return counts as a read of $v0 and of callee-saved registers; $v1 is
+# treated as dead there: no 64-bit returns in this code).
+# Count-preserving text pass (the assembler's nop is replaced by the moved word).
+# --------------------------------------------------------------------------
+_FF_ALU = {"addu", "addiu", "subu", "and", "andi", "or", "ori", "xor", "xori",
+           "nor", "sll", "srl", "sra", "sllv", "srlv", "srav", "slt", "slti",
+           "sltu", "sltiu", "lui", "li", "move"}
+_FF_RET_LIVE = {"v0", "s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7", "fp",
+                "sp", "ra", "gp"}
+
+
+def _ff_word_form(body):
+    """The single-word spelling of a 1-word source insn (`li $r,K` with K = hi<<16
+    becomes `lui $r,hi`), or None when it is not a 1-word pure-ALU insn."""
+    p = body.split(None, 1)
+    if not p or p[0].lower() not in _FF_ALU:
+        return None
+    if p[0].lower() != "li" and _src_nwords(body) != 1:
+        return None
+    if p[0].lower() == "li":
+        ops = split_ops(p[1])
+        v = _sm_int(ops[1].strip()) if len(ops) == 2 else None
+        if v is None:
+            return None
+        if -0x8000 <= v < 0x8000:
+            return "addiu\t%s,$0,%d" % (ops[0].strip(), v)
+        if v & 0xFFFF:
+            return None
+        return "lui\t%s,0x%x" % (ops[0].strip(), (v >> 16) & 0xFFFF)
+    return body
+
+
+def _ff_dead_on(lines, ins, label, reg, seen=None):
+    """`reg` is dead at `label`: on every path from it (both sides of conditional
+    branches, `j` followed, delay slots included) it is written before it is read.
+    A return reads $v0 and the callee-saved registers; calls and indirect
+    jumps give up (conservative)."""
+    seen = set() if seen is None else seen
+    if label in seen:
+        return True
+    seen.add(label)
+    at = next((k for k, l in enumerate(lines) if l.strip() == label + ":"), None)
+    if at is None:
+        return False
+    rest = [(i, l) for i, l in ins if i > at]
+    nr, on = set(), False
+    for x, xl in enumerate(lines):
+        s = xl.strip()
+        if s.startswith(".set") and "noreorder" in s:
+            on = True
+        elif s.startswith(".set") and s.split()[-1] == "reorder":
+            on = False
+        elif on:
+            nr.add(x)
+    k = 0
+    while k < len(rest):
+        i, l = rest[k]
+        body = l.split("#", 1)[0].strip()
+        br = _src_is_branch(l) or _src_is_ret(l)
+        if re.match(r"\s*jalr?\b", l):
+            return False
+        d, u = defs_uses(body)
+        if reg in u:
+            return False
+        if br:
+            # the delay slot (noreorder only) runs before the transfer
+            slot = i in nr and k + 1 < len(rest)
+            if slot:
+                sb = rest[k + 1][1].split("#", 1)[0].strip()
+                sd, su = defs_uses(sb)
+                if reg in su:
+                    return False
+                if reg in sd:
+                    return True
+            if _src_is_ret(l):
+                return reg not in _FF_RET_LIVE
+            lab = re.search(r"(\$L\w+)\s*$", body)
+            if not lab:
+                return False
+            if not _ff_dead_on(lines, ins, lab.group(1), reg, seen):
+                return False
+            if body.split(None, 1)[0].lower() in ("j", "b"):
+                return True
+            k += 2 if slot else 1           # fall-through continues after the slot
+            continue
+        if reg in d:
+            return True
+        k += 1
+    return False
+
+
+def fallthrough_fill_pass(stext, tgt):
+    tb = [k for k, (_w, d) in enumerate(tgt)
+          if d.split(None, 1)[0].lower() in _COND_BR_MN] if tgt else []
+    lines = stext.split("\n")
+    ins = [(i, l) for i, l in enumerate(lines) if _s_is_insn(l)]
+    noreo = False
+    ours = []                               # (line index of branch, in noreorder)
+    for i, l in enumerate(lines):
+        s = l.strip()
+        if s.startswith(".set") and "noreorder" in s:
+            noreo = True
+        elif s.startswith(".set") and s.split()[-1] == "reorder":
+            noreo = False
+        m = re.match(r"\s*([a-z]+)\b", l)
+        if _s_is_insn(l) and m and m.group(1) in _COND_BR_MN:
+            ours.append((i, noreo))
+    if len(ours) != len(tb):
+        return stext
+    edits = []
+    for (bi, nr), tk in zip(ours, tb):
+        if nr or tk + 1 >= len(tgt):
+            continue
+        tkey = _sm_key(tgt[tk + 1][1].strip(), True)
+        if tkey in (None, "skip") or tkey == ("sll", "zero", "zero", 0):
+            continue
+        # the first fall-through insn with the target's slot key that can be
+        # hoisted over every insn before it in the straight-line block
+        pick, seen = None, []
+        for fi, fl in ins:
+            if fi <= bi:
+                continue
+            if any(_branch_target_label(lines, ins, x) for x in lines[bi + 1:fi]):
+                break
+            fb = fl.split("#", 1)[0].strip()
+            if _src_is_branch(fl) or _src_is_ret(fl) or re.match(r"\s*jalr?\b", fl):
+                break
+            form = _ff_word_form(fb)
+            if form is not None and _sm_key(form, False) == tkey:
+                if all(_sm_indep(form, s) for s in seen):
+                    pick = (fi, form)
+                break
+            seen.append(fb)
+        if pick is None:
+            continue
+        fi, form = pick
+        d, _u = defs_uses(form)
+        lab = re.search(r"(\$L\w+)\s*$", lines[bi].split("#", 1)[0])
+        if len(d) != 1 or not lab or not _ff_dead_on(lines, ins, lab.group(1), next(iter(d))):
+            continue
+        edits.append((bi, fi, form))
+    if not edits:
+        return stext
+    for bi, fi, form in sorted(edits, reverse=True):
+        ind = _src_indent(lines[bi])
+        del lines[fi]
+        lines[bi:bi + 1] = [ind + ".set\tnoreorder", ind + ".set\tnomacro",
+                            lines[bi], ind + form, ind + ".set\tmacro",
+                            ind + ".set\treorder"]
     return "\n".join(lines)
 
 
@@ -1330,6 +1497,7 @@ PASSES = {
     "zero_remat": zero_remat_pass,
     "ra_restore_sink": ra_restore_sink_pass,
     "sched_match": sched_match_pass,
+    "fallthrough_fill": fallthrough_fill_pass,
 }
 
 # Passes that CHANGE the instruction count and so must run BEFORE sigma is derived
