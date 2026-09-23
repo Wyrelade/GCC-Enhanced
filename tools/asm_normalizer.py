@@ -1230,10 +1230,95 @@ def _ff_word_form(body):
             return None
         if -0x8000 <= v < 0x8000:
             return "addiu\t%s,$0,%d" % (ops[0].strip(), v)
+        if 0 <= v <= 0xFFFF:
+            return "ori\t%s,$0,%d" % (ops[0].strip(), v)
         if v & 0xFFFF:
             return None
         return "lui\t%s,0x%x" % (ops[0].strip(), (v >> 16) & 0xFFFF)
     return body
+
+
+_ASM_ROOT = None          # set by normalize_s from ctx["asm_root"]
+_CALLEE_S = {}
+_CALLEE_RD = {}
+
+
+def _callee_insns(fn):
+    """The retail asm of `fn` as a list of insn texts, with "LABEL" markers."""
+    if fn not in _CALLEE_S:
+        p = find_target_s(_ASM_ROOT, fn) if _ASM_ROOT else None
+        out = []
+        if p:
+            pat = re.compile(r"/\*\s*[0-9A-Fa-f]+\s+[0-9A-Fa-f]{8}\s+[0-9A-Fa-f]{8}\s*\*/\s+(.*)$")
+            for line in open(p, encoding="utf-8", errors="replace"):
+                m = pat.search(line)
+                if m:
+                    out.append(re.sub(r"\s+", " ", m.group(1).strip()))
+                elif re.match(r"\s*\.L\w+:", line):
+                    out.append("LABEL")
+        _CALLEE_S[fn] = out or None
+    return _CALLEE_S[fn]
+
+
+def _callee_reads(fn, reg, depth=0):
+    """Conservatively: may function `fn` (retail asm) read argument register `reg`
+    before writing it? A read counts unless `reg` was written earlier in the same
+    basic block or in the straight-line entry prefix (delay slots included); a
+    call made while `reg` may still hold the entry value recurses into that
+    callee (depth-limited). Unknown callee or deep chain: assume it reads."""
+    key = (fn, reg)
+    if key in _CALLEE_RD:
+        return _CALLEE_RD[key]
+    _CALLEE_RD[key] = True                   # recursion guard: assume read
+    body = _callee_insns(fn)
+    if body is None or depth > 3:
+        return True
+    entry_w, prefix, blk_w, res = False, True, False, False
+
+    def written():
+        return entry_w or blk_w
+    k = 0
+    while k < len(body):
+        b = body[k]
+        if b == "LABEL":
+            prefix, blk_w = False, False
+            k += 1
+            continue
+        mn = b.split(None, 1)[0].lower()
+        is_call = mn in ("jal", "jalr")
+        is_br = mn in _COND_BR_MN or mn in ("j", "b", "jr")
+        d, u = defs_uses(b)
+        if reg in u and not written() and not (is_call and mn == "jal"):
+            res = True                       # (a direct call's own read is the callee's)
+            break
+        if is_call or is_br:
+            slot = body[k + 1] if k + 1 < len(body) and body[k + 1] != "LABEL" else ""
+            sd, su = defs_uses(slot) if slot else (set(), set())
+            if reg in su and not written():
+                res = True
+                break
+            if reg in sd:
+                blk_w = True
+                if prefix:
+                    entry_w = True
+            if is_call and not written():
+                mc = re.match(r"jal (\w+)$", b)
+                if not mc or _callee_reads(mc.group(1), reg, depth + 1):
+                    res = True
+                    break
+            if is_call:
+                blk_w = True                 # the call clobbers it
+            else:
+                prefix, blk_w = False, False
+            k += 2
+            continue
+        if reg in d:
+            blk_w = True
+            if prefix:
+                entry_w = True
+        k += 1
+    _CALLEE_RD[key] = res
+    return res
 
 
 def _ff_dead_on(lines, ins, label, reg, seen=None):
@@ -1266,9 +1351,13 @@ def _ff_dead_on(lines, ins, label, reg, seen=None):
         if re.match(r"\s*jalr?\b", l):
             # a call kills every caller-saved register that is not an argument;
             # its delay slot (noreorder) and a jalr target register still read
-            if reg not in _CALL_CLOBBER or reg in ("a0", "a1", "a2", "a3"):
+            if reg not in _CALL_CLOBBER:
                 return False
-            if reg in defs_uses(body)[1]:
+            if reg in ("a0", "a1", "a2", "a3"):
+                mc = re.match(r"\s*jal\s+(\w+)\s*$", body)
+                if not mc or _callee_reads(mc.group(1), reg):
+                    return False
+            if body.split(None, 1)[0].lower() == "jalr" and reg in defs_uses(body)[1]:
                 return False
             if i in nr and k + 1 < len(rest):
                 sd, su = defs_uses(rest[k + 1][1].split("#", 1)[0].strip())
@@ -1305,7 +1394,73 @@ def _ff_dead_on(lines, ins, label, reg, seen=None):
     return False
 
 
+def _ff_nr_swap(stext, tgt):
+    """cc1 filled a conditional branch slot (noreorder) with the FIRST fall-through
+    insn Y; the target's slot holds a LATER fall-through insn X. Put X in the slot
+    and Y back at the head of the fall-through. Needs: X hoistable over the insns
+    before it (incl. Y), and both destinations dead on the taken path (X now runs
+    there, Y no longer does)."""
+    if not tgt:
+        return stext
+    tb = [k for k, (_w, d) in enumerate(tgt) if d.split(None, 1)[0].lower() in _COND_BR_MN]
+    lines = stext.split("\n")
+    ours = _tf_branches(lines)
+    if len(ours) != len(tb):
+        return stext
+    for k in range(len(ours)):
+        ours = _tf_branches(lines)
+        bi, nr = ours[k]
+        tk = tb[k]
+        if not nr or tk + 1 >= len(tgt):
+            continue
+        tkey = _sm_key(tgt[tk + 1][1].strip(), True)
+        if tkey in (None, "skip", ("nop",), ("sll", "zero", "zero", 0)):
+            continue
+        slot = _tf_next_insn(lines, bi)
+        if slot is None:
+            continue
+        yform = _ff_word_form(lines[slot].split("#", 1)[0].strip())
+        if yform is None or _sm_key(yform, False) == tkey:
+            continue
+        end = slot + 1
+        while end < len(lines) and lines[end].strip().startswith(".set"):
+            end += 1
+        ins = [(i, l) for i, l in enumerate(lines) if _s_is_insn(l)]
+        pick, seen = None, [yform]
+        for fi, fl in ins:
+            if fi < end:
+                continue
+            if any(_branch_target_label(lines, ins, x) for x in lines[end:fi]):
+                break
+            if _src_is_branch(fl) or _src_is_ret(fl) or re.match(r"\s*jalr?\b", fl):
+                break
+            fb = fl.split("#", 1)[0].strip()
+            form = _ff_word_form(fb)
+            if form is not None and _sm_key(form, False) == tkey:
+                if all(_sm_indep(form, s) for s in seen):
+                    pick = (fi, form)
+                break
+            seen.append(fb)
+        if pick is None:
+            continue
+        fi, xform = pick
+        lab = re.search(r"(\$L\w+)\s*$", lines[bi].split("#", 1)[0])
+        xd, _u = defs_uses(xform)
+        yd, _u = defs_uses(yform)
+        if not lab or len(xd) != 1 or len(yd) != 1:
+            continue
+        if not (_ff_dead_on(lines, ins, lab.group(1), next(iter(xd)))
+                and _ff_dead_on(lines, ins, lab.group(1), next(iter(yd)))):
+            continue
+        ind = _src_indent(lines[slot])
+        del lines[fi]
+        lines[slot] = ind + xform
+        lines.insert(end, ind + yform)
+    return "\n".join(lines)
+
+
 def fallthrough_fill_pass(stext, tgt):
+    stext = _ff_nr_swap(stext, tgt)
     tb = [k for k, (_w, d) in enumerate(tgt)
           if d.split(None, 1)[0].lower() in _COND_BR_MN] if tgt else []
     lines = stext.split("\n")
@@ -3238,6 +3393,8 @@ def normalize_s(s_file, ctx, manifest=None):
 
     ctx keys: python, maspsx_py, maspsx_flags, as_bin, maspsx_as_flags, objdump,
     run (callable -> (rc, out, err)), asm_root."""
+    global _ASM_ROOT
+    _ASM_ROOT = ctx.get("asm_root")
     if manifest is None:
         manifest = load_manifest()
     text = _read_bytes_str(s_file)
