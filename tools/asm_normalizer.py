@@ -1264,7 +1264,17 @@ def _ff_dead_on(lines, ins, label, reg, seen=None):
         body = l.split("#", 1)[0].strip()
         br = _src_is_branch(l) or _src_is_ret(l)
         if re.match(r"\s*jalr?\b", l):
-            return False
+            # a call kills every caller-saved register that is not an argument;
+            # its delay slot (noreorder) and a jalr target register still read
+            if reg not in _CALL_CLOBBER or reg in ("a0", "a1", "a2", "a3"):
+                return False
+            if reg in defs_uses(body)[1]:
+                return False
+            if i in nr and k + 1 < len(rest):
+                sd, su = defs_uses(rest[k + 1][1].split("#", 1)[0].strip())
+                if reg in su:
+                    return False
+            return True
         d, u = defs_uses(body)
         if reg in u:
             return False
@@ -1396,6 +1406,30 @@ def _tf_is_nop(body):
     return body.split(None, 1)[0].lower() == "nop" if body else False
 
 
+def _tf_thread(lines, label):
+    """(line of the first insn executed at `label`, its 1-word form, thread-to
+    label or None). When `label` starts with an unconditional `j/b $L2` whose
+    noreorder slot holds S, the first insn is S and the branch may go straight
+    to $L2 (jump threading, as retail's reorg does)."""
+    at = next((x for x, l in enumerate(lines) if l.strip() == label + ":"), None)
+    if at is None:
+        return None
+    xi = _tf_next_insn(lines, at)
+    if xi is None:
+        return None
+    xb = lines[xi].split("#", 1)[0].strip()
+    mj = re.match(r"(?:j|b)\s+(\$L\w+)$", xb)
+    if mj:
+        si = _tf_next_insn(lines, xi)
+        if si is None or not any(lines[y].strip().startswith(".set") and "noreorder" in lines[y]
+                                 for y in range(at, xi)):
+            return None
+        f = _ff_word_form(lines[si].split("#", 1)[0].strip())
+        return (si, f, mj.group(1)) if f is not None else None
+    f = _ff_word_form(xb)
+    return (xi, f, None) if f is not None else None
+
+
 def taken_fill_pass(stext, tgt):
     if not tgt:
         return stext
@@ -1406,6 +1440,84 @@ def taken_fill_pass(stext, tgt):
         return stext
     nop_key = ("sll", "zero", "zero", 0)
     n_new = 0
+    # Op C: our slot holds an insn cc1 stole from the fall-through path where the
+    # target leaves a nop: put it back on the fall-through, right before the first
+    # insn that reads its destination (its destination must be dead on the taken
+    # path, nothing on the way may write its destination or its sources, and the
+    # way there must be straight-line). Op A may then refill the slot.
+    for k in range(len(ours)):
+        ours = _tf_branches(lines)
+        bi, nr = ours[k]
+        tk = tb[k]
+        if not nr or tk + 1 >= len(tgt):
+            continue
+        slot = _tf_next_insn(lines, bi)
+        if slot is None:
+            continue
+        xb = lines[slot].split("#", 1)[0].strip()
+        form = _ff_word_form(xb)
+        if form is None:
+            continue
+        tkey = _sm_key(tgt[tk + 1][1].strip(), True)
+        if tkey not in (("nop",), nop_key):
+            # or the target fills this slot from the TAKEN path (Op A below)
+            lab0 = re.search(r"(\$L\w+)\s*$", lines[bi].split("#", 1)[0])
+            th0 = _tf_thread(lines, lab0.group(1)) if lab0 else None
+            f0 = th0[1] if th0 else None
+            if (f0 is None or _sm_key(f0, False) != tkey
+                    or _sm_key(form, False) == tkey):
+                continue
+        d, u = defs_uses(form)
+        if len(d) != 1:
+            continue
+        reg = next(iter(d))
+        lab = re.search(r"(\$L\w+)\s*$", lines[bi].split("#", 1)[0])
+        ins = [(i, l) for i, l in enumerate(lines) if _s_is_insn(l)]
+        if not lab or not _ff_dead_on(lines, ins, lab.group(1), reg):
+            continue
+        dest = None
+        for j in range(slot + 1, len(lines)):
+            l = lines[j]
+            if _s_is_label(l) and _branch_target_label(lines, ins, l):
+                # a join before any use: X goes right before it (still on the
+                # fall-through only; other entrants keep their own value)
+                dest = j
+                break
+            if not _s_is_insn(l):
+                continue
+            if _src_is_branch(l) or _src_is_ret(l) or re.match(r"\s*jalr?\b", l):
+                jd, ju = defs_uses(l.split("#", 1)[0].strip())
+                if reg in ju:
+                    dest = j
+                break
+            jd, ju = defs_uses(l.split("#", 1)[0].strip())
+            if reg in ju:
+                dest = j
+                break
+            if (set(jd) & (set(d) | set(u))):
+                break
+        if dest is None:
+            continue
+        # the use may sit inside a `.set noreorder` group: insert before the group
+        at = dest
+        while at > slot + 1 and (lines[at - 1].strip().startswith(".set")
+                                 or lines[at - 1].strip() in ("#nop", "")):
+            at -= 1
+        ind = _src_indent(lines[slot])
+        # an explicit load-delay `nop` right before the spot (the assembler's
+        # filler after a load, e.g. before a label) is where X goes: X then
+        # fills the load delay, as long as X does not read the loaded register
+        pi = max((y for y, _l in ins if y < at), default=None)
+        if (pi is not None and pi > slot and _tf_is_nop(lines[pi].split("#", 1)[0].strip())):
+            li_ = max((y for y, _l in ins if y < pi), default=None)
+            ld = lines[li_].split("#", 1)[0].strip() if li_ is not None else ""
+            if (re.match(r"(lw|lh|lhu|lb|lbu)\s", ld) and li_ > slot
+                    and not set(defs_uses(ld)[0]) & set(u)):
+                lines[pi] = _src_indent(lines[pi]) + form
+                lines[slot] = ind + "nop"
+                continue
+        lines.insert(at, ind + form)
+        lines[slot] = ind + "nop"
     # Op A: fill from the taken path
     for k in range(len(ours)):
         ours = _tf_branches(lines)
@@ -1425,14 +1537,10 @@ def taken_fill_pass(stext, tgt):
         lab = re.search(r"(\$L\w+)\s*$", body)
         if not lab:
             continue
-        at = next((x for x, l in enumerate(lines) if l.strip() == lab.group(1) + ":"), None)
-        if at is None:
+        th = _tf_thread(lines, lab.group(1))
+        if th is None:
             continue
-        xi = _tf_next_insn(lines, at)
-        if xi is None:
-            continue
-        xb = lines[xi].split("#", 1)[0].strip()
-        form = _ff_word_form(xb)
+        xi, form, thread_to = th
         if form is None or _sm_key(form, False) != tkey:
             continue
         d, u = defs_uses(form)
@@ -1448,7 +1556,7 @@ def taken_fill_pass(stext, tgt):
         if not _ff_dead_on(probe, pins, "$Ltf_probe", reg):
             continue
         n_new += 1
-        newlab = "$Ltf%d_%d" % (bi, n_new)
+        newlab = thread_to or "$Ltf%d_%d" % (bi, n_new)
         ind = _src_indent(lines[bi])
         nb = lines[bi][:lines[bi].rindex(lab.group(1))] + newlab
         if nr:
@@ -1459,7 +1567,8 @@ def taken_fill_pass(stext, tgt):
                                 ind + form, ind + ".set\tmacro", ind + ".set\treorder"]
             if xi > bi:
                 xi += 5
-        lines.insert(xi + 1, newlab + ":")
+        if not thread_to:
+            lines.insert(xi + 1, newlab + ":")
     # Op B: a slot insn made redundant by an identical earlier def
     ours = _tf_branches(lines)
     if len(ours) != len(tb):
@@ -1552,11 +1661,53 @@ def ra_restore_sink_pass(stext, tgt):
     return "\n".join(out)
 
 
+# The same for a nonzero 16-bit constant: our cc1 copies a register holding K
+# (`move $d,$s` after `li $s,K`), retail re-materializes it (`addiu $d,$zero,K`).
+# Budget per K = target's K materializations minus ours.
+_KTGT = re.compile(r"^(?:addiu|li)\s+\S+\s*,\s*(?:\$?zero\s*,\s*)?(-?(?:0x[0-9a-fA-F]+|\d+))\s*$")
+
+
+def const_remat_s(stext, want):
+    lines = stext.split("\n")
+    ins = [(i, l) for i, l in enumerate(lines) if _s_is_insn(l)]
+    have = {}
+    for _i, l in ins:
+        c = _CONST_DEF_S.match(l)
+        if c:
+            k = int(c.group(2) or c.group(4), 0)
+            have[k] = have.get(k, 0) + 1
+    budget = {k: n - have.get(k, 0) for k, n in want.items() if k != 0}
+    if not any(v > 0 for v in budget.values()):
+        return stext
+    changed = False
+    for p, (li, l) in enumerate(ins):
+        m = _MOVE_S.match(l)
+        if not m:
+            continue
+        src = _src_reg(m.group(3))
+        if not src or src == _src_reg("$0"):
+            continue
+        k = _const_reaching(lines, ins, p, src)
+        if k is None or budget.get(k, 0) <= 0 or not -0x8000 <= k < 0x8000:
+            continue
+        lines[li] = "%sli\t%s,%d" % (m.group(1), m.group(2), k)
+        budget[k] -= 1
+        changed = True
+    return "\n".join(lines) if changed else stext
+
+
 def zero_remat_pass(stext, tgt):
     want = sum(1 for _w, dis in tgt if _ZERO_TGT.match(dis.strip()))
     have = sum(1 for l in stext.split("\n")
                if _s_is_insn(l) and _ZERO_DEF_S.match(l))
-    return zero_remat_s(stext, want - have)
+    stext = zero_remat_s(stext, want - have)
+    wk = {}
+    for _w, dis in tgt:
+        m = _KTGT.match(dis.strip())
+        if m:
+            k = int(m.group(1), 0)
+            wk[k] = wk.get(k, 0) + 1
+    return const_remat_s(stext, wk)
 
 # --------------------------------------------------------------------------
 # exit-merge: cc1 emits each return as its own `j $31` (with the return value in
