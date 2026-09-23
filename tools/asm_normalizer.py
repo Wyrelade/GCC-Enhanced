@@ -1204,6 +1204,8 @@ def delay_fill_src(span, tgt, our_words):
             bu = bu - {"a0", "a1", "a2", "a3"}
         if not (defs_uses(pl.strip())[0] & bu):
             exp = _expand_sym(pl)
+            if exp is None:
+                exp = _expand_la(pl)
             if exp is not None:
                 # aspsx expands the macro first and fills the slot with its LAST
                 # word; the address setup stays ahead of the branch.
@@ -1700,6 +1702,22 @@ def _expand_sym(line):
         out.append("addu\t%s,%s,%s" % (t, t, idx))
     out.append("%s\t%s,%%lo(%s)(%s)" % (op, r, sym, t))
     return out
+
+
+def _expand_la(line):
+    """The aspsx expansion of an address macro `la $r,SYM[+k]` (lui + addiu %lo),
+    or None. Only used where a pass must split the macro (delay-slot filling)."""
+    b = line.split("#", 1)[0].strip()
+    p = b.split(None, 1)
+    if len(p) < 2 or p[0] != "la":
+        return None
+    ops = split_ops(p[1])
+    if len(ops) != 2:
+        return None
+    r, sym = ops[0].strip(), ops[1].strip()
+    if not re.fullmatch(r"[A-Za-z_.][\w.$]*(?:\+\d+)?", sym):
+        return None
+    return ["lui\t%s,%%hi(%s)" % (r, sym), "addiu\t%s,%s,%%lo(%s)" % (r, r, sym)]
 
 
 def _src_nwords(line):
