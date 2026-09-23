@@ -605,6 +605,8 @@ def shift_const_fold_s(stext, allowed):
         k = None
         for q in range(p - 1, -1, -1):
             qi, ql = ins[q]
+            if q == p - 1 and _src_is_branch(ql) and not _src_is_ret(ql):
+                continue            # we sit in its delay slot: it has not transferred yet
             if _src_is_branch(ql) or any(_branch_target_label(lines, ins, x)
                                         for x in lines[qi:li]):
                 break
@@ -933,7 +935,9 @@ def _sm_mem(body):
     return (st, ("any",))
 
 
-def _sm_indep(a, b):
+def _sm_indep(a, b, stable=frozenset()):
+    """`stable`: registers no insn of the block redefines, so two accesses based
+    on one of them at disjoint offsets cannot alias."""
     da, ua = defs_uses(a)
     db, ub = defs_uses(b)
     da, ua, db, ub = set(da), set(ua), set(db), set(ub)
@@ -942,6 +946,10 @@ def _sm_indep(a, b):
     ma, mb = _sm_mem(a), _sm_mem(b)
     if ma and mb and (ma[0] or mb[0]):
         wa, wb = ma[1], mb[1]
+        oa, ob = _mem_operand(a), _mem_operand(b)
+        if (wa[0] == "any" and wb[0] == "any" and oa and ob and oa[0] == ob[0]
+                and oa[0] in stable):
+            return oa[1] + oa[2] <= ob[1] or ob[1] + ob[2] <= oa[1]
         if "any" in (wa[0], wb[0]):
             return False
         if wa[0] == "sym" and wb[0] == "sym":
@@ -1040,7 +1048,11 @@ def sched_match_pass(stext, tgt):
         order = sorted(range(len(blk)), key=lambda x: pos[x])
         if order == list(range(len(blk))):
             continue
-        if not all(_sm_indep(bodies[x], bodies[y])
+        dset = set()
+        for b in bodies:
+            dset |= set(defs_uses(b)[0])
+        stable = frozenset(r for b in bodies for r in defs_uses(b)[1]) - dset
+        if not all(_sm_indep(bodies[x], bodies[y], stable)
                    for a_, x in enumerate(order) for y in order[a_ + 1:] if y < x):
             continue
         edits.append((blk, order))
@@ -2755,7 +2767,10 @@ def aspsx_label_nops(span):
             j += 1
         if saw_label and j < len(lines):
             nb = lines[j].split("#", 1)[0].strip()
-            if d & defs_uses(nb)[1]:
+            # a direct `jal` reads no register when it issues (its delay slot
+            # runs first); defs_uses models its argument registers as uses
+            uses = set() if re.match(r"jal\s", nb) else defs_uses(nb)[1]
+            if d & uses:
                 out.append(_src_indent(l) + "nop")
     return "\n".join(out)
 
