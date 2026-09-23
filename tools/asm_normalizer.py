@@ -654,9 +654,13 @@ def _const_reaching(lines, ins, p, reg):
         qi, ql = ins[q]
         if q == p - 1 and _src_is_branch(ql) and not _src_is_ret(ql):
             continue
-        if _src_is_branch(ql) or any(_branch_target_label(lines, ins, x)
-                                    for x in lines[qi:li]):
-            return None
+        if any(_branch_target_label(lines, ins, x) for x in lines[qi:li]):
+            return None                     # a join
+        mq = re.match(r"\s*([a-z]+)\b", ql)
+        if _src_is_branch(ql) and not (mq and mq.group(1) in _COND_BR_MN):
+            return None                     # an unconditional transfer: unreachable
+        if mq and mq.group(1) in _COND_BR_MN:
+            continue                        # we are on its fall-through path
         d, _u = defs_uses(ql.split("#", 1)[0].strip())
         if reg in d:
             c = _CONST_DEF_S.match(ql)
