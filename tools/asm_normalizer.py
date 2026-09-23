@@ -2177,6 +2177,8 @@ ALT_FLAVORS = {
     "nodb": ["-fno-delayed-branch"],
 }
 META_PASSES = tuple(ALT_FLAVORS)
+# local-label prefix per alternate compile (nosplit keeps the historical "ns")
+_ALT_TAG = {"nosplit": "ns", "nosplit_nodb": "nsnd", "nodb": "nd"}
 
 
 def alt_flavors(manifest):
@@ -2253,9 +2255,11 @@ def aspsx_label_nops(span):
     return "\n".join(out)
 
 
-def splice_alt_spans(text, alt_text, names):
+def splice_alt_spans(text, alt_text, names, tag="ns"):
     """Replace each function span in `names` with the same function's span from
-    `alt_text`. Returns (new_text, [spliced names])."""
+    `alt_text`. Returns (new_text, [spliced names]). `tag` keeps the renamed local
+    labels unique per alternate compile: the LM line-marker counters of two flavor
+    compiles overlap, so two flavors must not share a prefix."""
     alt = {n: alt_text[s:e] for n, s, e in split_spans(alt_text)}
     done = []
     for name, start, end in sorted(split_spans(text), key=lambda x: -x[1]):
@@ -2268,8 +2272,8 @@ def splice_alt_spans(text, alt_text, names):
             if _lc_body(text, lc) is None or _lc_body(text, lc) != _lc_body(alt_text, lc):
                 raise RuntimeError("alt compile: %s references %s, which differs between "
                                    "the two compiles" % (name, lc))
-        span = re.sub(r"\$L(?!C)(\w+)", r"$Lns_\1", span)
-        span = re.sub(r"(?<![\w$.])LM(\d+)\b", r"LMns\1", span)
+        span = re.sub(r"\$L(?!C)(\w+)", r"$L%s_\1" % tag, span)
+        span = re.sub(r"(?<![\w$.])LM(\d+)\b", r"LM%s\1" % tag, span)
         span = aspsx_label_nops(expand_sym_macros(span))
         text = text[:start] + span + text[end:]
         done.append(name)
@@ -2294,7 +2298,8 @@ def normalize_s(s_file, ctx, manifest=None):
         if not alt or not os.path.exists(alt):
             raise RuntimeError("%s functions %s need ctx['alt_s'][%r]"
                                % (flavor, ns, flavor))
-        text, done = splice_alt_spans(text, _read_bytes_str(alt), ns)
+        text, done = splice_alt_spans(text, _read_bytes_str(alt), ns,
+                                      _ALT_TAG.get(flavor, flavor))
         _write_bytes_str(s_file, text)
         rewrote.extend(done)
     spans = split_spans(text)
