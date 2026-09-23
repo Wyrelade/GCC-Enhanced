@@ -903,6 +903,11 @@ def _sm_key(body, target):
             mn, ops = "addiu", [ops[0], ops[1], str(-_sm_int(ops[2]))]
         elif mn == "addu" and len(ops) == 3 and _sm_int(ops[2]) is not None:
             mn = "addiu"
+        elif (mn in ("slt", "sltu", "and", "or", "xor") and len(ops) == 3
+              and _sm_int(ops[2]) is not None):
+            # immediate operand macro: the assembler emits the -i form
+            mn = {"slt": "slti", "sltu": "sltiu", "and": "andi", "or": "ori",
+                  "xor": "xori"}[mn]
     key = [mn]
     for o in ops:
         m = re.fullmatch(r"(-?(?:0x[0-9a-fA-F]+|\d+))\((\$?\w+)\)", o)
@@ -1023,11 +1028,23 @@ def _sm_units(lines, ins):
                 j = next((x for x, _l in ins if x > i), None)
                 if j is not None and not any(_s_is_label(lines[y]) for y in range(i + 1, j)):
                     b2 = lines[j].split("#", 1)[0].strip()
+                    # indexed form: `lui $r,%hi(S); addu $r,$r,$b; op $r,%lo(S)($r)`
+                    idx = None
+                    ma = re.match(r"addu\s+(\$\w+)\s*,\s*(\$\w+)\s*,\s*(\$\w+)$", b2)
+                    if (ma and ma.group(1) == mh.group(1) and ma.group(2) == mh.group(1)
+                            and ma.group(3) != mh.group(1)):
+                        j2 = next((x for x, _l in ins if x > j), None)
+                        if j2 is not None and not any(_s_is_label(lines[y])
+                                                      for y in range(j + 1, j2)):
+                            idx = ma.group(3)
+                            j = j2
+                            b2 = lines[j].split("#", 1)[0].strip()
                     m2 = re.match(r"(\w+)\s+(\$\w+)\s*,\s*%lo\(([^)]+)\)\((\$\w+)\)$", b2)
                     if (m2 and m2.group(3) == mh.group(2) and m2.group(4) == mh.group(1)
                             and m2.group(2) == mh.group(1)
                             and m2.group(1).lower() in ("lw", "lh", "lhu", "lb", "lbu")):
-                        cur.append((i, j, "%s\t%s,%s" % (m2.group(1), m2.group(2), m2.group(3))))
+                        sym = m2.group(3) + ("(%s)" % idx if idx else "")
+                        cur.append((i, j, "%s\t%s,%s" % (m2.group(1), m2.group(2), sym)))
                         prev_br = False
                         i = j + 1
                         continue
@@ -1043,6 +1060,11 @@ def _sm_units(lines, ins):
 def _sm_srckey(body):
     m = re.match(r"(\w+)\s+(\$\w+)\s*,\s*%lo\(([^)]+)\)\(\$(?:1|at)\)\s*$", body)
     if m:
+        return (m.group(1).lower(), norm_reg(m.group(2)), m.group(3))
+    # indexed symbolic load macro `op $d,S($b)`: gas expands it to
+    # `lui $d,%hi(S); addu $d,$d,$b; op $d,%lo(S)($d)`; keyed by its %lo word
+    m = re.match(r"(lw|lh|lhu|lb|lbu)\s+(\$\w+)\s*,\s*([A-Za-z_]\w*)\((\$\w+)\)\s*$", body)
+    if m and norm_reg(m.group(2)) not in ("1", "at"):
         return (m.group(1).lower(), norm_reg(m.group(2)), m.group(3))
     return _sm_key(body, False)
 
