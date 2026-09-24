@@ -1237,6 +1237,13 @@ def _sm_dead_after(lines, last, reg):
     return False
 
 
+def _sm_drift(anchors, line):
+    """Drift of the nearest anchor unit (by line) or 0."""
+    if not anchors:
+        return 0
+    return min(anchors, key=lambda a: abs(a[0] - line))[1]
+
+
 def sched_match_pass(stext, tgt):
     tkeys = [_sm_key(d.strip(), True) for _w, d in tgt]
     lines = stext.split("\n")
@@ -1248,6 +1255,24 @@ def sched_match_pass(stext, tgt):
     runs = []
     la_tmp = {}
     blocks = _sm_units(lines, ins, la_tmp)
+    wpos, w = {}, 0
+    for i, l in ins:
+        wpos[i] = w
+        w += _src_nwords(l)
+    for x in range(len(lines)):             # units may start at a `.set` line
+        if x not in wpos:
+            nx = next((i for i, _l in ins if i > x), None)
+            if nx is not None:
+                wpos[x] = wpos[nx]
+    # anchors: units whose key occurs exactly once in the target give the drift
+    # between our word estimate (no assembler nops) and the target index
+    anchors = []
+    for blk0 in blocks:
+        for u in blk0:
+            k = _sm_srckey(u[2])
+            qs = [q for q, tk in enumerate(tkeys) if k is not None and tk == k]
+            if len(qs) == 1 and u[0] in wpos:
+                anchors.append((u[0], qs[0] - wpos[u[0]]))
     for blk0 in blocks:
         # a split-address temp is private when only its own `la` units touch it
         # in the block and it is written before read after the block: then the
@@ -1271,8 +1296,12 @@ def sched_match_pass(stext, tgt):
                 k = None                    # not private: a barrier
             if u[2].split(None, 1)[0].lower() == "nop":
                 k = None                    # an explicit load-delay nop stays put
-            t = next((q for q, tk in enumerate(tkeys)
-                      if k is not None and tk == k and q not in used), None)
+            # a key can repeat (`move a1,a3` on several paths): take the unused
+            # target occurrence nearest to where this unit sits
+            cands = [q for q, tk in enumerate(tkeys)
+                     if k is not None and tk == k and q not in used]
+            est = wpos.get(u[0], 0) + _sm_drift(anchors, u[0])
+            t = min(cands, key=lambda q: (abs(q - est), q)) if cands else None
             if t is None:
                 if len(cur) > 1:
                     runs.append(cur)
@@ -4245,7 +4274,13 @@ def aspsx_label_nops(span):
             nb = lines[j].split("#", 1)[0].strip()
             # a direct `jal` reads no register when it issues (its delay slot
             # runs first); defs_uses models its argument registers as uses
-            uses = set() if re.match(r"jal\s", nb) else defs_uses(nb)[1]
+            # runs first); defs_uses models its argument registers as uses. An
+            # indirect `jal $31,$r` (cc1's jalr spelling) reads $r as it issues.
+            mi = re.match(r"jalr?\s+(?:\$\w+\s*,\s*)?(\$\w+)\s*$", nb)
+            if mi:
+                uses = {norm_reg(mi.group(1))}
+            else:
+                uses = set() if re.match(r"jal\s", nb) else defs_uses(nb)[1]
             if d & uses:
                 out.append(_src_indent(l) + "nop")
     return "\n".join(out)
