@@ -1410,7 +1410,7 @@ def _callee_reads(fn, reg, depth=0):
         return _CALLEE_RD[key]
     _CALLEE_RD[key] = True                   # recursion guard: assume read
     body = _callee_insns(fn)
-    if body is None or depth > 3:
+    if body is None or depth > 8:
         return True
     entry_w, prefix, blk_w, res = False, True, False, False
 
@@ -1447,6 +1447,8 @@ def _callee_reads(fn, reg, depth=0):
                     break
             if is_call:
                 blk_w = True                 # the call clobbers it
+                if prefix:
+                    entry_w = True           # ... on every path: all go through here
             else:
                 prefix, blk_w = False, False
             k += 2
@@ -2845,6 +2847,13 @@ def web_realloc_pass(stext, tgt):
                 if len(treg) != len(cr):
                     continue
                 comm = cm.split("|", 1)[0] in _COMMUTATIVE_ACC | {"mult", "multu"}
+                # a pinned web (entry value, call argument, ...) keeps its register:
+                # an aligned pair that disagrees there is a misalignment
+                if not comm and any(
+                        occ.get((n, r, pos, kd)) in pinned and r != t
+                        for (r, pos), t in zip(cr, treg) if pos is not None
+                        for kd in ("d", "u")):
+                    continue
                 uses = []
                 for k, ((r, pos), t) in enumerate(zip(cr, treg)):
                     if pos is None:
