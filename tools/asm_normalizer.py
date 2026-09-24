@@ -2288,6 +2288,10 @@ def const_remat_s(stext, want):
 _LOAD_S = re.compile(r"^(\s*)(lb|lbu|lh|lhu|lw)\s+(\$\w+)\s*,\s*(-?\d+)\((\$\w+)\)\s*(#.*)?$")
 _LOAD_T = re.compile(r"(lb|lbu|lh|lhu|lw)\s+\S+\s*,\s*(-?(?:0x[0-9a-fA-F]+|\d+))\(")
 _LR_STOP = re.compile(r"(s[bhw]|swl|swr|jal|jalr|j|jr|syscall|break)\b")
+_ANDI_S = re.compile(r"^(\s*)andi\s+(\$\w+)\s*,\s*(\$\w+)\s*,\s*(0xff|255|0xffff|65535)\s*(#.*)?$")
+_STORE_S = re.compile(r"^\s*(sb|sh|sw)\s+(\$\w+)\s*,\s*(-?\d+)\((\$\w+)\)\s*(#.*)?$")
+# a copy / zero-extend of a register just stored -> the load that re-reads it
+_FWD = {("sw", None): "lw", ("sb", 0xff): "lbu", ("sh", 0xffff): "lhu"}
 
 
 def load_remat_pass(stext, tgt):
@@ -2313,6 +2317,11 @@ def load_remat_pass(stext, tgt):
     changed = False
     for p, (li, l) in enumerate(ins):
         m = _MOVE_S.match(l)
+        mask = None
+        if not m:
+            m = _ANDI_S.match(l)
+            if m:
+                mask = int(m.group(4), 0)
         if not m or li in nr:
             continue
         rd, rs = norm_reg(m.group(2)), norm_reg(m.group(3))
@@ -2327,16 +2336,19 @@ def load_remat_pass(stext, tgt):
             b = ql.split("#", 1)[0].strip()
             ml = _LOAD_S.match(ql)
             d, _u = defs_uses(b)
-            if ml and norm_reg(ml.group(3)) == rs:
-                hit = (q, ml)
+            if ml and norm_reg(ml.group(3)) == rs and mask is None:
+                hit = (q, ml.group(2), int(ml.group(4)), ml.group(5))
+                break
+            ms = _STORE_S.match(ql)
+            if ms and norm_reg(ms.group(2)) == rs and (ms.group(1), mask) in _FWD:
+                hit = (q, _FWD[(ms.group(1), mask)], int(ms.group(3)), ms.group(4))
                 break
             if rs in d or _LR_STOP.match(b):
                 break
             q -= 1
         if not hit:
             continue
-        q, ml = hit
-        op, off, base = ml.group(2), int(ml.group(4)), ml.group(5)
+        q, op, off, base = hit
         k = (op, off)
         if norm_reg(base) == rs or want.get(k, 0) <= have.get(k, 0):
             continue
@@ -4467,17 +4479,40 @@ def _gp_small(alt_text):
     return small
 
 
-def gp_rel_macros(span, small):
+def _gp_addr(name):
+    """Address a splat-style `D_XXXXXXXX[+k]` name resolves to, else None."""
+    m = re.fullmatch(r"D_([0-9A-Fa-f]{8})(?:\+(\d+))?", name)
+    return int(m.group(1), 16) + int(m.group(2) or 0) if m else None
+
+
+def _gp_target_refs(name):
+    """(addresses, names) the retail function `name` reaches through $gp, or
+    None when there is no target to consult."""
+    t = find_target_s(_ASM_ROOT, name) if _ASM_ROOT else None
+    if not t:
+        return None
+    refs = re.findall(r"%gp_rel\(([A-Za-z_.][\w.$]*(?:\+\d+)?)\)", open(t).read())
+    return ({_gp_addr(r) for r in refs if _gp_addr(r) is not None},
+            {r.split("+")[0] for r in refs})
+
+
+def gp_rel_macros(span, small, refs=None):
     """Spell a -G compile's small-data macros the way the assembler emits them:
     `op $r,S[+k]` -> `op $r,%gp_rel(S[+k])($gp)`, `la $r,S[+k]` ->
-    `addiu $r,$gp,%gp_rel(S[+k])` (one word each)."""
+    `addiu $r,$gp,%gp_rel(S[+k])` (one word each). With `refs` (the target's
+    $gp addresses and names), a small symbol the target reaches by lui/%lo
+    instead (another unit declared it bigger) stays a plain macro."""
     if not small:
         return span
     out = []
     for l in span.split("\n"):
         b = l.split("#", 1)[0].strip()
-        m = re.fullmatch(r"(la|lw|lh|lhu|lb|lbu|sw|sh|sb)\s+(\$\w+)\s*,\s*"
+        m = re.fullmatch(r"(la|lw|lh|lhu|lb|lbu|lwl|lwr|sw|sh|sb|swl|swr)\s+(\$\w+)\s*,\s*"
                          r"([A-Za-z_.][\w.$]*)((?:\+\d+)?)", b)
+        if m and refs is not None and m.group(3) in small:
+            a0, a1 = _gp_addr(m.group(3)), _gp_addr(m.group(3) + m.group(4))
+            if not (a0 in refs[0] or a1 in refs[0] or m.group(3) in refs[1]):
+                m = None
         if m and m.group(3) in small:
             op, r, sym = m.group(1), m.group(2), m.group(3) + m.group(4)
             l = _src_indent(l) + ("addiu\t%s,$gp,%%gp_rel(%s)" % (r, sym) if op == "la"
@@ -4506,7 +4541,8 @@ def splice_alt_spans(text, alt_text, names, tag="ns"):
                                    "the two compiles" % (name, lc))
         span = re.sub(r"\$L(?!C)(\w+)", r"$L%s_\1" % tag, span)
         span = re.sub(r"(?<![\w$.])LM(\d+)\b", r"LM%s\1" % tag, span)
-        span = aspsx_label_nops(expand_sym_macros(gp_rel_macros(span, small)))
+        span = aspsx_label_nops(expand_sym_macros(
+            gp_rel_macros(span, small, _gp_target_refs(name) if small else None)))
         text = text[:start] + span + text[end:]
         done.append(name)
     return text, done
