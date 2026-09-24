@@ -2428,9 +2428,11 @@ def _wr_canon(mn, ops, rp):
         return [("?", [])] * _src_nwords("\t%s\t%s" % (mn, ",".join(ops)))
     if mn == "li":
         n = _src_nwords("\tli\t%s" % ",".join(ops))
+        v = int(ops[-1], 0)
+        if n != 1 and v & 0xFFFF == 0:
+            return [("lui", regs)]
         if n != 1:
             return [("?", [])] * n
-        v = int(ops[-1], 0)
         return [("addiu" if v < 0x8000 else "ori", regs + [("zero", None)])]
     if mn == "move":
         return [("addu", regs + [("zero", None)])]
@@ -2662,14 +2664,37 @@ def _wr_rename(lines, nodes, occ, mapping):
                                     ("\t#" + com) if com else "")
 
 
+def _wr_imms(items):
+    """Integer operands (immediates, memory offsets) of an operand list; labels
+    and %hi/%lo operands are skipped."""
+    out = []
+    for it in items:
+        it = it.strip()
+        mm = re.fullmatch(r"(.*)\((\S+)\)", it)
+        if mm and (mm.group(2) == "#" or norm_reg(mm.group(2)) is not None):
+            it = mm.group(1).strip()
+        if norm_reg(it) is not None or it == "#":
+            continue
+        v = _sm_int(it) if it else 0
+        if v is not None:
+            out.append(str(v))
+    return out
+
+
+def _wr_tok(mn, regs, sym, imms):
+    """Alignment token: mnemonic, %hi/%lo symbol, zero-register pattern, ints."""
+    return "%s|%s|%s|%s" % (mn, sym or "", "".join("Z" if r == "zero" else "R" for r in regs),
+                            ",".join(imms))
+
+
 def web_realloc_pass(stext, tgt):
     lines = stext.split("\n")
     tk = []
     for _, d in tgt:
-        mn, regs, _sk = insn_parts(d)
+        mn, regs, sk = insn_parts(d)
         if mn != "nop":
             sy = _SYM_RE.findall(d)
-            tk.append((mn + ("|" + sy[0] if sy else ""), regs))
+            tk.append((_wr_tok(mn, regs, sy[0] if sy else "", _wr_imms(sk)), regs))
     for _ in range(12):
         nodes, ok = _wr_nodes(lines)
         if not ok:
@@ -2683,31 +2708,66 @@ def web_realloc_pass(stext, tgt):
             if mn == "nop" or not mn:
                 continue
             sy = _SYM_RE.findall(lines[nd["line"]].split("#", 1)[0])
+            im = _wr_imms(ops)
+            if mn == "subu" and len(im) == 1:
+                im = [str(-int(im[0]))]
             for cm, cr in _wr_canon(mn, ops, rp):
-                ours.append((n, cr, cm + ("|" + sy[0] if sy and cm != "?" else "")))
+                if mn == "li" and cm == "lui":
+                    im = [str((int(ops[-1], 0) >> 16) & 0xFFFF)]
+                ours.append((n, cr, "?" if cm == "?" else
+                             _wr_tok(cm, [r for r, _p in cr], sy[0] if sy else "", im)))
         sm = difflib.SequenceMatcher(None, [o[2] for o in ours], [t[0] for t in tk],
                                      autojunk=False)
-        want = {}
+        want, comm_ops = {}, []
+
+        def vote(w, t):
+            if w is not None:
+                cnt = want.setdefault(w, {})
+                cnt[t] = cnt.get(t, 0) + 1
         for a, b, size in sm.get_matching_blocks():
             for q in range(size):
                 n, cr, cm = ours[a + q]
                 treg = tk[b + q][1]
                 if len(treg) != len(cr):
                     continue
-                for (r, pos), t in zip(cr, treg):
+                comm = cm.split("|", 1)[0] in _COMMUTATIVE_ACC | {"mult", "multu"}
+                uses = []
+                for k, ((r, pos), t) in enumerate(zip(cr, treg)):
                     if pos is None:
                         continue
-                    for kd in ("d", "u"):
-                        w = occ.get((n, r, pos, kd))
-                        if w is not None:
-                            want.setdefault(w, set()).add(t)
+                    vote(occ.get((n, r, pos, "d")), t)
+                    if comm and (k > 0 or cm.startswith("mult")):
+                        uses.append((occ.get((n, r, pos, "u")), t))
+                    else:
+                        vote(occ.get((n, r, pos, "u")), t)
+                if len(uses) == 2:
+                    comm_ops.append(uses)
+                else:
+                    for w, t in uses:
+                        vote(w, t)
+        # commutative operands: pair them straight or crossed, whichever agrees
+        # better with the votes from everything else (straight on a tie)
+        base = {w: max(c.items(), key=lambda x: x[1])[0] for w, c in want.items()}
+        for (w1, t1), (w2, t2) in comm_ops:
+            st = (base.get(w1) == t1) + (base.get(w2) == t2)
+            cr_ = (base.get(w1) == t2) + (base.get(w2) == t1)
+            if cr_ > st:
+                t1, t2 = t2, t1
+            vote(w1, t1)
+            vote(w2, t2)
         # all wanted webs at once first (resolves swaps and cycles), then one
         # at a time
         cand = {}
-        for w, ts in want.items():
-            if w in pinned or len(ts) != 1:
+        pick = {}
+        for w, cnt in want.items():
+            # plurality of the aligned occurrences (identical-looking insns can
+            # pair up crosswise; any pick is sound, the gate decides)
+            top = sorted(cnt.items(), key=lambda x: -x[1])
+            if len(top) == 1 or top[0][1] > top[1][1]:
+                pick[w] = top[0][0]
+        for w, t in pick.items():
+            if w in pinned:
                 continue
-            t = next(iter(ts))
             if t != reg_of[w] and t not in _WR_FIXED and reg_of[w] not in _WR_FIXED:
                 cand[w] = t
         if len(cand) > 1:
@@ -2719,10 +2779,9 @@ def web_realloc_pass(stext, tgt):
                 _wr_rename(lines, nodes, occ, cand)
                 continue
         done = False
-        for w, ts in sorted(want.items()):
-            if w in pinned or len(ts) != 1:
+        for w, t in sorted(pick.items()):
+            if w in pinned:
                 continue
-            t = next(iter(ts))
             r = reg_of[w]
             if t == r or t in _WR_FIXED or r in _WR_FIXED:
                 continue
