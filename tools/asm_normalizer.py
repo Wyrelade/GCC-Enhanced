@@ -726,6 +726,62 @@ _ZERO_TGT = re.compile(r"^(?:addu|or)\s+\S+\s*,\s*\$?zero\s*,\s*\$?zero\s*$"
                        r"|^(?:move\s+\S+\s*,\s*\$?zero|li\s+\S+\s*,\s*0)\s*$")
 
 
+def _noreorder_lines(lines):
+    out, on = set(), False
+    for x, l in enumerate(lines):
+        t = l.strip()
+        if t.startswith(".set") and "noreorder" in t:
+            on = True
+        elif t.startswith(".set") and t.split()[-1] == "reorder":
+            on = False
+        elif on:
+            out.add(x)
+    return out
+
+
+def _zero_reach(lines, ins, p, reg, nr, depth=0):
+    """`reg` holds zero on every path reaching insn ins[p]. Walks back on the
+    straight line; at a join label every entrant branch must deliver zero too
+    (its noreorder slot, else the path before it), and the fall-through only
+    counts when the insn before the label is not the slot of a `j`."""
+    li = ins[p][0]
+    for q in range(p - 1, -1, -1):
+        qi, ql = ins[q]
+        if q == p - 1 and _src_is_branch(ql):
+            continue            # we sit in its delay slot: it has not transferred yet
+        labs = [x.strip()[:-1] for x in lines[qi + 1:li]
+                if _s_is_label(x) and _branch_target_label(lines, ins, x)]
+        if labs:
+            if depth >= 4:
+                return False
+            for lab in labs:
+                pat = re.compile(r"[\s,]" + re.escape(lab) + r"\s*$")
+                for b, (bi, bl) in enumerate(ins):
+                    if not pat.search(bl.split("#", 1)[0]) or not _src_is_branch(bl):
+                        continue
+                    if bi in nr and b + 1 < len(ins) and ins[b + 1][0] in nr:
+                        sb = ins[b + 1][1].split("#", 1)[0].strip()
+                        if reg in defs_uses(sb)[0]:
+                            z = _ZERO_DEF_S.match(ins[b + 1][1])
+                            if not (z and _src_reg(next(g for g in z.groups()[:4] if g)) == reg):
+                                return False
+                            continue
+                    if not _zero_reach(lines, ins, b, reg, nr, depth + 1):
+                        return False
+            prev = ins[q - 1][1] if q > 0 else ""
+            if (q > 0 and qi in nr and re.match(r"\s*(j|b)\s+\$L", prev)
+                    and ins[q - 1][0] in nr):
+                return True     # ql is the slot of a `j`: no fall-through entrant
+        if _src_is_branch(ql):
+            return False
+        d, _u = defs_uses(ql.split("#", 1)[0].strip())
+        if reg in d:
+            z = _ZERO_DEF_S.match(ql)
+            return bool(z) and _src_reg(next(g for g in z.groups()[:4] if g)) == reg
+        li = qi
+    return False
+
+
 def zero_remat_s(stext, budget):
     if budget <= 0:
         return stext
@@ -741,20 +797,7 @@ def zero_remat_s(stext, budget):
         src = _src_reg(m.group(3))
         if not src or src == _src_reg("$0"):
             continue
-        zero = False
-        for q in range(p - 1, -1, -1):
-            qi, ql = ins[q]
-            if q == p - 1 and _src_is_branch(ql):
-                continue            # we sit in its delay slot: it has not transferred yet
-            if _src_is_branch(ql) or any(_branch_target_label(lines, ins, x)
-                                        for x in lines[qi:li]):
-                break
-            d, _u = defs_uses(ql.split("#", 1)[0].strip())
-            if src in d:
-                z = _ZERO_DEF_S.match(ql)
-                zero = bool(z) and _src_reg(next(g for g in z.groups()[:4] if g)) == src
-                break
-        if not zero:
+        if not _zero_reach(lines, ins, p, src, _noreorder_lines(lines)):
             continue
         lines[li] = "%smove\t%s,$0" % (m.group(1), m.group(2))
         budget -= 1
@@ -1087,6 +1130,19 @@ def _sm_units(lines, ins, la_tmp=None):
                 cur.append((i, j, lines[grp[1]].split("#", 1)[0].strip()))
                 i = j + 1
                 continue
+            # indexed form `lui $1,%hi(S); addu $1,$1,$b; op $r,%lo(S)($1)`:
+            # one unit keyed / dependency-checked as the macro `op $r,S($b)`
+            if (j < len(lines) and len(grp) == 3 and not prev_br
+                    and re.match(r"\s*lui\s+\$(?:1|at)\s*,\s*%hi\(", lines[grp[0]])):
+                ma = re.match(r"\s*addu\s+\$(?:1|at)\s*,\s*\$(?:1|at)\s*,\s*(\$\w+)\s*$",
+                              lines[grp[1]].split("#", 1)[0])
+                m3 = re.match(r"\s*(lw|lh|lhu|lb|lbu)\s+(\$\w+)\s*,\s*%lo\(([A-Za-z_]\w*)\)"
+                              r"\(\$(?:1|at)\)\s*$", lines[grp[2]].split("#", 1)[0])
+                if ma and m3 and norm_reg(ma.group(1)) not in ("at", None):
+                    cur.append((i, j, "%s\t%s,%s(%s)" % (m3.group(1), m3.group(2),
+                                                         m3.group(3), ma.group(1))))
+                    i = j + 1
+                    continue
             flush()
             i = j + 1
             prev_br = False
@@ -1213,6 +1269,8 @@ def sched_match_pass(stext, tgt):
             k = _sm_srckey(u[2])
             if la_tmp.get((u[0], u[1])) in bad:
                 k = None                    # not private: a barrier
+            if u[2].split(None, 1)[0].lower() == "nop":
+                k = None                    # an explicit load-delay nop stays put
             t = next((q for q, tk in enumerate(tkeys)
                       if k is not None and tk == k and q not in used), None)
             if t is None:
@@ -3795,7 +3853,27 @@ def _strip_trailing_pad(words):
 
 
 def assemble_words(ctx, sfile, fn):
-    """gas .s -> maspsx --run-assembler -> objdump; return [(be_hex, disasm)] for fn."""
+    """gas .s -> maspsx --run-assembler -> objdump; return [(be_hex, disasm)] for fn.
+    Memoized on the file bytes (a search re-assembles identical text often: most
+    candidate passes do not fire)."""
+    import hashlib
+    with open(sfile, "rb") as f:
+        key = (hashlib.sha1(f.read()).hexdigest(), fn,
+               tuple(ctx["maspsx_flags"]), tuple(ctx["maspsx_as_flags"]))
+    if key in _ASM_CACHE:
+        return list(_ASM_CACHE[key]), None
+    words, err = _assemble_words(ctx, sfile, fn)
+    if err is None:
+        if len(_ASM_CACHE) > 4096:
+            _ASM_CACHE.clear()
+        _ASM_CACHE[key] = list(words)
+    return words, err
+
+
+_ASM_CACHE = {}
+
+
+def _assemble_words(ctx, sfile, fn):
     obj = sfile + ".asmnorm.o"
     cmd = ([ctx["python"], ctx["maspsx_py"]] + ctx["maspsx_flags"]
            + ["--gnu-as-path=%s" % ctx["as_bin"]] + ctx["maspsx_as_flags"]
