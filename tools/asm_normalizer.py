@@ -2408,6 +2408,98 @@ def nodiv_pass(stext, tgt):
     return "\n".join(out) if changed else stext
 
 
+
+# --------------------------------------------------------------------------
+# copy-use: after `move X,Y` both registers hold the same value; our cc1 reads Y
+# where retail reads X (copy propagation went the other way). Aligned by
+# mnemonic sequence to the target, a use of Y whose target word reads X becomes
+# a use of X when the copy `move X,Y` precedes it on the same straight line and
+# neither X nor Y is written in between. Sound by value equality.
+# --------------------------------------------------------------------------
+def _cu_parts(l):
+    b = l.split("#", 1)[0].strip()
+    m = _MOVE_S.match(l)
+    if m:
+        return "addu", [norm_reg(m.group(2)), norm_reg(m.group(3)), "zero"], b
+    mn, regs, _sk = insn_parts(b)
+    return mn, regs, b
+
+
+def copy_use_pass(stext, tgt):
+    lines = stext.split("\n")
+    nr = _noreorder_lines(lines)
+    ins = [(i, l) for i, l in enumerate(lines) if _s_is_insn(l)
+           and not is_nop(l.split("#", 1)[0].strip())]
+    ours = [_cu_parts(l) for _i, l in ins]
+    tt = []
+    for _w, d in tgt:
+        if not is_nop(d.strip()):
+            mn, regs, _sk = insn_parts(d.strip())
+            tt.append((mn, regs))
+    sm = difflib.SequenceMatcher(None, ["%s/%d" % (o[0], len(o[1])) for o in ours],
+                                 ["%s/%d" % (t[0], len(t[1])) for t in tt], autojunk=False)
+    body = " ".join(l.split("#", 1)[0] for l in lines if _s_is_insn(l)
+                    or l.strip().startswith(".word"))
+    refd = set(re.findall(r"[$\w.]+", body))
+    changed = False
+    for a, bb, size in sm.get_matching_blocks():
+        for q in range(size):
+            p = a + q
+            li, l = ins[p]
+            mn, regs, b = ours[p]
+            tregs = tt[bb + q][1]
+            if li in nr or mn == "addu" and _MOVE_S.match(l):
+                continue
+            d, u = defs_uses(b)
+            diff = [(k, r, t) for k, (r, t) in enumerate(zip(regs, tregs)) if r != t]
+            if len(diff) != 1:
+                continue
+            k, y, x = diff[0]
+            if y not in u or y in d or x in d or x in u:
+                continue
+            # the copy `move x,y` earlier on this straight line
+            z, ok = p - 1, False
+            while z >= 0:
+                zi, zl = ins[z]
+                if zi in nr or any(_s_is_label(w) and w.strip()[:-1] in refd
+                                   for w in lines[zi + 1:ins[z + 1][0]]):
+                    break
+                mm = _MOVE_S.match(zl)
+                if mm and norm_reg(mm.group(2)) == x and norm_reg(mm.group(3)) == y:
+                    ok = True
+                    break
+                zd, _zu = defs_uses(zl.split("#", 1)[0].strip())
+                if x in zd or y in zd or _src_is_branch(zl) or re.match(r"\s*jalr?\b", zl):
+                    break
+                z -= 1
+            if not ok:
+                continue
+            # rewrite the k-th register operand
+            mb = re.match(r"^(\s*)(\S+)(\s+)(.*?)(\s*#.*)?$", l)
+            ops = split_ops(mb.group(4))
+            n = -1
+            for j, o in enumerate(ops):
+                mo = re.fullmatch(r"(.*)\((\$?\w+)\)", o.strip())
+                if mo and norm_reg(mo.group(2)) is not None:
+                    n += 1
+                    if n == k:
+                        ops[j] = "%s(%s)" % (mo.group(1), _src_reg_tok(mo.group(2), x))
+                elif norm_reg(o.strip()) is not None:
+                    n += 1
+                    if n == k:
+                        ops[j] = _src_reg_tok(o.strip(), x)
+            lines[li] = mb.group(1) + mb.group(2) + mb.group(3) + ",".join(ops) + (mb.group(5) or "")
+            changed = True
+    return "\n".join(lines) if changed else stext
+
+
+def _src_reg_tok(like, reg):
+    """`reg` (ABI name) spelled like the token `like` ($n numeric or $abi)."""
+    if re.fullmatch(r"\$\d+", like.strip()):
+        return "$%d" % ABI2NUM[reg]
+    return "$" + reg
+
+
 def zero_remat_pass(stext, tgt):
     want = sum(1 for _w, dis in tgt if _ZERO_TGT.match(dis.strip()))
     have = sum(1 for l in stext.split("\n")
@@ -3204,6 +3296,7 @@ PASSES = {
     "zero_remat": zero_remat_pass,
     "load_remat": load_remat_pass,
     "nodiv": nodiv_pass,
+    "copy_use": copy_use_pass,
     "ra_restore_sink": ra_restore_sink_pass,
     "sched_match": sched_match_pass,
     "fallthrough_fill": fallthrough_fill_pass,
