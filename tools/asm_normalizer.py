@@ -20,6 +20,7 @@ No function names or repository paths are baked into this module. The manifest
 supplies the function names; the caller supplies the toolchain paths and the
 retail-asm root via a small context object.
 """
+import difflib
 import json
 import os
 import re
@@ -2267,6 +2268,339 @@ def operand_recolor_s(stext, tgt):
     return stext
 
 
+# --------------------------------------------------------------------------
+# web_realloc. reg_realloc renames registers through ONE global sigma, so it
+# cannot express "this live range of $a0 is $v1 in the target while the entry
+# value stays in $a0" (e.g. `lbu $v1,0x46($a0)` where ours reuses the
+# dead argument register). This pass splits every register into webs (def-use
+# chains joined at shared uses, reaching definitions over the delay-slot aware
+# CFG), aligns our instructions with the target words (mnemonic sequence
+# match, nops ignored) and renames one web at a time to the register the
+# target uses at every aligned occurrence of it. Sound: a web is renamed only
+# when it is not pinned (entry value, call argument/clobber, return value,
+# $sp/$fp/$ra/$at/$gp) and does not interfere (Chaitin: neither is live where
+# the other is defined) with any web currently held in the new register.
+# Count-preserving, text pass after sigma.
+# --------------------------------------------------------------------------
+_WR_USE_ONLY = {"jr", "j", "b", "jal", "jalr", "mult",
+                "multu", "div", "divu", "mthi", "mtlo"}
+_WR_FIXED = {"zero", "sp", "fp", "gp", "k0", "k1", "ra", "at", "hi", "lo"}
+_WR_RET = ("v0", "sp", "s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7", "fp", "ra")
+_WR_IMM = {"addu": "addiu", "and": "andi", "or": "ori", "xor": "xori",
+           "slt": "slti", "sltu": "sltiu", "subu": "addiu"}
+
+
+def _wr_parse(line):
+    """cc1 insn line -> (indent, mnem, ops, comment, regpos) where regpos is
+    [(op_index, in_parens, abi_reg)] in operand order."""
+    body, _, com = line.partition("#")
+    indent = line[:len(line) - len(line.lstrip())]
+    p = body.strip().split(None, 1)
+    mn = p[0].lower() if p else ""
+    ops = split_ops(p[1]) if len(p) > 1 else []
+    rp = []
+    for k, op in enumerate(ops):
+        mm = re.fullmatch(r"(.*)\((\$\w+)\)", op)
+        if mm and norm_reg(mm.group(2)) is not None:
+            rp.append((k, True, norm_reg(mm.group(2))))
+        elif norm_reg(op) is not None:
+            rp.append((k, False, norm_reg(op)))
+    return indent, mn, ops, com, rp
+
+
+def _wr_canon(mn, ops, rp):
+    """Our line -> [(tgt_mnem, [(reg, ourpos|None)])] word tokens for alignment."""
+    regs = [(r, i) for i, (_, _, r) in enumerate(rp)]
+    so = _sym_operand("\t%s\t%s" % (mn, ",".join(ops)))
+    if so or mn == "la":
+        return [("?", [])] * _src_nwords("\t%s\t%s" % (mn, ",".join(ops)))
+    if mn == "li":
+        n = _src_nwords("\tli\t%s" % ",".join(ops))
+        if n != 1:
+            return [("?", [])] * n
+        v = int(ops[-1], 0)
+        return [("addiu" if v < 0x8000 else "ori", regs + [("zero", None)])]
+    if mn == "move":
+        return [("addu", regs + [("zero", None)])]
+    if mn in ("beq", "bne") and len(regs) == 2 and regs[1][0] == "zero":
+        return [(mn + "z", regs[:1])]
+    if mn == "j" and regs:
+        return [("jr", regs)]
+    if mn == "jal" and regs:
+        return [("jalr", regs)]
+    if mn in _WR_IMM and len(ops) == 3 and len(regs) == 2 and not ops[2].startswith("$"):
+        return [(_WR_IMM[mn], regs)]
+    return [(mn, regs)]
+
+
+def _wr_nodes(lines):
+    """Build the CFG. Returns (nodes, ok). node = {line, uses:[(reg,pos)],
+    defs:[(reg,pos)], succ:[...]}; pos None = implicit (pins the web)."""
+    nodes, labels, pend, nr = [], {}, [], False
+    nodes.append({"line": None, "uses": [], "succ": [1],
+                  "defs": [(r, None) for r in ABI2NUM if norm_reg(r) == r
+                           and r not in ("zero", "hi", "lo")]})
+    ins = []
+    for i, l in enumerate(lines):
+        s = l.strip()
+        if s.startswith(".set"):
+            w = s.split()[-1]
+            if w == "noreorder":
+                nr = True
+            elif w == "reorder":
+                nr = False
+            continue
+        m = re.match(r"^([\w.$]+):", s)
+        if m:
+            ins.append(("L", m.group(1), None))
+            continue
+        if _s_is_insn(l) and s.split(None, 1)[0].lower() != "nop":
+            ins.append(("I", i, nr))
+        elif _s_is_insn(l):
+            ins.append(("N", i, nr))
+    k = 0
+
+    def node(line, uses, defs, fall=True):
+        nodes.append({"line": line, "uses": uses, "defs": defs, "succ": [], "fall": fall})
+        return len(nodes) - 1
+
+    def ordinary(i):
+        ind, mn, ops, com, rp = _wr_parse(lines[i])
+        uses, defs = [], []
+        for pos, (_, _, r) in enumerate(rp):
+            if pos == 0 and mn not in _WR_USE_ONLY and mn not in _STORE_MN \
+                    and mn not in _COND_BR_MN:
+                defs.append((r, pos))
+            else:
+                uses.append((r, pos))
+        if _sym_operand(lines[i]):
+            defs.append(("at", None))
+        if mn in ("mult", "multu", "div", "divu"):
+            defs += [("hi", None), ("lo", None)]
+        return uses, defs
+
+    while k < len(ins):
+        kind, a, nrf = ins[k]
+        if kind == "L":
+            labels[a] = len(nodes)
+            k += 1
+            continue
+        i = a
+        ind, mn, ops, com, rp = _wr_parse(lines[i])
+        if kind == "N":
+            node(i, [], [])
+            k += 1
+            continue
+        xfer = mn in _COND_BR_MN or mn in ("j", "b", "jal", "jalr", "jr")
+        if not xfer:
+            u, d = ordinary(i)
+            node(i, u, d)
+            k += 1
+            continue
+        slot = None
+        if nrf and k + 1 < len(ins) and ins[k + 1][0] in ("I", "N"):
+            slot = ins[k + 1][1]
+        lab = re.search(r"(\$L\w+)\s*$", lines[i].split("#", 1)[0])
+        regs = [(r, pos) for pos, (_, _, r) in enumerate(rp)]
+        if mn in _COND_BR_MN:
+            node(i, regs, [])
+        elif mn in ("jal", "jalr") and regs:
+            node(i, regs[-1:], [])
+        elif mn in ("j", "jr") and regs:
+            if regs[0][0] != "ra":
+                return nodes, False          # indirect jump (table): give up
+            node(i, [], [])
+        else:
+            node(i, [], [])
+        head = len(nodes) - 1
+        if slot is not None:
+            u, d = ordinary(slot) if ins[k + 1][0] == "I" else ([], [])
+            node(slot, u, d)
+        last = len(nodes) - 1
+        if mn in ("jal", "jalr"):
+            node(None, [(r, None) for r in ("a0", "a1", "a2", "a3")],
+                 [(r, None) for r in _CALL_CLOBBER if r not in ("hi", "lo")])
+        elif mn in ("j", "jr") and regs:
+            node(None, [(r, None) for r in _WR_RET], [], fall=False)
+        elif mn in ("j", "b"):
+            nodes[last]["jump"] = lab.group(1) if lab else None
+            nodes[last]["fall"] = False
+            if not lab:
+                return nodes, False
+        if mn in _COND_BR_MN:
+            if not lab:
+                return nodes, False
+            nodes[last]["jump"] = lab.group(1)
+        k += 2 if slot is not None else 1
+    for n, nd in enumerate(nodes):
+        if n == 0:
+            continue
+        if nd.get("fall", True) and n + 1 < len(nodes):
+            nd["succ"].append(n + 1)
+        if nd.get("jump"):
+            t = labels.get(nd["jump"])
+            if t is None:
+                return nodes, False
+            if t < len(nodes):
+                nd["succ"].append(t)
+    return nodes, True
+
+
+def _wr_webs(nodes):
+    """Reaching defs -> webs. Returns (occ, pinned, live_out, defs_at) keyed by
+    web root: occ[(node,reg,pos)] = root; defs_at[node] = [roots defined]."""
+    dids = []                                   # (node, reg, pos)
+    gen = []
+    for n, nd in enumerate(nodes):
+        g = {}
+        for r, pos in nd["defs"]:
+            g[r] = len(dids)
+            dids.append((n, r, pos))
+        gen.append(g)
+    pred = [[] for _ in nodes]
+    for n, nd in enumerate(nodes):
+        for s in nd["succ"]:
+            pred[s].append(n)
+    IN = [dict() for _ in nodes]
+    OUT = [dict() for _ in nodes]
+    ch = True
+    while ch:
+        ch = False
+        for n in range(len(nodes)):
+            new = {}
+            for p in pred[n]:
+                for r, ds in OUT[p].items():
+                    new.setdefault(r, set()).update(ds)
+            IN[n] = new
+            o = {r: set(ds) for r, ds in new.items()}
+            for r, d in gen[n].items():
+                o[r] = {d}
+            if o != OUT[n]:
+                OUT[n] = o
+                ch = True
+    par = list(range(len(dids)))
+
+    def f(x):
+        while par[x] != x:
+            par[x] = par[par[x]]
+            x = par[x]
+        return x
+    useocc = []
+    for n, nd in enumerate(nodes):
+        for r, pos in nd["uses"]:
+            ds = sorted(IN[n].get(r, ()))
+            if not ds:
+                continue
+            for d in ds[1:]:
+                par[f(d)] = f(ds[0])
+            useocc.append((n, r, pos, ds[0]))
+    occ, pinned = {}, set()
+    for d, (n, r, pos) in enumerate(dids):
+        occ[(n, r, pos, "d")] = f(d)
+        if pos is None:
+            pinned.add(f(d))
+    for n, r, pos, d in useocc:
+        occ[(n, r, pos, "u")] = f(d)
+        if pos is None:
+            pinned.add(f(d))
+    reg_of = {f(d): r for d, (n, r, pos) in enumerate(dids)}
+    # web liveness (backward)
+    use_w = [set() for _ in nodes]
+    def_w = [set() for _ in nodes]
+    for (n, r, pos, kd), w in occ.items():
+        (use_w if kd == "u" else def_w)[n].add(w)
+    LI = [set() for _ in nodes]
+    LO = [set() for _ in nodes]
+    ch = True
+    while ch:
+        ch = False
+        for n in range(len(nodes) - 1, -1, -1):
+            lo = set()
+            for s in nodes[n]["succ"]:
+                lo |= LI[s]
+            li = use_w[n] | (lo - def_w[n])
+            if lo != LO[n] or li != LI[n]:
+                LO[n], LI[n] = lo, li
+                ch = True
+    return occ, pinned, reg_of, LO, def_w
+
+
+def web_realloc_pass(stext, tgt):
+    lines = stext.split("\n")
+    tk = [(mn, regs) for mn, regs, _ in (insn_parts(d) for _, d in tgt) if mn != "nop"]
+    for _ in range(12):
+        nodes, ok = _wr_nodes(lines)
+        if not ok:
+            return stext if _ == 0 else "\n".join(lines)
+        occ, pinned, reg_of, LO, def_w = _wr_webs(nodes)
+        ours = []                                  # (node, [(reg,pos)], mnem)
+        for n, nd in enumerate(nodes):
+            if nd["line"] is None or n == 0:
+                continue
+            ind, mn, ops, com, rp = _wr_parse(lines[nd["line"]])
+            if mn == "nop" or not mn:
+                continue
+            for cm, cr in _wr_canon(mn, ops, rp):
+                ours.append((n, cr, cm))
+        sm = difflib.SequenceMatcher(None, [o[2] for o in ours], [t[0] for t in tk],
+                                     autojunk=False)
+        want = {}
+        for a, b, size in sm.get_matching_blocks():
+            for q in range(size):
+                n, cr, cm = ours[a + q]
+                treg = tk[b + q][1]
+                if len(treg) != len(cr):
+                    continue
+                for (r, pos), t in zip(cr, treg):
+                    if pos is None:
+                        continue
+                    for kd in ("d", "u"):
+                        w = occ.get((n, r, pos, kd))
+                        if w is not None:
+                            want.setdefault(w, set()).add(t)
+        done = False
+        for w, ts in sorted(want.items()):
+            if w in pinned or len(ts) != 1:
+                continue
+            t = next(iter(ts))
+            r = reg_of[w]
+            if t == r or t in _WR_FIXED or r in _WR_FIXED:
+                continue
+            others = [x for x, rr in reg_of.items() if rr == t]
+            bad = False
+            for n in range(len(nodes)):
+                if w in def_w[n] and any(x in LO[n] for x in others):
+                    bad = True
+                    break
+                if w in LO[n] and any(x in def_w[n] for x in others):
+                    bad = True
+                    break
+            if bad:
+                continue
+            num = "$%d" % ABI2NUM[t]
+            edits = {}
+            for (n, rr, pos, kd), ww in occ.items():
+                if ww == w and pos is not None:
+                    edits.setdefault(nodes[n]["line"], set()).add(pos)
+            for li, poss in edits.items():
+                ind, mn, ops, com, rp = _wr_parse(lines[li])
+                ops = list(ops)
+                for pos in poss:
+                    k, par_, _r = rp[pos]
+                    if par_:
+                        ops[k] = re.sub(r"\(\$\w+\)$", "(%s)" % num, ops[k])
+                    else:
+                        ops[k] = num
+                body = lines[li].split("#", 1)[0].strip().split(None, 1)[0]
+                lines[li] = "%s%s\t%s%s" % (ind, body, ",".join(ops),
+                                            ("\t#" + com) if com else "")
+            done = True
+            break
+        if not done:
+            break
+    return "\n".join(lines)
+
+
 PASSES = {
     # reg_realloc is applied specially (it needs sigma from words); the ordered
     # list in the manifest still names it so the recipe is explicit and auditable.
@@ -2276,6 +2610,7 @@ PASSES = {
     "exit_merge": exit_merge_pass,
     "commutative_swap": commutative_swap_s,
     "operand_recolor": operand_recolor_s,
+    "web_realloc": web_realloc_pass,
     "laform": laform_fold_pass,
     "base_cse_collapse": base_cse_collapse_pass,
     "shift_const_fold": shift_const_fold_pass,
