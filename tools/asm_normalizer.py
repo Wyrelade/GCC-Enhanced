@@ -4677,6 +4677,73 @@ def splice_alt_spans(text, alt_text, names, tag="ns"):
     return text, done
 
 
+
+# --------------------------------------------------------------------------
+# jtbl binding: a switch cc1 lowers to a jump table emits its own `.rdata` table
+# inside the function span. Retail's table already sits in the separate rodata
+# object (splat keeps low .rodata there) and points at `.L<addr>` labels that the
+# INCLUDE_ASM body defined. Once the function is C, bind the two: drop our table,
+# address the retail `jtbl_<addr>` symbol instead, and define each retail
+# `.L<addr>` (global, like splat's jlabel) at the label our table entry names.
+# Tables pair up in order of first use; entry counts must agree. No word changes
+# (the table load is a relocated %hi/%lo), only data placement and symbols.
+# --------------------------------------------------------------------------
+_JT_DATA = None
+_OUR_JT = re.compile(r"(?m)^[ \t]*\.rdata[ \t\r]*\n(?:[ \t]*\.align[ \t]+\d+[ \t\r]*\n)?"
+                     r"(\$L\w+):[ \t\r]*\n((?:[ \t]*\.(?:word|gpword)[ \t]+\$L\w+[ \t\r]*\n)+)"
+                     r"[ \t]*\.text[ \t\r]*\n")
+
+
+def _jt_data(asm_root):
+    """{jtbl_name: [entry labels]} from every splat asm file under asm_root."""
+    global _JT_DATA
+    if _JT_DATA is None:
+        _JT_DATA = {}
+        for dp, _ds, fs in os.walk(asm_root):
+            for f in fs:
+                if not f.endswith(".s"):
+                    continue
+                t = open(os.path.join(dp, f), encoding="utf-8", errors="replace").read()
+                if "dlabel jtbl_" not in t:
+                    continue
+                for m in re.finditer(r"(?ms)^dlabel (jtbl_\w+)\n(.*?)^enddlabel", t):
+                    _JT_DATA[m.group(1)] = re.findall(r"\.word\s+(\.L\w+)", m.group(2))
+    return _JT_DATA
+
+
+def jtbl_bind(span, name, asm_root):
+    t = find_target_s(asm_root, name) if asm_root else None
+    if not t:
+        return span
+    used = []
+    for j in re.findall(r"\b(jtbl_\w+)\b", open(t, encoding="utf-8", errors="replace").read()):
+        if j not in used:
+            used.append(j)
+    ours = list(_OUR_JT.finditer(span))
+    if not used or len(used) != len(ours):
+        return span
+    data = _jt_data(asm_root)
+    alias = {}
+    for j, m in zip(used, ours):
+        ent = re.findall(r"\$L\w+", m.group(2))
+        if j not in data or len(data[j]) != len(ent):
+            return span
+        for r, o in zip(data[j], ent):
+            if alias.setdefault(r, o) != o:
+                return span                 # one retail label, two of ours
+    for j, m in reversed(list(zip(used, ours))):
+        span = span[:m.start()] + span[m.end():]
+        span = re.sub(r"%s(?!\w)" % re.escape(m.group(1)), j, span)
+    by_ours = {}
+    for r, o in alias.items():
+        by_ours.setdefault(o, []).append(r)
+    for o, rs in by_ours.items():
+        span = re.sub(r"(?m)^(%s:)[ \t\r]*$" % re.escape(o),
+                      lambda mm: mm.group(1) + "".join("\n\t.globl\t%s\n%s:" % (r, r)
+                                                       for r in sorted(rs)), span, count=1)
+    return span
+
+
 def normalize_s(s_file, ctx, manifest=None):
     """Splice-normalize the manifest functions in a cc1 .s in place. Reads once,
     rewrites once. Returns the sorted list of function names it rewrote.
@@ -4800,5 +4867,9 @@ def normalize_s(s_file, ctx, manifest=None):
             new_span, _fired = apply_padnop(out[start:end], our_hex, tgt_full)
             out = out[:start] + new_span + out[end:]
 
+    # Pass 3 -- bind C switch tables to the retail jump tables
+    for name, start, end in sorted(split_spans(out), key=lambda x: -x[1]):
+        if name in manifest:
+            out = out[:start] + jtbl_bind(out[start:end], name, ctx.get("asm_root")) + out[end:]
     _write_bytes_str(s_file, out)
     return sorted(set(rewrote))
