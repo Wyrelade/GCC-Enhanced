@@ -1945,6 +1945,91 @@ def taken_fill_pass(stext, tgt):
                 xi += 5
         if not thread_to:
             lines.insert(xi + 1, newlab + ":")
+    # Op G: the reverse of Op A. Our slot S was stolen from the taken path (the
+    # branch goes past where S was) but retail fills the slot from the
+    # fall-through head X and branches onto its own copy of S. Needs: the target
+    # slot == X, the target lands on an insn identical to S, nothing falls into
+    # our label from above (a transfer precedes it), S's destination dead on the
+    # fall-through, X's destination dead on the taken path and not read by S.
+    mfn = re.search(r"^\s*\.ent\s+(\w+)", stext, re.M)
+    fna = re.search(r"_([0-9A-Fa-f]{8})$", mfn.group(1)) if mfn else None
+    ours = _tf_branches(lines)
+    for k in range(len(ours)):
+        if fna is None:
+            break
+        ours = _tf_branches(lines)
+        if len(ours) != len(tb):
+            break
+        bi, nr = ours[k]
+        tk = tb[k]
+        if not nr or tk + 1 >= len(tgt):
+            continue
+        mt = re.search(r"\.L([0-9A-Fa-f]{8})\s*$", tgt[tk][1])
+        if not mt:
+            continue
+        ti = (int(mt.group(1), 16) - int(fna.group(1), 16)) // 4
+        if not 0 <= ti < len(tgt):
+            continue
+        slot = _tf_next_insn(lines, bi)
+        xi = _tf_next_insn(lines, slot) if slot is not None else None
+        if xi is None:
+            continue
+        sb = lines[slot].split("#", 1)[0].strip()
+        xb = lines[xi].split("#", 1)[0].strip()
+        sf, xf = _ff_word_form(sb), _ff_word_form(xb)
+        if sf is None or xf is None:
+            continue
+        tsk = _sm_key(tgt[tk + 1][1].strip(), True)
+        if _sm_key(xf, False) != tsk or _sm_key(sf, False) == tsk:
+            continue
+        tkey = _sm_key(tgt[ti][1].strip(), True)
+        if tkey == "skip":
+            if not sf.startswith("lui") or _SYM_RE.findall(tgt[ti][1]) != _SYM_RE.findall(sf):
+                continue
+        elif tkey is None or tkey != _sm_key(sf, False):
+            continue
+        if any(re.match(r"\s*\$L\w*:", lines[y]) for y in range(slot + 1, xi)):
+            continue                        # X sits at a join: not the fall-through head
+        lab = re.search(r"(\$L\w+)\s*$", lines[bi].split("#", 1)[0])
+        if not lab:
+            continue
+        at = next((x for x, l in enumerate(lines) if l.strip() == lab.group(1) + ":"), None)
+        if at is None:
+            continue
+        # the label must not be reached by falling through from above
+        while at > 0 and lines[at - 1].strip().endswith(":"):
+            at -= 1
+        pi = max((y for y in range(at) if _s_is_insn(lines[y])), default=None)
+        if pi is None:
+            continue
+        pj = max((y for y in range(pi) if _s_is_insn(lines[y])), default=None)
+        pb = lines[pi].split("#", 1)[0].strip()
+        jb = lines[pj].split("#", 1)[0].strip() if pj is not None else ""
+        uncond = re.match(r"(j|b)\s+\$\w+$|jr\s+\$\w+$", pb)
+        if not uncond and not (pj is not None and re.match(r"(j|b)\s+\$\w+$|jr\s+\$\w+$", jb)
+                               and pi in _noreorder_lines(lines)):
+            continue
+        ds, us = defs_uses(sf)
+        dx, ux = defs_uses(xf)
+        if len(ds) != 1 or len(dx) != 1 or set(dx) & set(us) or set(ds) & set(ux):
+            continue
+        ins = [(i, l) for i, l in enumerate(lines) if _s_is_insn(l)]
+        if not _ff_dead_on(lines, ins, lab.group(1), next(iter(dx))):
+            continue
+        probe = list(lines)
+        probe.insert(xi + 1, "$Ltg_probe:")
+        pins = [(i, l) for i, l in enumerate(probe) if _s_is_insn(l)]
+        if not _ff_dead_on(probe, pins, "$Ltg_probe", next(iter(ds))):
+            continue
+        n_new += 1
+        newlab = "$Ltg%d_%d" % (bi, n_new)
+        ind = _src_indent(lines[bi])
+        lines[bi] = lines[bi][:lines[bi].rindex(lab.group(1))] + newlab
+        lines[slot] = _src_indent(lines[slot]) + xf
+        del lines[xi]
+        if at > xi:
+            at -= 1
+        lines[at:at] = [newlab + ":", ind + sb]
     # Op B: a slot insn made redundant by an identical earlier def
     ours = _tf_branches(lines)
     if len(ours) != len(tb):
