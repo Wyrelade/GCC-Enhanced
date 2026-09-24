@@ -98,6 +98,10 @@ Phases A, B and the core of C are working.
 The tool was started while decompiling Digimon World 2 (PSX, SLUS-01193), the motivating case
 study, but the method is general to any PSX-era GCC 2.x matching decomp.
 
+Case study status (2026-09-24): 571 of 907 functions (62.95%) of the Digimon World 2 main
+executable are matched and rebuild byte-identical, up from 523 (57.66%) at the start of this
+round. Most of the new matches come from normalizer passes, not per-function C tuning.
+
 ## Tools
 
 - `tools/equiv.py` - Phase B semantic-equivalence verifier. Symbolic execution over a MIPS1
@@ -143,8 +147,14 @@ study, but the method is general to any PSX-era GCC 2.x matching decomp.
   `.s`-text operators, imports neither the solver nor the verifier, and takes the toolchain paths
   and retail-asm root from the caller, so no project symbols or paths are baked in. The manifest is
   `{"<function>": {"passes": [<pass name>, ...]}}` and lists the ordered rewrites to replay
-  deterministically (no search). Pass names: `reg_realloc` (apply the derived register
-  correspondence) and `commutative_swap` (transpose a commutative op's sources to the target order).
+  deterministically (no search). Pass names include `reg_realloc` (apply the derived register
+  correspondence), `web_realloc` (rename one register live range at a time, interference-checked),
+  `commutative_swap`, `operand_recolor`, `save_slot` (re-lay callee-saved stack slots),
+  `sched_match` (reorder independent units to the target order), `taken_fill` /
+  `fallthrough_fill` (delay-slot fill from either path), `dead_code`, `zero_remat` (constant
+  re-materialization), `shift_const_fold`, `exit_merge`, `un_hi_cse`, `laform`, and the word-level
+  `delay_fill`, `epilogue_unfill`, `reorder_indep`, `padnop`. `assemble_words` is memoized on the
+  assembled file's bytes, which makes a recipe search 8-50x faster.
   Keep the verified honesty gate in `phase_f.py`/`solve.py` as a pre-commit check; the shipped build
   just replays the recorded passes and relies on the linked checksum.
 
