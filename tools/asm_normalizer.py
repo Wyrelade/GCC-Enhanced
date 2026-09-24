@@ -1136,7 +1136,7 @@ def _sm_units(lines, ins, la_tmp=None):
                     and re.match(r"\s*lui\s+\$(?:1|at)\s*,\s*%hi\(", lines[grp[0]])):
                 ma = re.match(r"\s*addu\s+\$(?:1|at)\s*,\s*\$(?:1|at)\s*,\s*(\$\w+)\s*$",
                               lines[grp[1]].split("#", 1)[0])
-                m3 = re.match(r"\s*(lw|lh|lhu|lb|lbu)\s+(\$\w+)\s*,\s*%lo\(([A-Za-z_]\w*)\)"
+                m3 = re.match(r"\s*(lw|lh|lhu|lb|lbu|sw|sh|sb)\s+(\$\w+)\s*,\s*%lo\(([A-Za-z_]\w*(?:\+\d+)?)\)"
                               r"\(\$(?:1|at)\)\s*$", lines[grp[2]].split("#", 1)[0])
                 if ma and m3 and norm_reg(ma.group(1)) not in ("at", None):
                     cur.append((i, j, "%s\t%s,%s(%s)" % (m3.group(1), m3.group(2),
@@ -1201,15 +1201,29 @@ def _sm_units(lines, ins, la_tmp=None):
     return blocks
 
 
+def _sm_sym(s):
+    """`D_XXXXXXXX+k` -> the splat name of the address it resolves to."""
+    m = re.fullmatch(r"D_([0-9A-Fa-f]{8})\+(\d+)", s)
+    return "D_%08X" % (int(m.group(1), 16) + int(m.group(2))) if m else s
+
+
 def _sm_srckey(body):
     m = re.match(r"(\w+)\s+(\$\w+)\s*,\s*%lo\(([^)]+)\)\(\$(?:1|at)\)\s*$", body)
     if m:
-        return (m.group(1).lower(), norm_reg(m.group(2)), m.group(3))
-    # indexed symbolic load macro `op $d,S($b)`: gas expands it to
-    # `lui $d,%hi(S); addu $d,$d,$b; op $d,%lo(S)($d)`; keyed by its %lo word
-    m = re.match(r"(lw|lh|lhu|lb|lbu)\s+(\$\w+)\s*,\s*([A-Za-z_]\w*)\((\$\w+)\)\s*$", body)
+        return (m.group(1).lower(), norm_reg(m.group(2)), _sm_sym(m.group(3)))
+    # indexed symbolic access macro `op $d,S($b)`: gas expands it to
+    # `lui $d,%hi(S); addu $d,$d,$b; op $d,%lo(S)($d)` (a store through $at);
+    # keyed by its %lo word
+    m = re.match(r"(lw|lh|lhu|lb|lbu|sw|sh|sb)\s+(\$\w+)\s*,\s*([A-Za-z_]\w*(?:\+\d+)?)"
+                 r"\((\$\w+)\)\s*$", body)
     if m and norm_reg(m.group(2)) not in ("1", "at"):
-        return (m.group(1).lower(), norm_reg(m.group(2)), m.group(3))
+        return (m.group(1).lower(), norm_reg(m.group(2)), _sm_sym(m.group(3)))
+    # a 2-word `li` (lui [+ ori]) is keyed by its lui word
+    m = re.match(r"li\s+(\$\w+)\s*,\s*(-?(?:0x[0-9a-fA-F]+|\d+))\s*$", body)
+    if m:
+        v = int(m.group(2), 0)
+        if not (-0x8000 <= v <= 0xFFFF):
+            return ("lui", norm_reg(m.group(1)), (v >> 16) & 0xFFFF)
     return _sm_key(body, False)
 
 
@@ -2261,6 +2275,92 @@ def const_remat_s(stext, want):
     return "\n".join(lines) if changed else stext
 
 
+
+# --------------------------------------------------------------------------
+# load-remat: our cc1 CSEs a second read of the same memory word into a register
+# copy (`lb $3,34($16) ... move $4,$3`); retail reads the memory again
+# (`lb $4,34($16)`). Where the target carries more loads of an (opcode, offset)
+# than we do, a `move rd,rs` whose rs comes from such a load earlier on the same
+# straight-line path (no label, store or call in between, base and rs not
+# rewritten) becomes the reload. Count may change (a load-delay nop), so it runs
+# before sigma.
+# --------------------------------------------------------------------------
+_LOAD_S = re.compile(r"^(\s*)(lb|lbu|lh|lhu|lw)\s+(\$\w+)\s*,\s*(-?\d+)\((\$\w+)\)\s*(#.*)?$")
+_LOAD_T = re.compile(r"(lb|lbu|lh|lhu|lw)\s+\S+\s*,\s*(-?(?:0x[0-9a-fA-F]+|\d+))\(")
+_LR_STOP = re.compile(r"(s[bhw]|swl|swr|jal|jalr|j|jr|syscall|break)\b")
+
+
+def load_remat_pass(stext, tgt):
+    want, tk = {}, []
+    for _w, dis in tgt:
+        m = _LOAD_T.match(dis.strip())
+        k = (m.group(1), int(m.group(2), 0)) if m else None
+        tk.append(k)
+        if m:
+            want[k] = want.get(k, 0) + 1
+    lines = stext.split("\n")
+    ins = [(i, l) for i, l in enumerate(lines) if _s_is_insn(l)]
+    have = {}
+    for _i, l in ins:
+        m = _LOAD_S.match(l)
+        if m:
+            k = (m.group(2), int(m.group(4)))
+            have[k] = have.get(k, 0) + 1
+    nr = _noreorder_lines(lines)
+    body = " ".join(l.split("#", 1)[0] for l in lines if _s_is_insn(l)
+                    or l.strip().startswith(".word"))
+    refd = set(re.findall(r"[$\w.]+", body))
+    changed = False
+    for p, (li, l) in enumerate(ins):
+        m = _MOVE_S.match(l)
+        if not m or li in nr:
+            continue
+        rd, rs = norm_reg(m.group(2)), norm_reg(m.group(3))
+        if rs in (None, "zero") or rd in (None, "zero"):
+            continue
+        q, hit = p - 1, None
+        while q >= 0:
+            qi, ql = ins[q]
+            if qi in nr or any(_s_is_label(x) and x.strip()[:-1] in refd
+                                for x in lines[qi + 1:ins[q + 1][0]]):
+                break
+            b = ql.split("#", 1)[0].strip()
+            ml = _LOAD_S.match(ql)
+            d, _u = defs_uses(b)
+            if ml and norm_reg(ml.group(3)) == rs:
+                hit = (q, ml)
+                break
+            if rs in d or _LR_STOP.match(b):
+                break
+            q -= 1
+        if not hit:
+            continue
+        q, ml = hit
+        op, off, base = ml.group(2), int(ml.group(4)), ml.group(5)
+        k = (op, off)
+        if norm_reg(base) == rs or want.get(k, 0) <= have.get(k, 0):
+            continue
+        if any(norm_reg(base) in defs_uses(ins[x][1].split("#", 1)[0].strip())[0]
+               for x in range(q + 1, p)):
+            continue
+        new = "%s%s\t%s,%d(%s)" % (m.group(1), op, m.group(2), off, base)
+        lines[li] = new
+        have[k] = have.get(k, 0) + 1
+        changed = True
+        # the reload issues where the target has it: above a directly preceding
+        # load (same straight line) when the target shows the pair in that order
+        pi, pl = ins[p - 1] if p else (None, "")
+        mp = _LOAD_S.match(pl)
+        if (mp and pi not in nr and not any(_s_is_label(x) for x in lines[pi + 1:li])
+                and rd not in defs_uses(pl.split("#", 1)[0].strip())[0]
+                and rd != norm_reg(mp.group(5))
+                and norm_reg(mp.group(3)) != norm_reg(base)):
+            k2 = (mp.group(2), int(mp.group(4)))
+            if any(a == k and b == k2 for a, b in zip(tk, tk[1:])):
+                lines[pi], lines[li] = new, pl
+    return "\n".join(lines) if changed else stext
+
+
 def zero_remat_pass(stext, tgt):
     want = sum(1 for _w, dis in tgt if _ZERO_TGT.match(dis.strip()))
     have = sum(1 for l in stext.split("\n")
@@ -2984,6 +3084,61 @@ def save_slot_pass(stext, tgt):
     return "\n".join(lines)
 
 
+# --------------------------------------------------------------------------
+# label_nop. aspsx_label_nops spells a load-delay nop right after a load that a
+# label separates from its consumer (`lw; nop; L: use`). Usually retail has it
+# there, but some retail branches land ON that nop (`lw; L: nop; use`), one
+# word earlier. Target-guided: list the target's load/nop sites next to a
+# branch-target label (label before or after the nop) and our `load; nop; L:`
+# sites in order; when the counts agree, move each label the target has
+# before its nop. Count-preserving: only which word a branch lands on changes,
+# and the nop is a no-op on every path.
+# --------------------------------------------------------------------------
+def label_nop_pass(stext, tgt):
+    m = re.search(r"^\s*\.ent\s+(\w+)", stext, re.M)
+    fa = re.search(r"_([0-9A-Fa-f]{8})$", m.group(1)) if m else None
+    if not fa or not tgt:
+        return stext
+    base = int(fa.group(1), 16)
+    targets = set()
+    for _w, d in tgt:
+        mt = re.search(r"\.L([0-9A-Fa-f]{8})\s*$", d)
+        if mt:
+            targets.add((int(mt.group(1), 16) - base) // 4)
+    flags = []
+    for i in range(1, len(tgt) - 1):
+        if is_nop(tgt[i][1]) and _is_load(tgt[i - 1][1]) and (i in targets or i + 1 in targets):
+            flags.append(i in targets)
+    if not any(flags):
+        return stext
+    lines = stext.split("\n")
+    ins = [(i, l) for i, l in enumerate(lines) if _s_is_insn(l)]
+    nr = _noreorder_lines(lines)
+    sites = []
+    for k in range(len(ins) - 1):
+        li, ll = ins[k]
+        ni, nl = ins[k + 1]
+        if li in nr or ni in nr or not _is_load(ll.split("#", 1)[0].strip()):
+            continue
+        if not _tf_is_nop(nl.split("#", 1)[0].strip()):
+            continue
+        nxt = ins[k + 2][0] if k + 2 < len(ins) else len(lines)
+        labs = [y for y in range(ni + 1, nxt) if re.match(r"\s*\$L\w*:", lines[y])
+                and _branch_target_label(lines, ins, lines[y])]
+        if labs:
+            sites.append((ni, labs))
+    if len(sites) != len(flags):
+        return stext
+    for (ni, labs), before in sorted(zip(sites, flags), key=lambda x: -x[0][0]):
+        if not before:
+            continue
+        moved = [lines[y] for y in labs]
+        for y in reversed(labs):
+            del lines[y]
+        lines[ni:ni] = moved
+    return "\n".join(lines)
+
+
 PASSES = {
     # reg_realloc is applied specially (it needs sigma from words); the ordered
     # list in the manifest still names it so the recipe is explicit and auditable.
@@ -2995,10 +3150,12 @@ PASSES = {
     "operand_recolor": operand_recolor_s,
     "web_realloc": web_realloc_pass,
     "save_slot": save_slot_pass,
+    "label_nop": label_nop_pass,
     "laform": laform_fold_pass,
     "base_cse_collapse": base_cse_collapse_pass,
     "shift_const_fold": shift_const_fold_pass,
     "zero_remat": zero_remat_pass,
+    "load_remat": load_remat_pass,
     "ra_restore_sink": ra_restore_sink_pass,
     "sched_match": sched_match_pass,
     "fallthrough_fill": fallthrough_fill_pass,
@@ -3011,7 +3168,7 @@ PASSES = {
 # such pass listed in a recipe is applied ahead of reg_realloc regardless of the
 # manifest order; the rest keep their listed order after sigma.
 PRE_SIGMA_PASSES = ("un_hi_cse", "un_hi_cse_store", "exit_merge", "base_cse_collapse",
-                    "shift_const_fold", "zero_remat")
+                    "shift_const_fold", "zero_remat", "load_remat")
 
 # --------------------------------------------------------------------------
 # WORD-LEVEL passes. The original PSY-Q assembler (aspsx) scheduled branch and
@@ -4206,10 +4363,13 @@ ALT_FLAVORS = {
     "nosplit": ["-mno-split-addresses"],
     "nosplit_nodb": ["-mno-split-addresses", "-fno-delayed-branch"],
     "nodb": ["-fno-delayed-branch"],
+    "gp8": ["-G8"],
+    "gp8_nosplit": ["-G8", "-mno-split-addresses"],
 }
 META_PASSES = tuple(ALT_FLAVORS)
 # local-label prefix per alternate compile (nosplit keeps the historical "ns")
-_ALT_TAG = {"nosplit": "ns", "nosplit_nodb": "nsnd", "nodb": "nd"}
+_ALT_TAG = {"nosplit": "ns", "nosplit_nodb": "nsnd", "nodb": "nd", "gp8": "gp",
+            "gp8_nosplit": "gpns"}
 
 
 def alt_flavors(manifest):
@@ -4295,12 +4455,44 @@ def aspsx_label_nops(span):
     return "\n".join(out)
 
 
+def _gp_small(alt_text):
+    """Symbols a -G compile declared small (`.extern SYM, N`, `.comm`/`.lcomm`
+    within the threshold): cc1 leaves their accesses as macros and the
+    assembler makes them $gp-relative."""
+    small = set()
+    for m in re.finditer(r"(?m)^\s*\.(?:extern|comm|lcomm)\s+([A-Za-z_.][\w.$]*)\s*,\s*(\d+)",
+                         alt_text):
+        if 0 < int(m.group(2)) <= 8:
+            small.add(m.group(1))
+    return small
+
+
+def gp_rel_macros(span, small):
+    """Spell a -G compile's small-data macros the way the assembler emits them:
+    `op $r,S[+k]` -> `op $r,%gp_rel(S[+k])($gp)`, `la $r,S[+k]` ->
+    `addiu $r,$gp,%gp_rel(S[+k])` (one word each)."""
+    if not small:
+        return span
+    out = []
+    for l in span.split("\n"):
+        b = l.split("#", 1)[0].strip()
+        m = re.fullmatch(r"(la|lw|lh|lhu|lb|lbu|sw|sh|sb)\s+(\$\w+)\s*,\s*"
+                         r"([A-Za-z_.][\w.$]*)((?:\+\d+)?)", b)
+        if m and m.group(3) in small:
+            op, r, sym = m.group(1), m.group(2), m.group(3) + m.group(4)
+            l = _src_indent(l) + ("addiu\t%s,$gp,%%gp_rel(%s)" % (r, sym) if op == "la"
+                                  else "%s\t%s,%%gp_rel(%s)($gp)" % (op, r, sym))
+        out.append(l)
+    return "\n".join(out)
+
+
 def splice_alt_spans(text, alt_text, names, tag="ns"):
     """Replace each function span in `names` with the same function's span from
     `alt_text`. Returns (new_text, [spliced names]). `tag` keeps the renamed local
     labels unique per alternate compile: the LM line-marker counters of two flavor
     compiles overlap, so two flavors must not share a prefix."""
     alt = {n: alt_text[s:e] for n, s, e in split_spans(alt_text)}
+    small = _gp_small(alt_text)
     done = []
     for name, start, end in sorted(split_spans(text), key=lambda x: -x[1]):
         if name not in names:
@@ -4314,7 +4506,7 @@ def splice_alt_spans(text, alt_text, names, tag="ns"):
                                    "the two compiles" % (name, lc))
         span = re.sub(r"\$L(?!C)(\w+)", r"$L%s_\1" % tag, span)
         span = re.sub(r"(?<![\w$.])LM(\d+)\b", r"LM%s\1" % tag, span)
-        span = aspsx_label_nops(expand_sym_macros(span))
+        span = aspsx_label_nops(expand_sym_macros(gp_rel_macros(span, small)))
         text = text[:start] + span + text[end:]
         done.append(name)
     return text, done
