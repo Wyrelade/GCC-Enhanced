@@ -2373,6 +2373,41 @@ def load_remat_pass(stext, tgt):
     return "\n".join(lines) if changed else stext
 
 
+
+# --------------------------------------------------------------------------
+# nodiv: some retail units were assembled without the divide-by-zero / overflow
+# traps (`div $0,$a,$b; mflo $d`, no `bnez; break`), while maspsx --expand-div
+# adds them to every 3-operand `div/divu/rem/remu $d,$a,$b` macro. Spell such a
+# macro as the bare hardware divide plus its mflo/mfhi, which maspsx leaves
+# alone. Only fires when the target has no `break` at all. Count-changing.
+# --------------------------------------------------------------------------
+_DIV3_S = re.compile(r"^(\s*)(div|divu|rem|remu)\s+(\$\w+)\s*,\s*(\$\w+)\s*,\s*(\$\w+)\s*(#.*)?$")
+
+
+def nodiv_pass(stext, tgt):
+    if any(re.match(r"break\b", d.strip()) for _w, d in tgt):
+        return stext
+    lines = stext.split("\n")
+    out, changed = [], False
+    for k, l in enumerate(lines):
+        m = _DIV3_S.match(l) if _s_is_insn(l) else None
+        if not m or norm_reg(m.group(3)) == "zero":
+            out.append(l)
+            continue
+        op = "divu" if m.group(2).endswith("u") else "div"
+        mv = "mfhi" if m.group(2).startswith("rem") else "mflo"
+        out.append("%s%s\t$0,%s,%s" % (m.group(1), op, m.group(4), m.group(5)))
+        out.append("%s%s\t%s" % (m.group(1), mv, m.group(3)))
+        # aspsx treats the move like a load: a reader right behind it waits
+        nxt = next((x for x in lines[k + 1:] if _s_is_insn(x) or (
+            _s_is_label(x) and not x.strip().startswith("LM"))), "")
+        if (_s_is_insn(nxt) and not re.match(r"\s*\.set", nxt)
+                and norm_reg(m.group(3)) in defs_uses(nxt.split("#", 1)[0].strip())[1]):
+            out.append("%snop" % m.group(1))
+        changed = True
+    return "\n".join(out) if changed else stext
+
+
 def zero_remat_pass(stext, tgt):
     want = sum(1 for _w, dis in tgt if _ZERO_TGT.match(dis.strip()))
     have = sum(1 for l in stext.split("\n")
@@ -3168,6 +3203,7 @@ PASSES = {
     "shift_const_fold": shift_const_fold_pass,
     "zero_remat": zero_remat_pass,
     "load_remat": load_remat_pass,
+    "nodiv": nodiv_pass,
     "ra_restore_sink": ra_restore_sink_pass,
     "sched_match": sched_match_pass,
     "fallthrough_fill": fallthrough_fill_pass,
@@ -3180,7 +3216,7 @@ PASSES = {
 # such pass listed in a recipe is applied ahead of reg_realloc regardless of the
 # manifest order; the rest keep their listed order after sigma.
 PRE_SIGMA_PASSES = ("un_hi_cse", "un_hi_cse_store", "exit_merge", "base_cse_collapse",
-                    "shift_const_fold", "zero_remat", "load_remat")
+                    "shift_const_fold", "zero_remat", "load_remat", "nodiv")
 
 # --------------------------------------------------------------------------
 # WORD-LEVEL passes. The original PSY-Q assembler (aspsx) scheduled branch and
