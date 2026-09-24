@@ -4506,11 +4506,13 @@ ALT_FLAVORS = {
     "nodb": ["-fno-delayed-branch"],
     "gp8": ["-G8"],
     "gp8_nosplit": ["-G8", "-mno-split-addresses"],
+    "gp8_nosplit_noskip": ["-G8", "-mno-split-addresses", "-fno-cse-skip-blocks"],
 }
 META_PASSES = tuple(ALT_FLAVORS)
 # local-label prefix per alternate compile (nosplit keeps the historical "ns")
 _ALT_TAG = {"nosplit": "ns", "nosplit_nodb": "nsnd", "nodb": "nd", "gp8": "gp",
-            "gp8_nosplit": "gpns"}
+            "gp8_nosplit": "gpns",
+            "gp8_nosplit_noskip": "gpnk"}
 
 
 def alt_flavors(manifest):
