@@ -1056,11 +1056,13 @@ def _sm_indep(a, b, stable=frozenset()):
     return True
 
 
-def _sm_units(lines, ins):
+def _sm_units(lines, ins, la_tmp=None):
     """Straight-line blocks of movable units. A unit is one insn line, or an
     explicitly expanded symbolic access `.set noat; lui $1,%hi(S); op ..%lo(S)($1);
     .set at` (keyed and dependency-checked by its %lo insn). Returns
-    [[(first_line, last_line, key_body), ...], ...]."""
+    [[(first_line, last_line, key_body), ...], ...]. With a `la_tmp` dict, a
+    split address `lui $t,%hi(S); addiu $d,$t,%lo(S)` is one unit keyed
+    `la $d,S` and la_tmp[(first, last)] = $t (the caller must prove $t private)."""
     blocks, cur, noreo, prev_br = [], [], False, False
     ins_at = {i for i, _l in ins}
 
@@ -1116,6 +1118,15 @@ def _sm_units(lines, ins):
                             idx = ma.group(3)
                             j = j2
                             b2 = lines[j].split("#", 1)[0].strip()
+                    m3 = re.match(r"addiu\s+(\$\w+)\s*,\s*(\$\w+)\s*,\s*%lo\(([^)]+)\)$", b2)
+                    if (la_tmp is not None and m3 and idx is None
+                            and m3.group(2) == mh.group(1) and m3.group(3) == mh.group(2)
+                            and m3.group(1) != mh.group(1)):
+                        cur.append((i, j, "la\t%s,%s" % (m3.group(1), m3.group(3))))
+                        la_tmp[(i, j)] = mh.group(1)
+                        prev_br = False
+                        i = j + 1
+                        continue
                     m2 = re.match(r"(\w+)\s+(\$\w+)\s*,\s*%lo\(([^)]+)\)\((\$\w+)\)$", b2)
                     if (m2 and m2.group(3) == mh.group(2) and m2.group(4) == mh.group(1)
                             and m2.group(2) == mh.group(1)
@@ -1153,6 +1164,23 @@ def _sm_dep_body(body):
     return "%s\t%s,%s" % m.groups() if m else body
 
 
+def _sm_dead_after(lines, last, reg):
+    """`reg` is written before it is read on the straight line after line
+    `last` (labels are passed through; a transfer or the end gives up)."""
+    for j in range(last + 1, len(lines)):
+        l = lines[j]
+        if not _s_is_insn(l):
+            continue
+        if _src_is_branch(l) or _src_is_ret(l) or re.match(r"\s*jalr?\b", l):
+            return False
+        d, u = defs_uses(_sm_dep_body(l.split("#", 1)[0].strip()))
+        if reg in u:
+            return False
+        if reg in d:
+            return True
+    return False
+
+
 def sched_match_pass(stext, tgt):
     tkeys = [_sm_key(d.strip(), True) for _w, d in tgt]
     lines = stext.split("\n")
@@ -1162,10 +1190,29 @@ def sched_match_pass(stext, tgt):
     # a unit with no target match (e.g. `la $r,S+4` that splat names by the
     # address it resolves to) is a barrier: reorder the matched runs around it
     runs = []
-    for blk0 in _sm_units(lines, ins):
+    la_tmp = {}
+    blocks = _sm_units(lines, ins, la_tmp)
+    for blk0 in blocks:
+        # a split-address temp is private when only its own `la` units touch it
+        # in the block and it is written before read after the block: then the
+        # units depend on each other only through their destinations
+        tmps = {la_tmp[(u[0], u[1])] for u in blk0 if (u[0], u[1]) in la_tmp}
+        bad = set()
+        for t in tmps:
+            rt = norm_reg(t)
+            for u in blk0:
+                if la_tmp.get((u[0], u[1])) == t:
+                    continue
+                du = defs_uses(_sm_dep_body(u[2]))
+                if rt in du[0] or rt in du[1]:
+                    bad.add(t)
+            if t not in bad and not _sm_dead_after(lines, blk0[-1][1], rt):
+                bad.add(t)
         cur = []
         for u in blk0:
             k = _sm_srckey(u[2])
+            if la_tmp.get((u[0], u[1])) in bad:
+                k = None                    # not private: a barrier
             t = next((q for q, tk in enumerate(tkeys)
                       if k is not None and tk == k and q not in used), None)
             if t is None:
@@ -2031,7 +2078,8 @@ def const_remat_s(stext, want):
         if not src or src == _src_reg("$0"):
             continue
         k = _const_reaching(lines, ins, p, src)
-        if k is None or budget.get(k, 0) <= 0 or not -0x8000 <= k < 0x8000:
+        if k is None or budget.get(k, 0) <= 0 or not (-0x8000 <= k < 0x8000
+                                                     or (k & 0xFFFF) == 0):
             continue
         lines[li] = "%sli\t%s,%d" % (m.group(1), m.group(2), k)
         budget[k] -= 1
@@ -2050,7 +2098,13 @@ def zero_remat_pass(stext, tgt):
         if m:
             k = int(m.group(1), 0)
             wk[k] = wk.get(k, 0) + 1
+        mu = re.match(r"lui\s+\S+\s*,\s*(.+)$", dis.strip())
+        if mu and "%hi" not in mu.group(1) and _sm_int(mu.group(1)) is not None:
+            k = (_sm_int(mu.group(1)) & 0xFFFF) << 16    # a 1-word li of K<<16
+            k = k - (1 << 32) if k & 0x80000000 else k
+            wk[k] = wk.get(k, 0) + 1
     return const_remat_s(stext, wk)
+
 
 # --------------------------------------------------------------------------
 # exit-merge: cc1 emits each return as its own `j $31` (with the return value in
@@ -2418,7 +2472,11 @@ def _wr_nodes(lines):
             node(slot, u, d)
         last = len(nodes) - 1
         if mn in ("jal", "jalr"):
-            node(None, [(r, None) for r in ("a0", "a1", "a2", "a3")],
+            # a direct call reads only the argument registers its callee's
+            # retail asm reads (unknown callee: all four)
+            mc = re.match(r"\s*jal\s+([A-Za-z_]\w*)\s*$", lines[i].split("#", 1)[0])
+            node(None, [(r, None) for r in ("a0", "a1", "a2", "a3")
+                        if not mc or _callee_reads(mc.group(1), r)],
                  [(r, None) for r in _CALL_CLOBBER if r not in ("hi", "lo")])
         elif mn in ("j", "jr") and regs:
             node(None, [(r, None) for r in _WR_RET], [], fall=False)
@@ -2525,9 +2583,35 @@ def _wr_webs(nodes):
     return occ, pinned, reg_of, LO, def_w
 
 
+def _wr_rename(lines, nodes, occ, mapping):
+    """Rewrite every explicit occurrence of each web in `mapping` to its new
+    register (simultaneously)."""
+    edits = {}
+    for (n, rr, pos, kd), w in occ.items():
+        if w in mapping and pos is not None:
+            edits.setdefault(nodes[n]["line"], {})[pos] = "$%d" % ABI2NUM[mapping[w]]
+    for li, poss in edits.items():
+        ind, mn, ops, com, rp = _wr_parse(lines[li])
+        ops = list(ops)
+        for pos, num in poss.items():
+            k, par_, _r = rp[pos]
+            if par_:
+                ops[k] = re.sub(r"\(\$\w+\)$", "(%s)" % num, ops[k])
+            else:
+                ops[k] = num
+        body = lines[li].split("#", 1)[0].strip().split(None, 1)[0]
+        lines[li] = "%s%s\t%s%s" % (ind, body, ",".join(ops),
+                                    ("\t#" + com) if com else "")
+
+
 def web_realloc_pass(stext, tgt):
     lines = stext.split("\n")
-    tk = [(mn, regs) for mn, regs, _ in (insn_parts(d) for _, d in tgt) if mn != "nop"]
+    tk = []
+    for _, d in tgt:
+        mn, regs, _sk = insn_parts(d)
+        if mn != "nop":
+            sy = _SYM_RE.findall(d)
+            tk.append((mn + ("|" + sy[0] if sy else ""), regs))
     for _ in range(12):
         nodes, ok = _wr_nodes(lines)
         if not ok:
@@ -2540,8 +2624,9 @@ def web_realloc_pass(stext, tgt):
             ind, mn, ops, com, rp = _wr_parse(lines[nd["line"]])
             if mn == "nop" or not mn:
                 continue
+            sy = _SYM_RE.findall(lines[nd["line"]].split("#", 1)[0])
             for cm, cr in _wr_canon(mn, ops, rp):
-                ours.append((n, cr, cm))
+                ours.append((n, cr, cm + ("|" + sy[0] if sy and cm != "?" else "")))
         sm = difflib.SequenceMatcher(None, [o[2] for o in ours], [t[0] for t in tk],
                                      autojunk=False)
         want = {}
@@ -2558,6 +2643,23 @@ def web_realloc_pass(stext, tgt):
                         w = occ.get((n, r, pos, kd))
                         if w is not None:
                             want.setdefault(w, set()).add(t)
+        # all wanted webs at once first (resolves swaps and cycles), then one
+        # at a time
+        cand = {}
+        for w, ts in want.items():
+            if w in pinned or len(ts) != 1:
+                continue
+            t = next(iter(ts))
+            if t != reg_of[w] and t not in _WR_FIXED and reg_of[w] not in _WR_FIXED:
+                cand[w] = t
+        if len(cand) > 1:
+            fin = dict(reg_of)
+            fin.update(cand)
+            clash = any(fin[x] == fin[y] for n in range(len(nodes))
+                        for x in def_w[n] for y in LO[n] if x != y)
+            if not clash:
+                _wr_rename(lines, nodes, occ, cand)
+                continue
         done = False
         for w, ts in sorted(want.items()):
             if w in pinned or len(ts) != 1:
@@ -2577,27 +2679,68 @@ def web_realloc_pass(stext, tgt):
                     break
             if bad:
                 continue
-            num = "$%d" % ABI2NUM[t]
-            edits = {}
-            for (n, rr, pos, kd), ww in occ.items():
-                if ww == w and pos is not None:
-                    edits.setdefault(nodes[n]["line"], set()).add(pos)
-            for li, poss in edits.items():
-                ind, mn, ops, com, rp = _wr_parse(lines[li])
-                ops = list(ops)
-                for pos in poss:
-                    k, par_, _r = rp[pos]
-                    if par_:
-                        ops[k] = re.sub(r"\(\$\w+\)$", "(%s)" % num, ops[k])
-                    else:
-                        ops[k] = num
-                body = lines[li].split("#", 1)[0].strip().split(None, 1)[0]
-                lines[li] = "%s%s\t%s%s" % (ind, body, ",".join(ops),
-                                            ("\t#" + com) if com else "")
+            _wr_rename(lines, nodes, occ, {w: t})
             done = True
             break
         if not done:
             break
+    return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------
+# save_slot. After reg_realloc renames callee-saved registers, each one still
+# lives in the stack slot its OLD number was given (cc1 lays the save area out by
+# register number), so `sw $s1,0x14($sp)` can come out as `sw $s1,0x20($sp)`
+# while every other insn matches. Re-lay the save area to the target's
+# register -> slot map: target-guided (same saved set, same slot set), and sound
+# only when those slots are touched by nothing but the saves and restores of
+# their own register (checked over the whole function).
+# --------------------------------------------------------------------------
+_SS_RE = re.compile(r"^(\s*)(sw|lw)(\s+)(\$\w+)(\s*,\s*)(-?(?:0x[0-9a-fA-F]+|\d+))\((\$\w+)\)(.*)$")
+
+
+def _ss_map(pairs):
+    """{reg: offset} of callee-saved `sw reg,off($sp)` in (mnem, reg, off) list."""
+    m = {}
+    for mn, r, off in pairs:
+        if mn == "sw" and r in _CALLEE_RS and r not in m:
+            m[r] = off
+    return m
+
+
+def save_slot_pass(stext, tgt):
+    tp = []
+    for _w, d in tgt:
+        mn, regs, skel = insn_parts(d)
+        if mn == "sw" and len(regs) == 2 and regs[1] == "sp":
+            off = _sm_int(skel[1].replace("(#)", ""))
+            if off is not None:
+                tp.append(("sw", regs[0], off))
+    tmap = _ss_map(tp)
+    lines = stext.split("\n")
+    acc = []                                   # (line, mnem, reg, off)
+    for i, l in enumerate(lines):
+        m = _SS_RE.match(l.split("#", 1)[0])
+        if m and norm_reg(m.group(7)) == "sp":
+            acc.append((i, m.group(2), norm_reg(m.group(4)), int(m.group(6), 0)))
+        elif _s_is_insn(l) and re.search(r"\(\$(?:sp|29)\)", l):
+            mo = _mem_operand(l.split("#", 1)[0].strip())
+            if mo and mo[0] == "sp":
+                acc.append((i, "other", None, mo[1]))
+    omap = _ss_map([(mn, r, off) for _i, mn, r, off in acc])
+    if not omap or set(omap) != set(tmap) or omap == tmap \
+            or sorted(omap.values()) != sorted(tmap.values()):
+        return stext
+    slot_reg = {off: r for r, off in omap.items()}
+    for _i, mn, r, off in acc:
+        if off in slot_reg and (mn == "other" or r != slot_reg[off]):
+            return stext                       # slot used for something else
+    for i, mn, r, off in acc:
+        if off in slot_reg:
+            m = _SS_RE.match(lines[i].split("#", 1)[0])
+            lines[i] = "%s%s%s%s%s%d(%s)%s" % (m.group(1), m.group(2), m.group(3),
+                                               m.group(4), m.group(5), tmap[r],
+                                               m.group(7), m.group(8))
     return "\n".join(lines)
 
 
@@ -2611,6 +2754,7 @@ PASSES = {
     "commutative_swap": commutative_swap_s,
     "operand_recolor": operand_recolor_s,
     "web_realloc": web_realloc_pass,
+    "save_slot": save_slot_pass,
     "laform": laform_fold_pass,
     "base_cse_collapse": base_cse_collapse_pass,
     "shift_const_fold": shift_const_fold_pass,
