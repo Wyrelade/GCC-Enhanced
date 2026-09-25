@@ -1508,7 +1508,22 @@ def _ff_dead_on(lines, ins, label, reg, seen=None, callee_args=True):
             # a call kills every caller-saved register that is not an argument;
             # its delay slot (noreorder) and a jalr target register still read
             if reg not in _CALL_CLOBBER:
-                return False
+                # callee-saved (s0-s7, fp): the callee preserves it and does not
+                # read the caller's value, so keep scanning after the call
+                if not re.match(r"s[0-7]$|fp$|s8$", reg or ""):
+                    return False
+                if body.split(None, 1)[0].lower() == "jalr" and reg in defs_uses(body)[1]:
+                    return False
+                if i in nr and k + 1 < len(rest):
+                    sd, su = defs_uses(rest[k + 1][1].split("#", 1)[0].strip())
+                    if reg in su:
+                        return False
+                    if reg in sd:
+                        return True
+                    k += 2
+                else:
+                    k += 1
+                continue
             if reg in ("a0", "a1", "a2", "a3") and callee_args:
                 mc = re.match(r"\s*jal\s+(\w+)\s*$", body)
                 if not mc or _callee_reads(mc.group(1), reg):
@@ -4387,6 +4402,107 @@ def redundant_skip_pass(stext, tgt):
     return "\n".join(lines) if changed else stext
 
 
+# --------------------------------------------------------------------------
+# param_copy: retail copies an incoming argument into another argument
+# register at entry (`addiu sp,-40; move a1,a0; ...`, then uses a1 as the
+# parameter) where our cc1 keeps using a0. When the target prologue (first 8
+# insns) has `move Rn,Ak` (Rn a caller-saved/arg reg, not an s-reg) and ours has
+# none, rename our entry web of Ak (every explicit read reached only by the
+# incoming value; no implicit read such as a call argument or return) to Rn and
+# insert `move Rn,Ak` after the stack adjust. Rn must not be live or defined
+# anywhere that web is live, and Rn's own incoming value must be unused.
+# Count-changing: runs before sigma.
+# --------------------------------------------------------------------------
+_PC_ARGS = ("a0", "a1", "a2", "a3")
+
+
+def _pc_target(tgt):
+    for _w, d in tgt[:8]:
+        p = d.strip().split(None, 1)
+        if len(p) < 2:
+            continue
+        mn = p[0].lower()
+        ops = [norm_reg(x) for x in split_ops(p[1])]
+        if mn == "move" and len(ops) == 2:
+            ops = ops + ["zero"]
+        if mn in ("addu", "or", "move") and len(ops) == 3 and ops[2] == "zero" and \
+                ops[1] in _PC_ARGS and ops[0] and ops[0] != ops[1] and \
+                ops[0] in ("v0", "v1", "a0", "a1", "a2", "a3", "t0", "t1", "t2", "t3",
+                           "t4", "t5", "t6", "t7", "t8", "t9"):
+            return ops[0], ops[1]
+    return None
+
+
+def param_copy_pass(stext, tgt):
+    tp = _pc_target(tgt)
+    if not tp:
+        return stext
+    rn, ak = tp
+    lines = stext.split("\n")
+    ins = [i for i, l in enumerate(lines) if _s_is_insn(l) and not l.strip().startswith(".")]
+    for i in ins[:8]:
+        b = lines[i].split("#", 1)[0].strip()
+        m = re.match(r"move\s+(\$\w+)\s*,\s*(\$\w+)$", b)
+        if m and norm_reg(m.group(1)) == rn and norm_reg(m.group(2)) == ak:
+            return stext
+    nodes, ok = _wr_nodes(lines)
+    if not ok:
+        return stext
+    occ, pinned, reg_of, LO, def_w = _wr_webs(nodes)
+    ent = {}
+    for (n, r, pos, kd), w in occ.items():
+        if n == 0 and kd == "d":
+            ent[r] = w
+    aw, rw = ent.get(ak), ent.get(rn)
+    if aw is None:
+        return stext
+    uses = [(n, pos) for (n, r, pos, kd), w in occ.items() if w == aw and kd == "u"]
+    if not uses or any(pos is None for _n, pos in uses):
+        return stext
+    # Rn's incoming value must be unused (implicit reads by calls are the
+    # callee-asm arity over-approximation, not real uses)
+    if rw is not None and any(w == rw and kd == "u" and pos is not None
+                              for (n, r, pos, kd), w in occ.items()):
+        return stext
+    rwebs = set(w for (n, r, pos, kd), w in occ.items() if r == rn and w != rw)
+    for n in range(len(nodes)):
+        if aw in LO[n] or any(nn == n for nn, _p in uses):
+            if rwebs & LO[n] and aw in LO[n]:
+                return stext
+            if rwebs & def_w[n] and aw in LO[n]:
+                return stext
+    # other defs merged into the web (the parameter variable reassigned, e.g.
+    # in a loop) move with it; an implicit one cannot be renamed
+    odefs = [(n, pos) for (n, r, pos, kd), w in occ.items() if w == aw and kd == "d" and n != 0]
+    if any(pos is None for _n, pos in odefs):
+        return stext
+    edits = {}
+    for n, pos in uses + odefs:
+        edits.setdefault(nodes[n]["line"], set()).add(pos)
+    for li, poss in edits.items():
+        ind, mn, ops, com, rp = _wr_parse(lines[li])
+        ops = list(ops)
+        for pos in poss:
+            k, par_, _r = rp[pos]
+            num = "$%d" % ABI2NUM[rn]
+            if par_:
+                ops[k] = re.sub(r"\(\$\w+\)$", "(%s)" % num, ops[k])
+            else:
+                ops[k] = num
+        body = lines[li].split("#", 1)[0].strip().split(None, 1)[0]
+        lines[li] = "%s%s\t%s%s" % (ind, body, ",".join(ops), ("\t#" + com) if com else "")
+    at = None
+    for i in ins[:3]:
+        if re.match(r"\s*(subu|addu|addiu)\s+\$(sp|29)\s*,\s*\$(sp|29)\s*,", lines[i]):
+            at = i + 1
+            break
+    if at is None:
+        return stext
+    ind = lines[at - 1][:len(lines[at - 1]) - len(lines[at - 1].lstrip())]
+    lines.insert(at, "%smove\t$%d,$%d" % (ind, ABI2NUM[rn], ABI2NUM[ak]))
+    return "\n".join(lines)
+
+
 PASSES = {
     # reg_realloc is applied specially (it needs sigma from words); the ordered
     # list in the manifest still names it so the recipe is explicit and auditable.
@@ -4419,6 +4535,7 @@ PASSES = {
     "mask_reuse": mask_reuse_pass,
     "zero_cmp": zero_cmp_pass,
     "redundant_skip": redundant_skip_pass,
+    "param_copy": param_copy_pass,
 }
 
 # Passes that CHANGE the instruction count and so must run BEFORE sigma is derived
@@ -4427,7 +4544,7 @@ PASSES = {
 # manifest order; the rest keep their listed order after sigma.
 PRE_SIGMA_PASSES = ("un_hi_cse", "un_hi_cse_store", "exit_merge", "base_cse_collapse",
                     "shift_const_fold", "zero_remat", "load_remat", "nodiv",
-                    "offset_unfold", "zext_keep", "zero_cmp")
+                    "offset_unfold", "zext_keep", "zero_cmp", "param_copy")
 
 # --------------------------------------------------------------------------
 # WORD-LEVEL passes. The original PSY-Q assembler (aspsx) scheduled branch and
