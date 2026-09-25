@@ -1838,7 +1838,49 @@ def _tf_sole_entrant(lines, label):
     return bool(re.match(r"\s*(j|b|jr)\s", lines[p]))
 
 
+def _jnext_drop(stext):
+    """Drop a noreorder `j L` whose target label L comes right after its delay
+    slot (only labels, directives and blank lines between). The slot insn runs
+    on the fall-through either way, so it stays in place. cc1's reorg never
+    leaves such a jump; our text passes can, when they empty the block between
+    (a return block stolen into a branch slot)."""
+    lines = stext.split("\n")
+    nr = _noreorder_lines(lines)
+    changed = False
+    i = 0
+    while i < len(lines):
+        m = re.match(r"\s*j\s+(\$L\w+)\s*$", lines[i].split("#", 1)[0])
+        if not m or i not in nr:
+            i += 1
+            continue
+        slot = _tf_next_insn(lines, i)
+        if slot is None or slot not in nr or _src_is_branch(lines[slot]) \
+                or _src_is_ret(lines[slot]) or any(
+                    _s_is_label(lines[y]) for y in range(i + 1, slot)):
+            i += 1
+            continue
+        hit = False
+        for y in range(slot + 1, len(lines)):
+            st = lines[y].strip()
+            if st == m.group(1) + ":":
+                hit = True
+                break
+            if _s_is_insn(lines[y]) and not st.startswith("."):
+                break
+        if hit:
+            del lines[i]
+            changed = True
+            continue
+        i += 1
+    return "\n".join(lines) if changed else stext
+
+
 def taken_fill_pass(stext, tgt):
+    out = _taken_fill_core(stext, tgt)
+    return _jnext_drop(out) if out != stext else out
+
+
+def _taken_fill_core(stext, tgt):
     if not tgt:
         return stext
     tb = [k for k, (_w, d) in enumerate(tgt) if d.split(None, 1)[0].lower() in _COND_BR_MN]
