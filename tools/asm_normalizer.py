@@ -3975,9 +3975,9 @@ def _zx_target(tgt):
             q = d2.strip().split(None, 1)
             if q and q[0].lower() == "andi":
                 ops = split_ops(q[1])
-                if (len(ops) == 3 and norm_reg(ops[0]) == r and norm_reg(ops[1]) == r
-                        and _sm_int(ops[2]) == mask):
-                    hit = True
+                if (len(ops) == 3 and norm_reg(ops[1]) == r and _sm_int(ops[2]) == mask):
+                    # "other": the zero-extend lands in another register
+                    hit = True if norm_reg(ops[0]) == r else "other"
                     break
             if r in uu or r in dd or is_branch(d2.strip()):
                 break
@@ -4020,10 +4020,21 @@ def zext_keep_pass(stext, tgt):
         if mm and norm_reg(mm.group(1)) == r and norm_reg(mm.group(2)) == r and \
                 _sm_int(mm.group(3)) == int(mask, 16):
             continue
+        dst = m.group(2)
+        if want[n] == "other":
+            # into the reader's destination: the reader must read only R
+            rd, ru = defs_uses(lines[at].split("#", 1)[0].strip())
+            if len(rd) != 1 or set(ru) != {r} or next(iter(rd)) == r:
+                continue
+            mr = re.match(r"^(\s*\w+\s+)(\$\w+)(\s*,\s*)(\$\w+)(.*)$", lines[at])
+            if not mr or norm_reg(mr.group(4)) != r:
+                continue
+            dst = mr.group(2)
+            lines[at] = mr.group(1) + mr.group(2) + mr.group(3) + dst + mr.group(5)
         while at > j + 1 and lines[at - 1].strip() in ("#nop", ""):
             at -= 1
         ind = lines[j][:len(lines[j]) - len(lines[j].lstrip())]
-        lines.insert(at, "%sandi\t%s,%s,%s" % (ind, m.group(2), m.group(2), mask))
+        lines.insert(at, "%sandi\t%s,%s,%s" % (ind, dst, m.group(2), mask))
         changed = True
     return "\n".join(lines) if changed else stext
 
