@@ -1476,11 +1476,12 @@ def _callee_reads(fn, reg, depth=0):
     return res
 
 
-def _ff_dead_on(lines, ins, label, reg, seen=None):
+def _ff_dead_on(lines, ins, label, reg, seen=None, callee_args=True):
     """`reg` is dead at `label`: on every path from it (both sides of conditional
     branches, `j` followed, delay slots included) it is written before it is read.
     A return reads $v0 and the callee-saved registers; calls and indirect
-    jumps give up (conservative)."""
+    jumps give up (conservative). callee_args=False trusts the C call arity
+    (a call reads only the arguments cc1 set up) instead of the callee asm."""
     seen = set() if seen is None else seen
     if label in seen:
         return True
@@ -1508,7 +1509,7 @@ def _ff_dead_on(lines, ins, label, reg, seen=None):
             # its delay slot (noreorder) and a jalr target register still read
             if reg not in _CALL_CLOBBER:
                 return False
-            if reg in ("a0", "a1", "a2", "a3"):
+            if reg in ("a0", "a1", "a2", "a3") and callee_args:
                 mc = re.match(r"\s*jal\s+(\w+)\s*$", body)
                 if not mc or _callee_reads(mc.group(1), reg):
                     return False
@@ -1537,7 +1538,7 @@ def _ff_dead_on(lines, ins, label, reg, seen=None):
             lab = re.search(r"(\$L\w+)\s*$", body)
             if not lab:
                 return False
-            if not _ff_dead_on(lines, ins, lab.group(1), reg, seen):
+            if not _ff_dead_on(lines, ins, lab.group(1), reg, seen, callee_args):
                 return False
             if body.split(None, 1)[0].lower() in ("j", "b"):
                 return True
@@ -3748,6 +3749,152 @@ def zext_keep_pass(stext, tgt):
     return "\n".join(lines) if changed else stext
 
 
+
+# --------------------------------------------------------------------------
+# self_move: cc1 coalesced a value into the register of the giv/copy it seeds,
+# leaving a literal `move R,R` (e.g. `lw $6,0($4); sh x,288($6); ... move $4,$16;
+# move $6,$6`), where retail kept the value in T and copies it (`lw $4,0($4);
+# sh x,288($4); ... move $6,$4; move $4,$16`). When the target has a `move R,T`
+# and the straight-line web of R that reaches our self-move can live in T (T not
+# read or written inside it apart from its defining insn, dead on every branch
+# leaving it, no call), rename that web to T and hoist the move above the
+# preceding insns that do not touch R or read T.
+# --------------------------------------------------------------------------
+_SMV_RE = re.compile(r"^(\s*)move\s+(\$\w+)\s*,\s*(\$\w+)\s*$")
+
+
+def _smv_target(tgt):
+    out = []
+    for _w, d in tgt:
+        p = d.strip().split(None, 1)
+        if len(p) < 2 or p[0].lower() not in ("addu", "or", "move"):
+            continue
+        ops = split_ops(p[1])
+        if p[0].lower() == "move" and len(ops) == 2:
+            ops = ops + ["$zero"]
+        if len(ops) == 3 and norm_reg(ops[2]) == "zero":
+            r, t = norm_reg(ops[0]), norm_reg(ops[1])
+            if r and t and r != t and t != "zero":
+                out.append((r, t))
+    return out
+
+
+def _smv_branch_label(lines, name):
+    for l in lines:
+        if _s_is_insn(l) and re.search(r"(?<![\w$])%s\s*$" % re.escape(name),
+                                       l.split("#", 1)[0].rstrip()):
+            return True
+    return False
+
+
+def _smv_rename(line, r, t):
+    rn, tn = _abi_to_num("$" + r), _abi_to_num("$" + t)
+    body, sep, com = line.partition("#")
+
+    def sub(m):
+        return tn if norm_reg(m.group(0)) == r else m.group(0)
+    return re.sub(r"\$\w+", sub, body) + sep + com
+
+
+def self_move_pass(stext, tgt):
+    tm = _smv_target(tgt)
+    if not tm:
+        return stext
+    lines = stext.split("\n")
+    changed = False
+    for j in range(len(lines)):
+        m = _SMV_RE.match(lines[j].split("#", 1)[0].rstrip())
+        if not m or norm_reg(m.group(2)) != norm_reg(m.group(3)):
+            continue
+        R = norm_reg(m.group(2))
+        # which target `move R,T`: the same ordinal among moves into R, else the only T
+        ours = [x for x in range(len(lines)) if (lambda mo: mo and norm_reg(mo.group(2)) == R)(
+            _SMV_RE.match(lines[x].split("#", 1)[0].rstrip()))]
+        ts = [t for r, t in tm if r == R]
+        if len(ts) == len(ours):
+            T = ts[ours.index(j)]
+        elif len(set(ts)) == 1:
+            T = ts[0]
+        else:
+            continue
+        if T == R:
+            continue
+        # hop back over plain insns (reorder mode) that neither touch R nor read T
+        p, x = j, j - 1
+        while x >= 0:
+            st = lines[x].strip()
+            if not st or st.startswith(".loc") or (st.endswith(":") and st.startswith("LM")):
+                x -= 1
+                continue
+            if not _s_is_insn(lines[x]) or _src_is_branch(lines[x]) or \
+                    re.match(r"\s*jalr?\b", lines[x]):
+                break
+            d, u = defs_uses(lines[x].split("#", 1)[0].strip())
+            if R in d or R in u or T in u:
+                break
+            p = x
+            x -= 1
+        if p == j:
+            continue
+        # web of R reaching p: straight line back to its def
+        ren, labs, dfn, x, ok = [], [], None, p - 1, True
+        while x >= 0:
+            l = lines[x]
+            st = l.strip()
+            if _s_is_label(l):
+                if not st.startswith("LM") and _smv_branch_label(lines, st[:-1]):
+                    ok = False
+                    break
+                x -= 1
+                continue
+            if not _s_is_insn(l):
+                x -= 1
+                continue
+            body = l.split("#", 1)[0].strip()
+            if re.match(r"\s*jalr?\b", l) or _src_is_ret(l):
+                ok = False
+                break
+            if _src_is_branch(l):
+                lab = re.search(r"(\$L\w+)\s*$", body)
+                if not lab or body.split(None, 1)[0].lower() in ("j", "b"):
+                    ok = False
+                    break
+                labs.append(lab.group(1))
+            d, u = defs_uses(body)
+            if R in d:
+                if R in u or T in d:
+                    ok = False
+                    break
+                dfn = x
+                break
+            if T in d or T in u:
+                ok = False
+                break
+            if R in u:
+                ren.append(x)
+            x -= 1
+        if not ok or dfn is None:
+            continue
+        ins = [(i, l) for i, l in enumerate(lines) if _s_is_insn(l)]
+        if not all(_ff_dead_on(lines, ins, lb, R, None, False) and _ff_dead_on(lines, ins, lb, T)
+                   for lb in labs):
+            continue
+        dl = lines[dfn]
+        body, sep, com = dl.partition("#")
+        mm = re.match(r"^(\s*\w+\s+)(\$\w+)(.*)$", body)
+        if not mm or norm_reg(mm.group(2)) != R:
+            continue
+        lines[dfn] = mm.group(1) + _abi_to_num("$" + T) + mm.group(3) + sep + com
+        for x in ren:
+            lines[x] = _smv_rename(lines[x], R, T)
+        ind = m.group(1)
+        mv = "%smove\t%s,%s" % (ind, m.group(2), _abi_to_num("$" + T))
+        del lines[j]
+        lines.insert(p, mv)
+        changed = True
+    return "\n".join(lines) if changed else stext
+
+
 PASSES = {
     # reg_realloc is applied specially (it needs sigma from words); the ordered
     # list in the manifest still names it so the recipe is explicit and auditable.
@@ -3776,6 +3923,7 @@ PASSES = {
     "slot_unfill": slot_unfill_pass,
     "cross_jump": cross_jump_pass,
     "zext_keep": zext_keep_pass,
+    "self_move": self_move_pass,
 }
 
 # Passes that CHANGE the instruction count and so must run BEFORE sigma is derived
