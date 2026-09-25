@@ -4860,6 +4860,68 @@ def slot_retake_pass(stext, tgt):
     return "\n".join(lines) if changed else stext
 
 
+# --------------------------------------------------------------------------
+# undo_drop: reorg fills a conditional branch slot with `addu R,R,k` taken from
+# the branch target and, when it thinks R is live on the fall-through, puts
+# `addu R,R,-k` right after the slot. Retail's reorg leaves the undo out where R
+# is dead (the count of a timeout loop, dead after the loop).
+# Drop an undo whose register is dead after it, only while our undo count
+# exceeds the target's. Count-changing, so it runs before sigma.
+# --------------------------------------------------------------------------
+_UD_ADD = re.compile(r"\s*(?:addu|addiu)\s+(\$\w+)\s*,\s*(\$\w+)\s*,\s*(-?(?:0x[0-9a-fA-F]+|\d+))\s*$")
+
+
+def _ud_undo_count(tgt):
+    n = 0
+    for _w, d in tgt:
+        m = _UD_ADD.match(d)
+        if m and norm_reg(m.group(1)) == norm_reg(m.group(2)) != "sp" and int(m.group(3), 0) < 0:
+            n += 1
+    return n
+
+
+def undo_drop_pass(stext, tgt):
+    if not tgt:
+        return stext
+    lines = stext.split("\n")
+    nr = _noreorder_lines(lines)
+    ours = []
+    for x, l in enumerate(lines):
+        m = _UD_ADD.match(l.split("#", 1)[0])
+        if not m or x in nr or norm_reg(m.group(1)) != norm_reg(m.group(2)):
+            continue
+        k = int(m.group(3), 0)
+        if k >= 0:
+            continue
+        ins = [y for y in range(x) if _s_is_insn(lines[y]) and not lines[y].strip().startswith(".")]
+        if len(ins) < 2:
+            continue
+        sl, br = ins[-1], ins[-2]
+        if sl not in nr or br not in nr or not _COND_S.match(_s_mnem(lines[br])):
+            continue
+        if any(_s_is_label(lines[y]) for y in range(sl + 1, x)):
+            continue
+        ms = _UD_ADD.match(lines[sl].split("#", 1)[0])
+        if not ms or norm_reg(ms.group(1)) != norm_reg(m.group(1)) \
+                or norm_reg(ms.group(2)) != norm_reg(m.group(1)) or int(ms.group(3), 0) != -k:
+            continue
+        ours.append(x)
+    extra = len(ours) - _ud_undo_count(tgt)
+    if extra <= 0:
+        return stext
+    drop = []
+    for x in ours:
+        reg = norm_reg(_UD_ADD.match(lines[x].split("#", 1)[0]).group(1))
+        ins = [(i, l) for i, l in enumerate(lines) if _s_is_insn(l)]
+        if _zc_dead_after(lines, ins, x, reg):
+            drop.append(x)
+    if not drop:
+        return stext
+    for x in sorted(drop[:extra], reverse=True):
+        del lines[x]
+    return "\n".join(lines)
+
+
 PASSES = {
     # reg_realloc is applied specially (it needs sigma from words); the ordered
     # list in the manifest still names it so the recipe is explicit and auditable.
@@ -4896,6 +4958,7 @@ PASSES = {
     "selfmove_nop": selfmove_nop_pass,
     "slot_swap": slot_swap_pass,
     "slot_retake": slot_retake_pass,
+    "undo_drop": undo_drop_pass,
 }
 
 # Passes that CHANGE the instruction count and so must run BEFORE sigma is derived
@@ -4904,7 +4967,8 @@ PASSES = {
 # manifest order; the rest keep their listed order after sigma.
 PRE_SIGMA_PASSES = ("un_hi_cse", "un_hi_cse_store", "exit_merge", "base_cse_collapse",
                     "shift_const_fold", "zero_remat", "load_remat", "nodiv",
-                    "offset_unfold", "zext_keep", "zero_cmp", "param_copy")
+                    "offset_unfold", "zext_keep", "zero_cmp", "param_copy",
+                    "undo_drop")
 
 # --------------------------------------------------------------------------
 # WORD-LEVEL passes. The original PSY-Q assembler (aspsx) scheduled branch and
