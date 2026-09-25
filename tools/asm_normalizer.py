@@ -4532,6 +4532,88 @@ def selfmove_nop_pass(stext, tgt):
     return "\n".join(lines) if changed else stext
 
 
+# --------------------------------------------------------------------------
+# slot_swap: our reorg filled a conditional branch slot from the fall-through
+# (`P; bc L; S` with S stolen from the fall-through) where retail put the insn
+# before the branch into the slot and left S at the fall-through head
+# (`bc L; P; S`). Target-guided per conditional branch (same count): the
+# target slot is P's word form and the insn after it is S's. P must not write
+# a register the branch reads; S's destination must be dead at L (it no longer
+# runs on the taken path). Count preserving.
+# --------------------------------------------------------------------------
+def slot_swap_pass(stext, tgt):
+    if not tgt:
+        return stext
+    tb = [k for k, (_w, d) in enumerate(tgt) if d.split(None, 1)[0].lower() in _COND_BR_MN]
+    lines = stext.split("\n")
+    if len(_tf_branches(lines)) != len(tb):
+        return stext
+    changed = False
+    for k in range(len(tb)):
+        ours = _tf_branches(lines)
+        if len(ours) != len(tb):
+            break
+        bi, nr = ours[k]
+        tk = tb[k]
+        if not nr or tk + 2 >= len(tgt):
+            continue
+        si = _tf_next_insn(lines, bi)
+        if si is None:
+            continue
+        # P: the insn right before the branch, same block (no label between)
+        pi = None
+        for y in range(bi - 1, -1, -1):
+            l = lines[y]
+            if _s_is_label(l) and not l.strip().startswith("LM"):
+                break
+            if _s_is_insn(l):
+                pi = y
+                break
+        if pi is None:
+            continue
+        pb = lines[pi].split("#", 1)[0].strip()
+        sb = lines[si].split("#", 1)[0].strip()
+        if not pb or not sb or _tf_is_nop(pb) or _tf_is_nop(sb):
+            continue
+        if _src_is_branch(lines[pi]) or re.match(r"\s*jalr?\b", lines[pi]):
+            continue
+        fp, fs = _ff_word_form(pb), _ff_word_form(sb)
+        if fp is None and re.match(r"(sb|sh|sw|lb|lbu|lh|lhu|lw)\s", pb) and \
+                _src_nwords(pb) == 1 and not _sym_operand("\t" + pb):
+            fp = pb             # a 1-word store/load may sit in the slot too
+        if fp is None or fs is None:
+            continue
+        if _sm_key(tgt[tk + 1][1].strip(), True) != _sm_key(fp, False):
+            continue
+        if _sm_key(tgt[tk + 2][1].strip(), True) != _sm_key(fs, False):
+            continue
+        bd, bu = defs_uses(lines[bi].split("#", 1)[0].strip())
+        pd, pu = defs_uses(fp)
+        if set(pd) & set(bu):
+            continue
+        sd, su = defs_uses(fs)
+        if len(sd) != 1:
+            continue
+        lab = re.search(r"(\$L\w+)\s*$", lines[bi].split("#", 1)[0])
+        ins = [(i, l) for i, l in enumerate(lines) if _s_is_insn(l)]
+        if not lab or not _ff_dead_on(lines, ins, lab.group(1), next(iter(sd))):
+            continue
+        # S must not read what P writes out of order (P still runs first) and
+        # must not be read by the branch (it ran before the transfer only as slot)
+        ind = _src_indent(lines[si])
+        new = list(lines)
+        new[si] = ind + fp
+        # S goes to the fall-through head: after the end of the noreorder group
+        at = si + 1
+        while at < len(new) and new[at].strip().startswith(".set"):
+            at += 1
+        new.insert(at, ind + fs)
+        del new[pi]
+        lines = new
+        changed = True
+    return "\n".join(lines) if changed else stext
+
+
 PASSES = {
     # reg_realloc is applied specially (it needs sigma from words); the ordered
     # list in the manifest still names it so the recipe is explicit and auditable.
@@ -4566,6 +4648,7 @@ PASSES = {
     "redundant_skip": redundant_skip_pass,
     "param_copy": param_copy_pass,
     "selfmove_nop": selfmove_nop_pass,
+    "slot_swap": slot_swap_pass,
 }
 
 # Passes that CHANGE the instruction count and so must run BEFORE sigma is derived
