@@ -1882,8 +1882,65 @@ def _jnext_drop(stext):
     return "\n".join(lines) if changed else stext
 
 
+def _j_steal(stext, tgt):
+    """`j L` (reorder mode, or noreorder with a nop slot) -> `j L'; X` with X the
+    first insn of L's block and L' a new label right after X, when the target's
+    jump with the same ordinal has X in its slot."""
+    if not tgt:
+        return stext
+    tj = [k for k, (_w, d) in enumerate(tgt) if d.split(None, 1)[0].lower() in ("j", "b")]
+    lines = stext.split("\n")
+    oj = [x for x, l in enumerate(lines) if re.match(r"\s*j\s+\$L\w+\s*$", l.split("#", 1)[0])]
+    if len(oj) != len(tj):
+        return stext
+    nr = _noreorder_lines(lines)
+    changed = False
+    for n in range(len(oj) - 1, -1, -1):
+        x = oj[n]
+        k = tj[n]
+        if k + 1 >= len(tgt) or is_nop(tgt[k + 1][1].strip()):
+            continue
+        slot = None
+        if x in nr:
+            slot = _tf_next_insn(lines, x)
+            if slot is None or not _tf_is_nop(lines[slot].split("#", 1)[0].strip()):
+                continue
+        lab = re.search(r"(\$L\w+)\s*$", lines[x].split("#", 1)[0]).group(1)
+        at = next((y for y, l in enumerate(lines) if l.strip() == lab + ":"), None)
+        if at is None:
+            continue
+        xi = _tf_next_insn(lines, at)
+        if xi is None or xi in nr or any(_s_is_label(lines[y]) and not lines[y].strip().startswith("LM")
+                                         and lines[y].strip() != lab + ":" for y in range(at + 1, xi)):
+            continue
+        xb = lines[xi].split("#", 1)[0].strip()
+        form = _ff_word_form(xb)
+        if form is None or _src_is_branch(lines[xi]) or re.match(r"(jalr?|nop)\b", xb):
+            continue
+        if _sm_key(tgt[k + 1][1].strip(), True) != _sm_key(form, False):
+            continue
+        n_js = sum(1 for l in lines if l.strip().startswith("$Ljs"))
+        nl_ = "$Ljs%d_%d" % (x, n_js)
+        ind = _src_indent(lines[xi])
+        if xi > x:
+            lines.insert(xi + 1, nl_ + ":")
+        if slot is not None:
+            lines[slot] = ind + form
+            lines[x] = lines[x][:lines[x].rindex(lab)] + nl_
+        else:
+            lines[x:x + 1] = [ind + ".set\tnoreorder", ind + ".set\tnomacro",
+                              ind + "j\t" + nl_, ind + form,
+                              ind + ".set\tmacro", ind + ".set\treorder"]
+        if xi < x:
+            lines.insert(xi + 1, nl_ + ":")
+        nr = _noreorder_lines(lines)
+        oj = [y for y, l in enumerate(lines) if re.match(r"\s*j\s+\$L\w+\s*$", l.split("#", 1)[0])]
+        changed = True
+    return "\n".join(lines) if changed else stext
+
+
 def taken_fill_pass(stext, tgt):
-    out = _taken_fill_core(stext, tgt)
+    out = _j_steal(_taken_fill_core(stext, tgt), tgt)
     return _jnext_drop(out) if out != stext else out
 
 
