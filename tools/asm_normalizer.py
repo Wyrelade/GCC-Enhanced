@@ -2868,6 +2868,11 @@ def _wr_nodes(lines):
     """Build the CFG. Returns (nodes, ok). node = {line, uses:[(reg,pos)],
     defs:[(reg,pos)], succ:[...]}; pos None = implicit (pins the web)."""
     nodes, labels, pend, nr = [], {}, [], False
+    jt = []
+    for l in lines:
+        mj = re.match(r"\s*\.(?:word|gpword)\s+(\$L\w+)\s*$", l)
+        if mj and mj.group(1) not in jt:
+            jt.append(mj.group(1))
     nodes.append({"line": None, "uses": [], "succ": [1],
                   "defs": [(r, None) for r in ABI2NUM if norm_reg(r) == r
                            and r not in ("zero", "hi", "lo")]})
@@ -2939,8 +2944,13 @@ def _wr_nodes(lines):
             node(i, regs[-1:], [])
         elif mn in ("j", "jr") and regs:
             if regs[0][0] != "ra":
-                return nodes, False          # indirect jump (table): give up
-            node(i, [], [])
+                # switch jump: successors are the entries of the span's jump
+                # tables (every table: a superset of the real ones is sound)
+                if not jt:
+                    return nodes, False
+                node(i, regs, [])
+            else:
+                node(i, [], [])
         else:
             node(i, [], [])
         head = len(nodes) - 1
@@ -2955,6 +2965,9 @@ def _wr_nodes(lines):
             node(None, [(r, None) for r in ("a0", "a1", "a2", "a3")
                         if not mc or _callee_reads(mc.group(1), r)],
                  [(r, None) for r in _CALL_CLOBBER if r not in ("hi", "lo")])
+        elif mn in ("j", "jr") and regs and regs[0][0] != "ra":
+            nodes[last]["jumps"] = jt
+            nodes[last]["fall"] = False
         elif mn in ("j", "jr") and regs:
             node(None, [(r, None) for r in _WR_RET], [], fall=False)
         elif mn in ("j", "b"):
@@ -2972,11 +2985,11 @@ def _wr_nodes(lines):
             continue
         if nd.get("fall", True) and n + 1 < len(nodes):
             nd["succ"].append(n + 1)
-        if nd.get("jump"):
-            t = labels.get(nd["jump"])
+        for jl in ([nd["jump"]] if nd.get("jump") else []) + nd.get("jumps", []):
+            t = labels.get(jl)
             if t is None:
                 return nodes, False
-            if t < len(nodes):
+            if t < len(nodes) and t not in nd["succ"]:
                 nd["succ"].append(t)
     return nodes, True
 
