@@ -4416,7 +4416,8 @@ def redundant_skip_pass(stext, tgt):
 _PC_ARGS = ("a0", "a1", "a2", "a3")
 
 
-def _pc_target(tgt):
+def _pc_targets(tgt):
+    out = []
     for _w, d in tgt[:8]:
         p = d.strip().split(None, 1)
         if len(p) < 2:
@@ -4428,26 +4429,36 @@ def _pc_target(tgt):
         if mn in ("addu", "or", "move") and len(ops) == 3 and ops[2] == "zero" and \
                 ops[1] in _PC_ARGS and ops[0] and ops[0] != ops[1] and \
                 ops[0] in ("v0", "v1", "a0", "a1", "a2", "a3", "t0", "t1", "t2", "t3",
-                           "t4", "t5", "t6", "t7", "t8", "t9"):
-            return ops[0], ops[1]
-    return None
+                           "t4", "t5", "t6", "t7", "t8", "t9") and \
+                all(ops[0] != x and ops[1] != y for x, y in out):
+            out.append((ops[0], ops[1]))
+    return out
 
 
-def param_copy_pass(stext, tgt):
-    tp = _pc_target(tgt)
-    if not tp:
-        return stext
-    rn, ak = tp
-    lines = stext.split("\n")
-    ins = [i for i, l in enumerate(lines) if _s_is_insn(l) and not l.strip().startswith(".")]
-    for i in ins[:8]:
-        b = lines[i].split("#", 1)[0].strip()
-        m = re.match(r"move\s+(\$\w+)\s*,\s*(\$\w+)$", b)
-        if m and norm_reg(m.group(1)) == rn and norm_reg(m.group(2)) == ak:
-            return stext
+def _pc_edit(lines, nodes, occ_list, newreg):
+    edits = {}
+    for n, pos, reg in occ_list:
+        edits.setdefault(nodes[n]["line"], {})[pos] = newreg(reg)
+    for li, poss in edits.items():
+        ind, mn, ops, com, rp = _wr_parse(lines[li])
+        ops = list(ops)
+        for pos, nr_ in poss.items():
+            k, par_, _r = rp[pos]
+            num = "$%d" % ABI2NUM[nr_]
+            if par_:
+                ops[k] = re.sub(r"\(\$\w+\)$", "(%s)" % num, ops[k])
+            else:
+                ops[k] = num
+        body = lines[li].split("#", 1)[0].strip().split(None, 1)[0]
+        lines[li] = "%s%s\t%s%s" % (ind, body, ",".join(ops), ("\t#" + com) if com else "")
+
+
+def _pc_one(lines, rn, ak):
+    """Rename Ak's entry web to Rn (rename mode) or swap Ak<->Rn everywhere (swap
+    mode, when Rn is busy). Returns True when lines were changed."""
     nodes, ok = _wr_nodes(lines)
     if not ok:
-        return stext
+        return False
     occ, pinned, reg_of, LO, def_w = _wr_webs(nodes)
     ent = {}
     for (n, r, pos, kd), w in occ.items():
@@ -4455,52 +4466,144 @@ def param_copy_pass(stext, tgt):
             ent[r] = w
     aw, rw = ent.get(ak), ent.get(rn)
     if aw is None:
-        return stext
+        return False
     uses = [(n, pos) for (n, r, pos, kd), w in occ.items() if w == aw and kd == "u"]
     if not uses or any(pos is None for _n, pos in uses):
-        return stext
+        return False
     # Rn's incoming value must be unused (implicit reads by calls are the
     # callee-asm arity over-approximation, not real uses)
     if rw is not None and any(w == rw and kd == "u" and pos is not None
                               for (n, r, pos, kd), w in occ.items()):
-        return stext
-    rwebs = set(w for (n, r, pos, kd), w in occ.items() if r == rn and w != rw)
-    for n in range(len(nodes)):
-        if aw in LO[n] or any(nn == n for nn, _p in uses):
-            if rwebs & LO[n] and aw in LO[n]:
-                return stext
-            if rwebs & def_w[n] and aw in LO[n]:
-                return stext
-    # other defs merged into the web (the parameter variable reassigned, e.g.
-    # in a loop) move with it; an implicit one cannot be renamed
+        return False
     odefs = [(n, pos) for (n, r, pos, kd), w in occ.items() if w == aw and kd == "d" and n != 0]
     if any(pos is None for _n, pos in odefs):
+        return False
+    rwebs = set(w for (n, r, pos, kd), w in occ.items() if r == rn and w != rw)
+    busy = False
+    for n in range(len(nodes)):
+        if aw in LO[n] and (rwebs & LO[n] or rwebs & def_w[n]):
+            busy = True
+            break
+    if not busy:
+        _pc_edit(lines, nodes, [(n, pos, None) for n, pos in uses + odefs], lambda _r: rn)
+        return True
+    # swap mode: every explicit Ak/Rn occurrence changes register; no web of
+    # either register may have an implicit occurrence besides the entry defs
+    for (n, r, pos, kd), w in occ.items():
+        if r in (ak, rn) and pos is None and not (n == 0 and kd == "d"):
+            if kd == "u" and w == rw:
+                continue            # arity over-approximation read of Rn's garbage
+            return False
+    ol = [(n, pos, r) for (n, r, pos, kd), w in occ.items() if r in (ak, rn) and pos is not None]
+    _pc_edit(lines, nodes, ol, lambda r: rn if r == ak else ak)
+    return True
+
+
+def _pc_forward(lines, mv, ak):
+    """lines[mv] is `move Y,Ak` at the entry: every other explicit read of Ak's
+    entry value that only the move's Y def reaches reads Y instead (retail uses
+    the copy everywhere, freeing Ak)."""
+    body = lines[mv].split("#", 1)[0].strip()
+    m = re.match(r"(?:move\s+(\$\w+)\s*,|addu\s+(\$\w+)\s*,)", body)
+    if not m:
+        return
+    yr = norm_reg(m.group(1) or m.group(2))
+    nodes, ok = _wr_nodes(lines)
+    if not ok:
+        return
+    occ, pinned, reg_of, LO, def_w = _wr_webs(nodes)
+    aw = next((w for (n, r, pos, kd), w in occ.items() if n == 0 and kd == "d" and r == ak), None)
+    mvn = next((n for n, nd in enumerate(nodes) if nd["line"] == mv), None)
+    if aw is None or mvn is None:
+        return
+    # reaching defs of Y (forward dataflow over node ids)
+    gen = {n: n for n, nd in enumerate(nodes) if any(r == yr for r, _p in nd["defs"])}
+    pred = [[] for _ in nodes]
+    for n, nd in enumerate(nodes):
+        for sx in nd["succ"]:
+            pred[sx].append(n)
+    IN = [set() for _ in nodes]
+    OUT = [set() for _ in nodes]
+    ch = True
+    while ch:
+        ch = False
+        for n in range(len(nodes)):
+            i_ = set()
+            for p_ in pred[n]:
+                i_ |= OUT[p_]
+            o_ = {gen[n]} if n in gen else set(i_)
+            if i_ != IN[n] or o_ != OUT[n]:
+                IN[n], OUT[n] = i_, o_
+                ch = True
+    ol = []
+    for (n, r, pos, kd), w in occ.items():
+        if w == aw and kd == "u" and n != mvn:
+            if pos is None or IN[n] != {mvn}:
+                continue
+            ol.append((n, pos, r))
+    if ol:
+        _pc_edit(lines, nodes, ol, lambda _r: yr)
+
+
+def param_copy_pass(stext, tgt):
+    tps = _pc_targets(tgt)
+    if not tps:
         return stext
-    edits = {}
-    for n, pos in uses + odefs:
-        edits.setdefault(nodes[n]["line"], set()).add(pos)
-    for li, poss in edits.items():
-        ind, mn, ops, com, rp = _wr_parse(lines[li])
-        ops = list(ops)
-        for pos in poss:
-            k, par_, _r = rp[pos]
-            num = "$%d" % ABI2NUM[rn]
-            if par_:
-                ops[k] = re.sub(r"\(\$\w+\)$", "(%s)" % num, ops[k])
-            else:
-                ops[k] = num
-        body = lines[li].split("#", 1)[0].strip().split(None, 1)[0]
-        lines[li] = "%s%s\t%s%s" % (ind, body, ",".join(ops), ("\t#" + com) if com else "")
-    at = None
+    lines = stext.split("\n")
+    ins = [i for i, l in enumerate(lines) if _s_is_insn(l) and not l.strip().startswith(".")]
+    if not ins:
+        return stext
+    for i in ins[:8]:
+        b = lines[i].split("#", 1)[0].strip()
+        m = re.match(r"move\s+(\$\w+)\s*,\s*(\$\w+)$", b)
+        if m and (norm_reg(m.group(1)), norm_reg(m.group(2))) in tps:
+            return stext
+    at = ins[0]
     for i in ins[:3]:
         if re.match(r"\s*(subu|addu|addiu)\s+\$(sp|29)\s*,\s*\$(sp|29)\s*,", lines[i]):
             at = i + 1
             break
-    if at is None:
-        return stext
-    ind = lines[at - 1][:len(lines[at - 1]) - len(lines[at - 1].lstrip())]
-    lines.insert(at, "%smove\t$%d,$%d" % (ind, ABI2NUM[rn], ABI2NUM[ak]))
-    return "\n".join(lines)
+    changed = False
+    for rn, ak in tps:
+        # ours already copies Ak, later on the entry straight line: hoist that
+        # copy to the entry (web_realloc names it afterwards)
+        hi = None
+        seen = set()
+        for y in range(at, len(lines)):
+            l = lines[y]
+            if _s_is_label(l) and not l.strip().startswith("LM"):
+                break
+            if not _s_is_insn(l) or l.strip().startswith("."):
+                continue
+            body = l.split("#", 1)[0].strip()
+            if _src_is_branch(l) or _src_is_ret(l) or re.match(r"jalr?\b", body):
+                break
+            m = re.match(r"(?:move\s+(\$\w+)\s*,\s*(\$\w+)|addu\s+(\$\w+)\s*,\s*(\$\w+)\s*,\s*\$(?:0|zero))$", body)
+            d, u = defs_uses(body)
+            if m:
+                yr = norm_reg(m.group(1) or m.group(3))
+                sr = norm_reg(m.group(2) or m.group(4))
+                if sr == ak and yr not in seen and ak not in seen:
+                    hi = y
+                    break
+            seen |= set(d) | set(u) - {ak}
+            if ak in d:
+                break
+        if hi is not None:
+            ln = lines.pop(hi)
+            lines.insert(at, ln)
+            _pc_forward(lines, at, ak)
+            at += 1
+            changed = True
+            continue
+        if not _pc_one(lines, rn, ak):
+            break
+        ref = lines[at] if at < len(lines) and _s_is_insn(lines[at]) else lines[ins[0]]
+        ind = ref[:len(ref) - len(ref.lstrip())]
+        lines.insert(at, "%smove\t$%d,$%d" % (ind, ABI2NUM[rn], ABI2NUM[ak]))
+        at += 1
+        changed = True
+    return "\n".join(lines) if changed else stext
 
 
 # --------------------------------------------------------------------------
