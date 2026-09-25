@@ -4060,6 +4060,333 @@ def mask_reuse_pass(stext, tgt):
     return "\n".join(lines) if changed else stext
 
 
+# --------------------------------------------------------------------------
+# zero_cmp: cse put a register known to hold zero on this path (a switch
+# register reached through `beq R,$0,L`) into a compare against zero, so retail
+# tests `slt v0,s6,v0; beqz v0,L` where our cc1 folds the constant and emits
+# `blez v0,L`. When the target has such `slt X,Z,R; beqz/bnez X` pairs (Z not
+# $zero, X == R) and ours has fewer, rewrite our blez/bgtz/bltz/bgez R,L into
+# the slt + beqz/bnez form, using the one register proven zero at the branch
+# (every entrant of the join label is a `beq Z,$0` / `beqz Z` edge or a
+# fall-through that is itself zero) and only when R is dead after the branch
+# on both paths. The slt goes before the noreorder block so gas keeps the
+# load-delay nop. Count-changing: runs before sigma.
+# --------------------------------------------------------------------------
+_ZC_FORM = {"blez": ("hi", "beqz"), "bgtz": ("hi", "bnez"),
+            "bltz": ("lo", "bnez"), "bgez": ("lo", "beqz")}
+_ZC_BR = re.compile(r"^(\s*)(blez|bgtz|bltz|bgez)\s+(\$\w+)\s*,\s*(\$L\w+)\s*$")
+
+
+def _zc_target_count(tgt):
+    n = 0
+    for k in range(len(tgt) - 1):
+        p = tgt[k][1].strip().split(None, 1)
+        q = tgt[k + 1][1].strip().split(None, 1)
+        if len(p) < 2 or len(q) < 2 or p[0].lower() != "slt" or q[0].lower() not in ("beqz", "bnez"):
+            continue
+        ops = [norm_reg(x) for x in split_ops(p[1])]
+        qo = [norm_reg(x) for x in split_ops(q[1])]
+        if len(ops) == 3 and ops[0] == qo[0] and "zero" not in ops[1:] and ops[0] in ops[1:]:
+            n += 1
+    return n
+
+
+def _zc_our_count(lines):
+    ins = [l.split("#", 1)[0].strip() for l in lines if _s_is_insn(l) and not l.strip().startswith(".")]
+    n = 0
+    for k in range(len(ins) - 1):
+        m = re.match(r"slt\s+(\$\w+)\s*,\s*(\$\w+)\s*,\s*(\$\w+)$", ins[k])
+        q = re.match(r"(beq|bne)z?\s+(\$\w+)", ins[k + 1])
+        if m and q and norm_reg(m.group(1)) == norm_reg(q.group(2)) and \
+                "zero" not in (norm_reg(m.group(2)), norm_reg(m.group(3))):
+            n += 1
+    return n
+
+
+def _zc_zero_at(lines, li, reg, depth=0):
+    """reg holds zero at line li: walk back; a def kills (unless `move reg,$0`/li 0);
+    at a branch-target label every entrant must be a `beq reg,$0` edge (or beqz)
+    or a zero path; a fall-through into the label must be zero too unless the
+    line before is an unconditional `j` (reorder mode)."""
+    if depth > 4:
+        return False
+    for x in range(li - 1, -1, -1):
+        l = lines[x]
+        t = l.strip()
+        if _s_is_label(l) and t.startswith("$L"):
+            lab = t[:-1]
+            pat = re.compile(r"[\s,]" + re.escape(lab) + r"\s*$")
+            for y, bl in enumerate(lines):
+                if y == x or not _s_is_insn(bl) or not pat.search(bl.split("#", 1)[0]):
+                    continue
+                b = bl.split("#", 1)[0].strip()
+                mm = re.match(r"beq\s+(\$\w+)\s*,\s*(\$\w+)\s*,", b)
+                mz = re.match(r"beqz\s+(\$\w+)\s*,", b)
+                if mm and ({norm_reg(mm.group(1)), norm_reg(mm.group(2))} == {reg, "zero"}):
+                    pass
+                elif mz and norm_reg(mz.group(1)) == reg:
+                    pass
+                elif not _zc_zero_at(lines, y, reg, depth + 1):
+                    return False
+                # the entrant's delay slot must not write reg
+                for z in range(y + 1, min(len(lines), y + 4)):
+                    if _s_is_insn(lines[z]) and not lines[z].strip().startswith("."):
+                        if reg in defs_uses(lines[z].split("#", 1)[0].strip())[0]:
+                            return False
+                        break
+            # fall-through into the label
+            for z in range(x - 1, -1, -1):
+                pz = lines[z]
+                if _s_is_insn(pz) and not pz.strip().startswith("."):
+                    if re.match(r"\s*(j|b)\s+\$L", pz):
+                        return True
+                    break
+                if _s_is_label(pz) and pz.strip().startswith("$L"):
+                    break
+            continue
+        if not _s_is_insn(l) or t.startswith("."):
+            continue
+        body = l.split("#", 1)[0].strip()
+        if re.match(r"jalr?\b", body):
+            if reg in _CALL_CLOBBER:
+                return False
+            continue
+        if _src_is_branch(l) or _src_is_ret(l):
+            return False
+        d, _u = defs_uses(body)
+        if reg in d:
+            z = re.match(r"(?:move\s+\$\w+\s*,\s*\$0|li\s+\$\w+\s*,\s*0)\s*$", body)
+            return bool(z)
+    return False
+
+
+def _zc_dead_after(lines, ins, slot_line, reg):
+    """reg dead on the fall-through path after slot_line (index into lines)."""
+    for x in range(slot_line + 1, len(lines)):
+        l = lines[x]
+        if not _s_is_insn(l) or l.strip().startswith("."):
+            continue
+        body = l.split("#", 1)[0].strip()
+        if re.match(r"jalr?\b", body):
+            return reg in _CALL_CLOBBER and reg not in ("a0", "a1", "a2", "a3")
+        d, u = defs_uses(body)
+        if reg in u:
+            return False
+        if _src_is_ret(l):
+            return reg not in _FF_RET_LIVE
+        if _src_is_branch(l):
+            lab = re.search(r"(\$L\w+)\s*$", body)
+            if not lab or not _ff_dead_on(lines, ins, lab.group(1), reg):
+                return False
+            if body.split(None, 1)[0].lower() in ("j", "b"):
+                return True
+            continue
+        if reg in d:
+            return True
+    return False
+
+
+def zero_cmp_pass(stext, tgt):
+    lines = stext.split("\n")
+    if _zc_target_count(tgt) <= 0:
+        return stext
+    # per mnemonic: our blez/bgtz/bltz/bgez surplus over the target's
+    tb = {}
+    for _w, d in tgt:
+        mn = d.strip().split(None, 1)[0].lower() if d.strip() else ""
+        if mn in _ZC_FORM:
+            tb[mn] = tb.get(mn, 0) - 1
+    for l in lines:
+        m = _ZC_BR.match(l.split("#", 1)[0].rstrip())
+        if m:
+            tb[m.group(2)] = tb.get(m.group(2), 0) + 1
+    budget = sum(v for v in tb.values() if v > 0)
+    if budget <= 0:
+        return stext
+    regs = sorted(set(norm_reg(t) for l in lines if _s_is_insn(l)
+                      for t in re.findall(r"\$\d+\b", l.split("#", 1)[0])) - {"zero"})
+    x = 0
+    changed = False
+    while x < len(lines) and budget > 0:
+        m = _ZC_BR.match(lines[x].split("#", 1)[0].rstrip())
+        if not m:
+            x += 1
+            continue
+        ind, br, r, lab = m.groups()
+        if tb.get(br, 0) <= 0:
+            x += 1
+            continue
+        rn = norm_reg(r)
+        cands = [z for z in regs if z != rn and _zc_zero_at(lines, x, z)]
+        if len(cands) != 1:
+            x += 1
+            continue
+        zr = cands[0]
+        ins = [(i, l) for i, l in enumerate(lines) if _s_is_insn(l)]
+        slot = None
+        nr = _noreorder_lines(lines)
+        if x in nr:
+            for y in range(x + 1, len(lines)):
+                if _s_is_insn(lines[y]) and not lines[y].strip().startswith("."):
+                    slot = y
+                    break
+            if slot is None:
+                x += 1
+                continue
+            sd, su = defs_uses(lines[slot].split("#", 1)[0].strip())
+            if rn in sd or rn in su:
+                x += 1
+                continue
+        after = slot if slot is not None else x
+        if not _ff_dead_on(lines, ins, lab, rn) or not _zc_dead_after(lines, ins, after, rn):
+            x += 1
+            continue
+        side, nbr = _ZC_FORM[br]
+        ztok = next(t for t in re.findall(r"\$\d+\b", "\n".join(lines)) if norm_reg(t) == zr)
+        slt = "%sslt\t%s,%s,%s" % (ind, r, ztok, r) if side == "hi" else \
+            "%sslt\t%s,%s,%s" % (ind, r, r, ztok)
+        lines[x] = "%s%s\t%s,%s" % (ind, nbr, r, lab)
+        at = x
+        if x in nr:
+            while at > 0 and lines[at - 1].strip().startswith(".set"):
+                at -= 1
+        lines.insert(at, slt)
+        x += 2
+        budget -= 1
+        tb[br] -= 1
+        changed = True
+    return "\n".join(lines) if changed else stext
+
+
+# --------------------------------------------------------------------------
+# redundant_skip: reorg (fill_slots_from_thread / redundant_insn) skips a
+# target-thread insn that is redundant on the branch path and redirects the
+# branch past it: retail `lw v1,36(s4); beqz v1,L+4` where L is `lw v1,36(s4)`
+# again. Ours branches to L. When the target has such branches (the insn
+# before the branch target equals a load reaching the branch with no def of its
+# registers, store or call in between) and ours has fewer, retarget our
+# matching branches to a new label after the redundant load. Count preserving.
+# --------------------------------------------------------------------------
+_RS_BR = re.compile(r"^(\s*)(beq|bne|beqz|bnez|blez|bgtz|bltz|bgez)\s+(.*?)(\$L\w+)\s*$")
+_RS_LD = re.compile(r"^(lw|lh|lhu|lb|lbu)\s+(\$\w+)\s*,\s*(-?\w+)\((\$\w+)\)$")
+_RS_ST = re.compile(r"^(sw|sh|sb|swl|swr)\b")
+
+
+def _rs_canon(body):
+    return re.sub(r"\s+", " ", body.replace(", ", ",")).strip()
+
+
+def _rs_reaches(seq, ld):
+    """seq: insn bodies (oldest first) on the straight line up to and including
+    the branch (and its slot); ld: the load body. True when an identical load
+    is in seq with no def of its dest/base, store or call after it."""
+    m = _RS_LD.match(ld)
+    if not m:
+        return False
+    rd, rb = norm_reg(m.group(2)), norm_reg(m.group(4))
+    for k in range(len(seq) - 1, -1, -1):
+        b = seq[k]
+        if _rs_canon(b) == _rs_canon(ld) and k < len(seq):
+            return True
+        if _RS_ST.match(b) or re.match(r"jalr?\b", b):
+            return False
+        d, _u = defs_uses(b)
+        if rd in d or rb in d:
+            return False
+    return False
+
+
+def _rs_target_count(tgt):
+    dis = [d.strip() for _w, d in tgt]
+    words_pc = {}
+    n = 0
+    for k, d in enumerate(dis):
+        p = d.split(None, 1)
+        if not p or p[0].lower() not in ("beq", "bne", "beqz", "bnez", "blez", "bgtz", "bltz", "bgez"):
+            continue
+        w = int(tgt[k][0], 16)
+        off = w & 0xFFFF
+        off = off - 0x10000 if off & 0x8000 else off
+        t = k + 1 + off
+        if t < 1 or t > len(dis):
+            continue
+        prev = dis[t - 1]
+        pm = prev.split(None, 1)
+        if not pm or pm[0].lower() not in ("lw", "lh", "lhu", "lb", "lbu"):
+            continue
+        ld = "%s %s" % (pm[0].lower(), ",".join(x.strip() for x in split_ops(pm[1])))
+        seq = []
+        for q in range(max(0, k - 12), k + 2):
+            if q < len(dis) and dis[q].split(None, 1)[0].lower() != "nop":
+                qp = dis[q].split(None, 1)
+                seq.append("%s %s" % (qp[0].lower(), ",".join(x.strip() for x in split_ops(qp[1])) if len(qp) > 1 else ""))
+        if t - 1 != k + 1 and _rs_reaches(seq, ld):
+            n += 1
+    return n
+
+
+def redundant_skip_pass(stext, tgt):
+    want = _rs_target_count(tgt)
+    if want <= 0:
+        return stext
+    lines = stext.split("\n")
+    nr = _noreorder_lines(lines)
+    labidx = {l.strip()[:-1]: i for i, l in enumerate(lines) if _s_is_label(l) and l.strip().startswith("$L")}
+    changed = False
+    nlab = 0
+    for x in range(len(lines)):
+        if want <= 0:
+            break
+        m = _RS_BR.match(lines[x].split("#", 1)[0].rstrip())
+        if not m:
+            continue
+        lab = m.group(4)
+        if lab not in labidx:
+            continue
+        # straight-line insns before the branch (stop at a real label), plus the slot
+        seq = []
+        for y in range(x - 1, -1, -1):
+            l = lines[y]
+            if _s_is_label(l) and l.strip().startswith("$L"):
+                break
+            if _s_is_insn(l) and not l.strip().startswith("."):
+                b = l.split("#", 1)[0].strip()
+                if _src_is_branch(l) or _src_is_ret(l):
+                    break
+                seq.insert(0, b)
+        seq.append(lines[x].split("#", 1)[0].strip())
+        if x in nr:
+            for y in range(x + 1, len(lines)):
+                if _s_is_insn(lines[y]) and not lines[y].strip().startswith("."):
+                    seq.append(lines[y].split("#", 1)[0].strip())
+                    break
+        seq = [_rs_canon(b) for b in seq[:-1] if b] + [_rs_canon(seq[-1])] if seq else []
+        # first insn of the target thread
+        li = labidx[lab]
+        fi = None
+        for y in range(li + 1, len(lines)):
+            l = lines[y]
+            if _s_is_insn(l) and not l.strip().startswith("."):
+                fi = y
+                break
+        if fi is None or fi in nr:
+            continue
+        ld = _rs_canon(lines[fi].split("#", 1)[0].strip())
+        if not _RS_LD.match(ld.replace(", ", ",")):
+            continue
+        if not _rs_reaches([b for b in seq if not b.startswith(("beq", "bne", "blez", "bgtz", "bltz", "bgez"))], ld):
+            continue
+        new = "$Lgcce_rs%d" % nlab
+        nlab += 1
+        lines.insert(fi + 1, new + ":")
+        labidx = {l.strip()[:-1]: i for i, l in enumerate(lines) if _s_is_label(l) and l.strip().startswith("$L")}
+        nr = _noreorder_lines(lines)
+        lines[x] = lines[x].replace(lab, new)
+        want -= 1
+        changed = True
+    return "\n".join(lines) if changed else stext
+
+
 PASSES = {
     # reg_realloc is applied specially (it needs sigma from words); the ordered
     # list in the manifest still names it so the recipe is explicit and auditable.
@@ -4090,6 +4417,8 @@ PASSES = {
     "zext_keep": zext_keep_pass,
     "self_move": self_move_pass,
     "mask_reuse": mask_reuse_pass,
+    "zero_cmp": zero_cmp_pass,
+    "redundant_skip": redundant_skip_pass,
 }
 
 # Passes that CHANGE the instruction count and so must run BEFORE sigma is derived
@@ -4098,7 +4427,7 @@ PASSES = {
 # manifest order; the rest keep their listed order after sigma.
 PRE_SIGMA_PASSES = ("un_hi_cse", "un_hi_cse_store", "exit_merge", "base_cse_collapse",
                     "shift_const_fold", "zero_remat", "load_remat", "nodiv",
-                    "offset_unfold", "zext_keep")
+                    "offset_unfold", "zext_keep", "zero_cmp")
 
 # --------------------------------------------------------------------------
 # WORD-LEVEL passes. The original PSY-Q assembler (aspsx) scheduled branch and
