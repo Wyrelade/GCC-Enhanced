@@ -3908,6 +3908,158 @@ def self_move_pass(stext, tgt):
     return "\n".join(lines) if changed else stext
 
 
+# --------------------------------------------------------------------------
+# mask_reuse: combine folded a narrower mask onto the unmasked source. Retail
+# `andi M,S,0xffff; ...; andi D,M,0x7e` (reads the zero-extended copy), ours
+# `andi M,S,0xffff; ...; andi D,S,0x7e`. Both are S & K when K is a subset of
+# the first mask. When the target has a chained andi (source = dest of an
+# earlier same-block andi with a superset mask) with immediate K, point our
+# same-block `andi D,S,K` at M (M and S not redefined in between, no label,
+# branch or call in between). Ordinal per K; count preserving.
+# --------------------------------------------------------------------------
+_MR_ANDI = re.compile(r"^(\s*)andi\s+(\$\w+)\s*,\s*(\$\w+)\s*,\s*(\S+)\s*$")
+
+
+def _mr_chains(items):
+    """items: list of (kind, mn, ops, dd, uu) with kind in insn/label/branch.
+    Return list of (index, K, M) for andi whose source is an earlier andi dest
+    with a superset mask (M = that dest)."""
+    out = []
+    for i, (kind, mn, ops, dd, uu) in enumerate(items):
+        if kind != "insn" or mn != "andi" or len(ops) != 3:
+            continue
+        k = _sm_int(ops[2])
+        src = norm_reg(ops[1])
+        if k is None:
+            continue
+        for j in range(i - 1, -1, -1):
+            kj, mnj, opsj, ddj, uuj = items[j]
+            if kj != "insn":
+                break
+            if mnj == "andi" and len(opsj) == 3 and norm_reg(opsj[0]) == src and \
+                    norm_reg(opsj[1]) != src:
+                kk = _sm_int(opsj[2])
+                if kk is not None and (k & kk) == k and k != kk:
+                    out.append((i, k, src))
+                break
+            if src in ddj:
+                break
+    return out
+
+
+def _mr_items_tgt(tgt):
+    items = []
+    for _w, d in tgt:
+        d = d.strip()
+        p = d.split(None, 1)
+        mn = p[0].lower() if p else ""
+        ops = split_ops(p[1]) if len(p) > 1 else []
+        dd, uu = defs_uses(d)
+        kind = "branch" if (is_branch(d) or mn in ("jal", "jalr", "jr", "j")) else "insn"
+        items.append((kind, mn, ops, dd, uu))
+    return items
+
+
+_MR_TEMPS = [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 24, 25]
+
+
+def _mr_free_reg(lines):
+    body = "\n".join(l.split("#", 1)[0] for l in lines if _s_is_insn(l))
+    used = set(norm_reg(t) for t in re.findall(r"\$\w+", body))
+    for n in _MR_TEMPS:
+        if norm_reg("$%d" % n) not in used:
+            return "$%d" % n
+    return None
+
+
+def _mr_rename_all(line, rn, fr):
+    return re.sub(r"\$\w+", lambda t: fr if norm_reg(t.group(0)) == rn else t.group(0), line)
+
+
+def _mr_rename_dest(line, rn, fr):
+    m = re.match(r"^(\s*\S+\s+)(\$\w+)(.*)$", line)
+    if m and norm_reg(m.group(2)) == rn:
+        return m.group(1) + fr + m.group(3)
+    return line
+
+
+def mask_reuse_pass(stext, tgt):
+    want = {}
+    titems = _mr_items_tgt(tgt)
+    for _i, k, _m in _mr_chains(titems):
+        want[k] = want.get(k, 0) + 1
+    if not want:
+        return stext
+    lines = stext.split("\n")
+    changed = False
+    for x in range(len(lines)):
+        m = _MR_ANDI.match(lines[x])
+        if not m:
+            continue
+        k = _sm_int(m.group(4))
+        if k is None or not want.get(k):
+            continue
+        d, sreg = m.group(2), m.group(3)
+        sn = norm_reg(sreg)
+        hit = None
+        for y in range(x - 1, -1, -1):
+            l = lines[y]
+            if _s_is_label(l) and not l.strip().startswith("LM"):
+                break
+            if not _s_is_insn(l) or re.match(r"\s*\.", l):
+                continue
+            body = l.split("#", 1)[0].strip()
+            if _src_is_branch(l) or re.match(r"\s*j(al)?r?\b", l):
+                break
+            mm = _MR_ANDI.match(l)
+            if mm and norm_reg(mm.group(3)) == sn and norm_reg(mm.group(2)) != sn:
+                kk = _sm_int(mm.group(4))
+                if kk is not None and (k & kk) == k and k != kk:
+                    hit = (y, mm.group(2))
+                break
+            dd, _uu = defs_uses(body)
+            if sn in dd:
+                break
+        if hit is None:
+            continue
+        y, mreg = hit
+        mn = norm_reg(mreg)
+        wz = None
+        for z in range(y + 1, x):
+            l = lines[z]
+            if not _s_is_insn(l) or re.match(r"\s*\.", l):
+                continue
+            dd, _uu = defs_uses(l.split("#", 1)[0].strip())
+            if sn in dd:
+                wz = -1
+                break
+            if mn in dd and wz is None:
+                wz = z
+        if wz == -1:
+            continue
+        if wz is not None:
+            # case B: M is overwritten at wz before x. Only when x itself
+            # redefines M (D == M): rename M in [wz, x) (wz: dest only) to a
+            # register the function never mentions, so M keeps S & K2 up to x.
+            if norm_reg(d) != mn:
+                continue
+            fr = _mr_free_reg(lines)
+            if fr is None:
+                continue
+            for z in range(wz, x):
+                l = lines[z]
+                if not _s_is_insn(l) or re.match(r"\s*\.", l):
+                    continue
+                if z == wz:
+                    lines[z] = _mr_rename_dest(l, mn, fr)
+                else:
+                    lines[z] = _mr_rename_all(l, mn, fr)
+        lines[x] = "%sandi\t%s,%s,%s" % (m.group(1), d, mreg, m.group(4))
+        want[k] -= 1
+        changed = True
+    return "\n".join(lines) if changed else stext
+
+
 PASSES = {
     # reg_realloc is applied specially (it needs sigma from words); the ordered
     # list in the manifest still names it so the recipe is explicit and auditable.
@@ -3937,6 +4089,7 @@ PASSES = {
     "cross_jump": cross_jump_pass,
     "zext_keep": zext_keep_pass,
     "self_move": self_move_pass,
+    "mask_reuse": mask_reuse_pass,
 }
 
 # Passes that CHANGE the instruction count and so must run BEFORE sigma is derived
