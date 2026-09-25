@@ -4987,13 +4987,21 @@ ALT_FLAVORS = {
     "nosplit_hf": ["-mno-split-addresses", "-mhard-float"],
     "nodb_hf": ["-fno-delayed-branch", "-mhard-float"],
     "nosplit_nodb_hf": ["-mno-split-addresses", "-fno-delayed-branch", "-mhard-float"],
+    # units built without loop strength reduction (address givs stay i*size+base)
+    "nosr": ["-fno-strength-reduce"],
+    "nosplit_nosr": ["-mno-split-addresses", "-fno-strength-reduce"],
+    # units built without the second cse pass and without cse jump following
+    "nocse": ["-fno-rerun-cse-after-loop", "-fno-cse-follow-jumps"],
+    "nosplit_nocse": ["-mno-split-addresses", "-fno-rerun-cse-after-loop", "-fno-cse-follow-jumps"],
 }
 META_PASSES = tuple(ALT_FLAVORS)
 # local-label prefix per alternate compile (nosplit keeps the historical "ns")
 _ALT_TAG = {"nosplit": "ns", "nosplit_nodb": "nsnd", "nodb": "nd", "gp8": "gp",
             "gp8_nosplit": "gpns",
             "gp8_nosplit_noskip": "gpnk", "hf": "hf", "nosplit_hf": "nshf",
-            "nodb_hf": "ndhf", "nosplit_nodb_hf": "nsndhf"}
+            "nodb_hf": "ndhf", "nosplit_nodb_hf": "nsndhf",
+            "nosr": "nsr", "nosplit_nosr": "nsnsr", "nocse": "ncse",
+            "nosplit_nocse": "nsncse"}
 
 
 def alt_flavors(manifest):
