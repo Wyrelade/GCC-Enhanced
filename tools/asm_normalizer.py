@@ -23,6 +23,7 @@ retail-asm root via a small context object.
 import difflib
 import json
 import os
+import collections
 import re
 import subprocess
 
@@ -5101,6 +5102,61 @@ def undo_drop_pass(stext, tgt):
     return "\n".join(lines)
 
 
+# --------------------------------------------------------------------------
+# copy_swap: `move A,$0` ... `move B,A` (straight line, neither A nor B read or
+# written in between) holds the same values afterwards as `move B,$0` ...
+# `move A,B`; retail's cse kept the constant in the other register
+# (s0 = n = 0 and a1 = n for a call argument). Target-guided: fires when
+# the target has both swapped insns and fewer of our pair.
+# --------------------------------------------------------------------------
+_CS_ZERO = re.compile(r"^(\s*)(?:move\s+(\$\w+)\s*,\s*\$(?:0|zero)|li\s+(\$\w+)\s*,\s*0)\s*(?:#.*)?$")
+
+
+def copy_swap_pass(stext, tgt):
+    if not tgt:
+        return stext
+    tk = collections.Counter(_sm_key(d.strip(), True) for _w, d in tgt)
+    lines = stext.split("\n")
+    nr = _noreorder_lines(lines)
+    changed = False
+    for x in range(len(lines)):
+        m = _CS_ZERO.match(lines[x])
+        if not m or x in nr:
+            continue
+        a = m.group(2) or m.group(3)
+        ra = norm_reg(a)
+        for y in range(x + 1, len(lines)):
+            l = lines[y]
+            if _join_label(lines, y):
+                break
+            if not _s_is_insn(l) or l.strip().startswith("."):
+                continue
+            mm = _MOVE_S.match(l)
+            if mm and norm_reg(mm.group(3)) == ra and y not in nr:
+                b = mm.group(2)
+                rb = norm_reg(b)
+                if rb == ra:
+                    break
+                ours = [_sm_key("move\t%s,$0" % a, False), _sm_key("move\t%s,%s" % (b, a), False)]
+                swp = [_sm_key("move\t%s,$0" % b, False), _sm_key("move\t%s,%s" % (a, b), False)]
+                # B must not be read or written between the two insns either
+                free = all(rb not in set(defs_uses(lines[z].split("#", 1)[0].strip())[0])
+                           | set(defs_uses(lines[z].split("#", 1)[0].strip())[1])
+                           for z in range(x + 1, y)
+                           if _s_is_insn(lines[z]) and not lines[z].strip().startswith("."))
+                if free and all(tk.get(k, 0) > 0 for k in swp) and any(tk.get(k, 0) == 0 for k in ours):
+                    lines[x] = "%smove\t%s,$0" % (m.group(1), b)
+                    lines[y] = "%smove\t%s,%s" % (_src_indent(l), a, b)
+                    changed = True
+                break
+            if _src_is_branch(l) or _src_is_ret(l) or re.match(r"\s*jalr?\b", l):
+                break
+            d, u = defs_uses(l.split("#", 1)[0].strip())
+            if ra in d or ra in u:
+                break
+    return "\n".join(lines) if changed else stext
+
+
 PASSES = {
     # reg_realloc is applied specially (it needs sigma from words); the ordered
     # list in the manifest still names it so the recipe is explicit and auditable.
@@ -5138,6 +5194,7 @@ PASSES = {
     "slot_swap": slot_swap_pass,
     "slot_retake": slot_retake_pass,
     "undo_drop": undo_drop_pass,
+    "copy_swap": copy_swap_pass,
 }
 
 # Passes that CHANGE the instruction count and so must run BEFORE sigma is derived
