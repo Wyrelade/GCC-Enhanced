@@ -4503,6 +4503,35 @@ def param_copy_pass(stext, tgt):
     return "\n".join(lines)
 
 
+# --------------------------------------------------------------------------
+# selfmove_nop: a register rename (web_realloc) can leave a literal
+# `move R,R` (e.g. the return value copy in a jr slot once the value's web got
+# the return register). It does nothing; retail has a nop there. When the
+# target has no self-move, turn ours into `nop` (count preserving).
+# --------------------------------------------------------------------------
+_SMN_RE = re.compile(r"^(\s*)(?:move\s+(\$\w+)\s*,\s*(\$\w+)|addu\s+(\$\w+)\s*,\s*(\$\w+)\s*,\s*\$(?:0|zero))\s*$")
+
+
+def selfmove_nop_pass(stext, tgt):
+    for _w, d in tgt:
+        p = d.strip().split(None, 1)
+        if len(p) > 1 and p[0].lower() in ("addu", "or", "move"):
+            ops = [norm_reg(x) for x in split_ops(p[1])]
+            if len(ops) >= 2 and ops[0] == ops[1] and (len(ops) == 2 or ops[2] == "zero"):
+                return stext
+    lines = stext.split("\n")
+    changed = False
+    for x, l in enumerate(lines):
+        m = _SMN_RE.match(l.split("#", 1)[0].rstrip())
+        if not m:
+            continue
+        a, b = (m.group(2), m.group(3)) if m.group(2) else (m.group(4), m.group(5))
+        if norm_reg(a) == norm_reg(b):
+            lines[x] = m.group(1) + "nop"
+            changed = True
+    return "\n".join(lines) if changed else stext
+
+
 PASSES = {
     # reg_realloc is applied specially (it needs sigma from words); the ordered
     # list in the manifest still names it so the recipe is explicit and auditable.
@@ -4536,6 +4565,7 @@ PASSES = {
     "zero_cmp": zero_cmp_pass,
     "redundant_skip": redundant_skip_pass,
     "param_copy": param_copy_pass,
+    "selfmove_nop": selfmove_nop_pass,
 }
 
 # Passes that CHANGE the instruction count and so must run BEFORE sigma is derived
