@@ -2690,6 +2690,12 @@ def merge_exits_s(stext):
     ent = ENT_RE.search(stext)
     label = _EXIT_LABEL + ("_" + ent.group(1) if ent else "")
     last_i = rets[-1]
+    # the last return falls into the shared exit only when nothing executable
+    # follows its delay slot; otherwise it stays a jump to the exit
+    after = [x for x in range(last_i + 1, len(lines)) if _s_is_insn(lines[x])
+             and not lines[x].strip().startswith(".")]
+    if len(after) > 1:
+        last_i = None
     out = []
     for i, l in enumerate(lines):
         if i == last_i:
