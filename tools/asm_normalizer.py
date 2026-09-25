@@ -2664,6 +2664,11 @@ def _target_cond_delay_nop(tgt):
     res = []
     for i, (_, dis) in enumerate(tgt):
         if _COND_S.match(dis.split(None, 1)[0].lower()):
+            # the aspsx div-by-zero check (`bnez d,L; nop; break 7`) is not in
+            # the cc1 source (maspsx expands it later): skip it so the k-th
+            # target branch lines up with our k-th source branch
+            if i + 2 < len(tgt) and tgt[i + 2][1].split(None, 1)[0].lower() == "break":
+                continue
             nxt = tgt[i + 1][1] if i + 1 < len(tgt) else ""
             res.append(is_nop(nxt))
     return res
