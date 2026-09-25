@@ -2631,7 +2631,10 @@ def copy_use_pass(stext, tgt):
             li, l = ins[p]
             mn, regs, b = ours[p]
             tregs = tt[bb + q][1]
-            if li in nr or mn == "addu" and _MOVE_S.match(l):
+            # a return's delay slot is the one noreorder insn handled: the
+            # return reads no copy register
+            ret_slot = li in nr and p > 0 and _src_is_ret(ins[p - 1][1])
+            if (li in nr and not ret_slot) or mn == "addu" and _MOVE_S.match(l):
                 continue
             d, u = defs_uses(b)
             diff = [(k, r, t) for k, (r, t) in enumerate(zip(regs, tregs)) if r != t]
@@ -2644,15 +2647,17 @@ def copy_use_pass(stext, tgt):
             z, ok = p - 1, False
             while z >= 0:
                 zi, zl = ins[z]
-                if zi in nr or any(_s_is_label(w) and w.strip()[:-1] in refd
+                if (zi in nr and not (ret_slot and z == p - 1)) or any(_s_is_label(w) and w.strip()[:-1] in refd
                                    for w in lines[zi + 1:ins[z + 1][0]]):
                     break
                 mm = _MOVE_S.match(zl)
-                if mm and norm_reg(mm.group(2)) == x and norm_reg(mm.group(3)) == y:
+                # either direction: after `move x,y` or `move y,x` both hold one value
+                if mm and {norm_reg(mm.group(2)), norm_reg(mm.group(3))} == {x, y}:
                     ok = True
                     break
                 zd, _zu = defs_uses(zl.split("#", 1)[0].strip())
-                if x in zd or y in zd or _src_is_branch(zl) or re.match(r"\s*jalr?\b", zl):
+                if x in zd or y in zd or (_src_is_branch(zl) and not (ret_slot and z == p - 1)) \
+                        or re.match(r"\s*jalr?\b", zl):
                     break
                 z -= 1
             if not ok:
