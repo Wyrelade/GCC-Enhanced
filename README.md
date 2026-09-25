@@ -98,11 +98,12 @@ Phases A, B and the core of C are working.
 The tool was started while decompiling Digimon World 2 (PSX, SLUS-01193), the motivating case
 study, but the method is general to any PSX-era GCC 2.x matching decomp.
 
-Case study status (2026-09-24): 628 of 907 functions (69.24%) of the Digimon World 2 main
-executable are matched and rebuild byte-identical, up from 571 (62.95%) at the start of this
-round. New this round: -G8 compile flavors with gp-relative small data, jump-table binding to
-the retail tables, nodiv, load_remat and copy_use. The gp flavors need a maspsx that parses
-`%gp_rel(sym)($gp)` operands like `%lo` (no macro expansion, no $at).
+Case study status (2026-09-25): 660 of 907 functions (72.77%) of the Digimon World 2 main
+executable are matched and rebuild byte-identical, up from 628 (69.24%) at the start of this
+round. New this round: offset_unfold, slot_unfill (including slot un-stealing), cross_jump,
+zext_keep, taken_fill splitting a symbolic load into its lui half, and -mhard-float compile
+flavors (hf, nosplit_hf, nodb_hf, nosplit_nodb_hf) for library units whose loops keep
+constants in saved registers.
 
 ## Tools
 
