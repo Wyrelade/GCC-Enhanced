@@ -3277,6 +3277,121 @@ def label_nop_pass(stext, tgt):
         lines[ni:ni] = moved
     return "\n".join(lines)
 
+# --------------------------------------------------------------------------
+# offset-unfold: our cc1 folds a constant member offset into the index before
+# the base add (`addu $K,$I,K; addu $Y,$B,$K; sb $r,0($Y)`) where retail keeps
+# the plain element address and carries the offset in every access
+# (`addu $Y,$B,$I; sb $r,K($Y)`). Applies when the folded temp dies at the base
+# add and every later access through $Y is a memory base use. One insn fewer.
+# --------------------------------------------------------------------------
+_ADDI_S = re.compile(r"^(\s*)addi?u\s+(\$\w+)\s*,\s*(\$\w+)\s*,\s*(-?\d+|-?0x[0-9a-fA-F]+)\s*(#.*)?$")
+_ADD3_S = re.compile(r"^(\s*)addu\s+(\$\w+)\s*,\s*(\$\w+)\s*,\s*(\$\w+)\s*(#.*)?$")
+_MEMB_S = re.compile(r"^(\s*)(lb|lbu|lh|lhu|lw|lwl|lwr|sb|sh|sw|swl|swr)\s+(\$\w+)\s*,\s*(-?\d+)\((\$\w+)\)\s*(#.*)?$")
+
+
+def _ou_reads_after(lines, start, reg):
+    """[(line, is_mem_base)] for every instruction after `start` that reads
+    `reg`; None when `reg` is written after `start`."""
+    out = []
+    for j in range(start + 1, len(lines)):
+        l = lines[j]
+        if not _s_is_insn(l):
+            continue
+        body = l.split("#", 1)[0].strip()
+        d, u = defs_uses(body)
+        if reg in u:
+            m = _MEMB_S.match(l)
+            out.append((j, bool(m and norm_reg(m.group(5)) == reg
+                                and (m.group(2) in ("lb", "lbu", "lh", "lhu", "lw", "lwl", "lwr")
+                                     or norm_reg(m.group(3)) != reg))))
+        if reg in d:
+            return None
+    return out
+
+
+def _ou_live(lines, start, reg):
+    """`reg` is read by some instruction after `start` before a write of it
+    (textual order; conservative for the forward-only shapes this pass takes)."""
+    for j in range(start + 1, len(lines)):
+        if not _s_is_insn(lines[j]):
+            continue
+        d, u = defs_uses(lines[j].split("#", 1)[0].strip())
+        if reg in u:
+            return True
+        if reg in d:
+            return False
+    return False
+
+
+def offset_unfold_pass(stext, tgt):
+    lines = stext.split("\n")
+    changed = True
+    any_change = False
+    while changed:
+        changed = False
+        for a, la in enumerate(lines):
+            ma = _ADDI_S.match(la) if _s_is_insn(la) else None
+            if not ma:
+                continue
+            k, i = norm_reg(ma.group(2)), norm_reg(ma.group(3))
+            imm = int(ma.group(4), 0)
+            if k in (None, "zero", "sp", "gp") or i in (None, "zero", "sp", "gp") or not imm:
+                continue
+            # the base add on the same straight line, k and i unchanged between
+            b, slot = None, False
+            for j in range(a + 1, len(lines)):
+                l = lines[j]
+                if _s_is_label(l) and not l.strip().startswith("LM"):
+                    break
+                if not _s_is_insn(l) or re.match(r"\s*\.", l):
+                    continue
+                mb = _ADD3_S.match(l)
+                body = l.split("#", 1)[0].strip()
+                d, u = defs_uses(body)
+                if mb and k in (norm_reg(mb.group(3)), norm_reg(mb.group(4))):
+                    b = j
+                    break
+                if slot or k in u or k in d or i in d:
+                    break
+                # a conditional branch's delay slot (noreorder) runs on both paths
+                if _src_is_branch(l) and j in _noreorder_lines(lines) and \
+                        re.match(r"\s*(beq|bne|blez|bgtz|bltz|bgez|beqz|bnez)\b", l):
+                    slot = True
+                    continue
+                if _src_is_branch(l) or _src_is_ret(l) or re.match(r"\s*jalr?\b", l):
+                    break
+            if b is None:
+                continue
+            mb = _ADD3_S.match(lines[b])
+            y = norm_reg(mb.group(2))
+            o1, o2 = norm_reg(mb.group(3)), norm_reg(mb.group(4))
+            base = o2 if o1 == k else o1
+            if base == k or y in (None, "zero"):
+                continue
+            # k dies at the base add (unless the add rewrites it)
+            if y != k and _ou_live(lines, b, k):
+                continue
+            ry = _ou_reads_after(lines, b, y)
+            if not ry or not all(mem for _j, mem in ry):
+                continue
+            if any(not -0x8000 <= int(_MEMB_S.match(lines[j]).group(4)) + imm < 0x8000
+                   for j, _m in ry):
+                continue
+            for j, _m in ry:
+                m = _MEMB_S.match(lines[j])
+                lines[j] = "%s%s\t%s,%d(%s)%s" % (m.group(1), m.group(2), m.group(3),
+                                                  int(m.group(4)) + imm, m.group(5),
+                                                  (" " + m.group(6)) if m.group(6) else "")
+            src_i = ma.group(3)
+            lines[b] = "%saddu\t%s,%s,%s%s" % (mb.group(1), mb.group(2),
+                                                mb.group(3) if o1 != k else src_i,
+                                                mb.group(4) if o2 != k else src_i,
+                                                (" " + mb.group(5)) if mb.group(5) else "")
+            del lines[a]
+            changed = any_change = True
+            break
+    return "\n".join(lines) if any_change else stext
+
 
 PASSES = {
     # reg_realloc is applied specially (it needs sigma from words); the ordered
@@ -3302,6 +3417,7 @@ PASSES = {
     "fallthrough_fill": fallthrough_fill_pass,
     "taken_fill": taken_fill_pass,
     "dead_code": dead_code_pass,
+    "offset_unfold": offset_unfold_pass,
 }
 
 # Passes that CHANGE the instruction count and so must run BEFORE sigma is derived
@@ -3309,7 +3425,8 @@ PASSES = {
 # such pass listed in a recipe is applied ahead of reg_realloc regardless of the
 # manifest order; the rest keep their listed order after sigma.
 PRE_SIGMA_PASSES = ("un_hi_cse", "un_hi_cse_store", "exit_merge", "base_cse_collapse",
-                    "shift_const_fold", "zero_remat", "load_remat", "nodiv")
+                    "shift_const_fold", "zero_remat", "load_remat", "nodiv",
+                    "offset_unfold")
 
 # --------------------------------------------------------------------------
 # WORD-LEVEL passes. The original PSY-Q assembler (aspsx) scheduled branch and
