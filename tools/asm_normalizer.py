@@ -3392,6 +3392,73 @@ def offset_unfold_pass(stext, tgt):
             break
     return "\n".join(lines) if any_change else stext
 
+# --------------------------------------------------------------------------
+# slot-unfill: our reorg fills a conditional branch's delay slot with a
+# constant load from before the branch where retail leaves that slot empty and
+# keeps the constant at the head of the block (retail's reorg later steals it
+# into the slots of the branches ENTERING that block: taken_fill /
+# fallthrough_fill redo that part). Target-guided by conditional-branch
+# ordinal: only a slot the target leaves as a nop. The constant moves up to
+# just after the block's label when nothing in between touches its register.
+# --------------------------------------------------------------------------
+_SU_CONST = re.compile(r"^\s*(li|lui)\s+(\$\w+)\s*,\s*[-\w()%>< ]+\s*(#.*)?$")
+
+
+def slot_unfill_pass(stext, tgt):
+    lines = stext.split("\n")
+    tb = []
+    for k, (_w, d) in enumerate(tgt):
+        mn = d.strip().split(None, 1)[0] if d.strip() else ""
+        if mn in _COND_BR_MN:
+            tb.append(is_nop(tgt[k + 1][1].strip()) if k + 1 < len(tgt) else False)
+    ob = [j for j, l in enumerate(lines) if _s_is_insn(l)
+          and not re.match(r"\s*\.", l) and _src_is_branch(l)
+          and re.match(r"\s*(beq|bne|blez|bgtz|bltz|bgez|beqz|bnez)\b", l)]
+    if len(ob) != len(tb):
+        return stext
+    nr = _noreorder_lines(lines)
+    changed = False
+    for n in range(len(ob) - 1, -1, -1):
+        j = ob[n]
+        if not tb[n] or j not in nr:
+            continue
+        s = next((x for x in range(j + 1, len(lines)) if _s_is_insn(lines[x])
+                  and not re.match(r"\s*\.", lines[x])), None)
+        if s is None or s not in nr:
+            continue
+        m = _SU_CONST.match(lines[s])
+        if not m:
+            continue
+        body = lines[s].split("#", 1)[0].strip()
+        d, u = defs_uses(body)
+        if u or len(d) != 1:
+            continue
+        x = next(iter(d))
+        # walk back to the block label
+        head, ok = None, True
+        for q in range(j - 1, -1, -1):
+            l = lines[q]
+            if _s_is_label(l) and not l.strip().startswith("LM"):
+                head = q
+                break
+            if not _s_is_insn(l) or re.match(r"\s*\.", l):
+                continue
+            if _src_is_branch(l) or _src_is_ret(l) or re.match(r"\s*jalr?\b", l):
+                ok = False
+                break
+            dd, uu = defs_uses(l.split("#", 1)[0].strip())
+            if x in dd or x in uu:
+                ok = False
+                break
+        if not ok or head is None:
+            continue
+        ind = lines[s][:len(lines[s]) - len(lines[s].lstrip())]
+        const = lines[s]
+        lines[s] = ind + "nop"
+        lines.insert(head + 1, const)
+        changed = True
+    return "\n".join(lines) if changed else stext
+
 
 PASSES = {
     # reg_realloc is applied specially (it needs sigma from words); the ordered
@@ -3418,6 +3485,7 @@ PASSES = {
     "taken_fill": taken_fill_pass,
     "dead_code": dead_code_pass,
     "offset_unfold": offset_unfold_pass,
+    "slot_unfill": slot_unfill_pass,
 }
 
 # Passes that CHANGE the instruction count and so must run BEFORE sigma is derived
