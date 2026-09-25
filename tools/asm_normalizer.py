@@ -4195,6 +4195,15 @@ def _zc_dead_after(lines, ins, slot_line, reg):
         if _src_is_ret(l):
             return reg not in _FF_RET_LIVE
         if _src_is_branch(l):
+            # a noreorder slot runs before the transfer on both paths
+            if x in _noreorder_lines(lines):
+                sl = _tf_next_insn(lines, x)
+                if sl is not None:
+                    sd, su = defs_uses(lines[sl].split("#", 1)[0].strip())
+                    if reg in su:
+                        return False
+                    if reg in sd:
+                        return True
             lab = re.search(r"(\$L\w+)\s*$", body)
             if not lab or not _ff_dead_on(lines, ins, lab.group(1), reg):
                 return False
@@ -4722,6 +4731,93 @@ def slot_swap_pass(stext, tgt):
     return "\n".join(lines) if changed else stext
 
 
+# --------------------------------------------------------------------------
+# slot_retake: both reorgs fill a conditional branch slot from the taken
+# thread, but pick a different insn because the block order differs: ours
+# `beq v0,$0,L; X` (X was the thread head, L now after it), retail takes a
+# later thread insn Y. Put X back at the thread head (L must have no other
+# entrant), move Y (pure ALU, independent of the thread insns it passes) into
+# the slot. X and Y dests must be dead on the fall-through (X no longer runs
+# there, Y now does). sched_match then orders the block. Count preserving.
+# --------------------------------------------------------------------------
+def slot_retake_pass(stext, tgt):
+    if not tgt:
+        return stext
+    tb = [k for k, (_w, d) in enumerate(tgt) if d.split(None, 1)[0].lower() in _COND_BR_MN]
+    lines = stext.split("\n")
+    if len(_tf_branches(lines)) != len(tb):
+        return stext
+    changed = False
+    for k in range(len(tb)):
+        ours = _tf_branches(lines)
+        if len(ours) != len(tb):
+            break
+        bi, nr = ours[k]
+        tk = tb[k]
+        if not nr or tk + 1 >= len(tgt):
+            continue
+        si = _tf_next_insn(lines, bi)
+        if si is None:
+            continue
+        xb = lines[si].split("#", 1)[0].strip()
+        fx = _ff_word_form(xb)
+        tkey = _sm_key(tgt[tk + 1][1].strip(), True)
+        if fx is None or _sm_key(fx, False) == tkey or tkey in (("nop",), ("sll", "zero", "zero", 0)):
+            continue
+        lab = re.search(r"(\$L\w+)\s*$", lines[bi].split("#", 1)[0])
+        if not lab:
+            continue
+        ins = [(i, l) for i, l in enumerate(lines) if _s_is_insn(l)]
+        if not _tf_sole_entrant(lines, lab.group(1)):
+            continue
+        at = next((y for y, l in enumerate(lines) if l.strip() == lab.group(1) + ":"), None)
+        if at is None:
+            continue
+        # scan the thread's straight line for Y
+        passed, yi = [], None
+        for y in range(at + 1, len(lines)):
+            l = lines[y]
+            if _s_is_label(l) and not l.strip().startswith("LM"):
+                break
+            if not _s_is_insn(l) or l.strip().startswith("."):
+                continue
+            if _src_is_branch(l) or _src_is_ret(l) or re.match(r"\s*jalr?\b", l):
+                break
+            b = l.split("#", 1)[0].strip()
+            fy = _ff_word_form(b)
+            if fy is not None and _sm_key(fy, False) == tkey:
+                yi = y
+                break
+            passed.append(b)
+            if len(passed) > 6:
+                break
+        if yi is None:
+            continue
+        fy = _ff_word_form(lines[yi].split("#", 1)[0].strip())
+        yd, yu = defs_uses(fy)
+        xd, xu = defs_uses(fx)
+        if set(yd) & (set(xd) | set(xu)) or set(xd) & set(yu):
+            continue
+        ok = True
+        for b in passed:
+            d, u = defs_uses(b)
+            if set(yd) & (set(d) | set(u)) or set(yu) & set(d):
+                ok = False
+                break
+        if not ok:
+            continue
+        if not all(_zc_dead_after(lines, ins, si, r) for r in set(yd) | set(xd)):
+            continue
+        ind = _src_indent(lines[si])
+        new = list(lines)
+        del new[yi]
+        new[si] = ind + fy
+        new.insert(at + 1, ind + fx)
+        lines = new
+        changed = True
+    return "\n".join(lines) if changed else stext
+
+
 PASSES = {
     # reg_realloc is applied specially (it needs sigma from words); the ordered
     # list in the manifest still names it so the recipe is explicit and auditable.
@@ -4757,6 +4853,7 @@ PASSES = {
     "param_copy": param_copy_pass,
     "selfmove_nop": selfmove_nop_pass,
     "slot_swap": slot_swap_pass,
+    "slot_retake": slot_retake_pass,
 }
 
 # Passes that CHANGE the instruction count and so must run BEFORE sigma is derived
