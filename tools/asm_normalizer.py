@@ -4985,12 +4985,15 @@ ALT_FLAVORS = {
     # FP registers not fixed: loop.c hoists more loop constants into s-regs
     "hf": ["-mhard-float"],
     "nosplit_hf": ["-mno-split-addresses", "-mhard-float"],
+    "nodb_hf": ["-fno-delayed-branch", "-mhard-float"],
+    "nosplit_nodb_hf": ["-mno-split-addresses", "-fno-delayed-branch", "-mhard-float"],
 }
 META_PASSES = tuple(ALT_FLAVORS)
 # local-label prefix per alternate compile (nosplit keeps the historical "ns")
 _ALT_TAG = {"nosplit": "ns", "nosplit_nodb": "nsnd", "nodb": "nd", "gp8": "gp",
             "gp8_nosplit": "gpns",
-            "gp8_nosplit_noskip": "gpnk", "hf": "hf", "nosplit_hf": "nshf"}
+            "gp8_nosplit_noskip": "gpnk", "hf": "hf", "nosplit_hf": "nshf",
+            "nodb_hf": "ndhf", "nosplit_nodb_hf": "nsndhf"}
 
 
 def alt_flavors(manifest):
