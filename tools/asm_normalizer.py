@@ -1694,8 +1694,36 @@ def fallthrough_fill_pass(stext, tgt):
         ind = _src_indent(lines[bi])
         del lines[fi]
         lines[bi:bi + 1] = [ind + ".set\tnoreorder", ind + ".set\tnomacro",
-                            lines[bi], ind + form, ind + ".set\tmacro",
+                            lines[bi], ind + form + "\t# ffdup", ind + ".set\tmacro",
                             ind + ".set\treorder"]
+    return _ff_skip_dup("\n".join(lines))
+
+
+def _ff_skip_dup(stext):
+    """A branch whose slot got X from the fall-through, while its taken arm starts
+    with the same X: retarget it past that copy (X already ran in the slot)."""
+    lines = stext.split("\n")
+    n = 0
+    for x in range(len(lines)):
+        if not lines[x].rstrip().endswith("# ffdup"):
+            continue
+        form = lines[x].split("#", 1)[0].strip()
+        lines[x] = lines[x].split("#", 1)[0].rstrip()
+        bi = max(y for y in range(x) if _s_is_insn(lines[y]) and not lines[y].strip().startswith("."))
+        lab = re.search(r"(\$L\w+)\s*$", lines[bi].split("#", 1)[0])
+        if not lab:
+            continue
+        at = next((y for y, l in enumerate(lines) if l.strip() == lab.group(1) + ":"), None)
+        xi = _tf_next_insn(lines, at) if at is not None else None
+        if xi is None or xi in _noreorder_lines(lines) or any(
+                _join_label(lines, y) for y in range(at + 1, xi)):
+            continue
+        if _ff_word_form(lines[xi].split("#", 1)[0].strip()) != form:
+            continue
+        n += 1
+        nl_ = "$Lfd%d_%d" % (bi, n)
+        lines[bi] = lines[bi][:lines[bi].rindex(lab.group(1))] + nl_
+        lines.insert(xi + 1, nl_ + ":")
     return "\n".join(lines)
 
 
@@ -1882,6 +1910,16 @@ def _jnext_drop(stext):
     return "\n".join(lines) if changed else stext
 
 
+def _join_label(lines, y):
+    """Line y is a label some real insn (not a directive) references: a control-flow
+    join, unlike cc1's `LMn` line markers and `$Lb/$Le` debug block labels."""
+    if not _s_is_label(lines[y]):
+        return False
+    pat = re.compile(r"(?<![\w$.])" + re.escape(lines[y].strip()[:-1]) + r"(?![\w$])")
+    return any(pat.search(l.split("#", 1)[0]) for l in lines
+               if _s_is_insn(l) and not l.strip().startswith("."))
+
+
 def _j_steal(stext, tgt):
     """`j L` (reorder mode, or noreorder with a nop slot) -> `j L'; X` with X the
     first insn of L's block and L' a new label right after X, when the target's
@@ -1910,8 +1948,7 @@ def _j_steal(stext, tgt):
         if at is None:
             continue
         xi = _tf_next_insn(lines, at)
-        if xi is None or xi in nr or any(_s_is_label(lines[y]) and not lines[y].strip().startswith("LM")
-                                         and lines[y].strip() != lab + ":" for y in range(at + 1, xi)):
+        if xi is None or xi in nr or any(_join_label(lines, y) for y in range(at + 1, xi)):
             continue
         xb = lines[xi].split("#", 1)[0].strip()
         form = _ff_word_form(xb)
@@ -2139,6 +2176,12 @@ def _taken_fill_core(stext, tgt):
         if len(d) != 1:
             continue
         reg = next(iter(d))
+        # both arms start with this insn: retail fills from the fall-through and
+        # skips the taken copy (fallthrough_fill does that)
+        fh = _tf_next_insn(lines, slot if slot is not None else bi)
+        if fh is not None and not any(_join_label(lines, y) for y in range((slot or bi) + 1, fh)) \
+                and _ff_word_form(lines[fh].split("#", 1)[0].strip()) == form:
+            continue
         # the moved insn now also runs on the fall-through path: its destination
         # must be dead there (probe label right after the branch / its slot)
         probe = list(lines)
@@ -2314,8 +2357,9 @@ def _taken_fill_core(stext, tgt):
 # --------------------------------------------------------------------------
 def _dc_referenced(lines, name):
     pat = re.compile(r"(?<![\w$.])" + re.escape(name) + r"(?![\w$])")
+    # `.begin`/`.bend` debug-block markers name `$Lb`/`$Le` labels: not joins
     return any(pat.search(l.split("#", 1)[0]) for l in lines
-               if l.strip() != name + ":")
+               if l.strip() != name + ":" and not re.match(r"\s*\.(begin|bend)\b", l))
 
 
 def dead_code_pass(stext, tgt):
