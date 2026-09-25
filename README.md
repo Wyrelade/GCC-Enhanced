@@ -98,13 +98,14 @@ Phases A, B and the core of C are working.
 The tool was started while decompiling Digimon World 2 (PSX, SLUS-01193), the motivating case
 study, but the method is general to any PSX-era GCC 2.x matching decomp.
 
-Case study status (2026-09-25): 721 of 907 functions (79.49%) of the Digimon World 2 main
-executable are matched and rebuild byte-identical, up from 691 (76.19%) at the start of this
-round. New this round: mask_reuse (an andi reads the zero-extended copy the target keeps),
-zero_cmp (slt+beqz against a register known zero on the path), redundant_skip (a branch
-retargeted past a redundant taken-thread load), param_copy (argument copies at entry, with a
-register swap mode), selfmove_nop, slot_swap and slot_retake (delay slot choice), liveness past
-calls for callee-saved registers, and exit_merge ignoring the assembler div-by-zero checks.
+Case study status (2026-09-26): 740 of 907 functions (81.59%) of the Digimon World 2 main
+executable are matched and rebuild byte-identical, up from 721 (79.49%) at the start of this
+round. New this round: undo_drop (a dead compensating decrement after a slot increment),
+copy_swap (a zero constant and its copy trade registers), taken_fill filling an empty jump slot
+from the target and dropping a jump to the next insn, fallthrough_fill skipping the taken copy
+of an insn both arms start with, slot_unfill putting stolen block heads back, copy_use in both
+directions, zext_keep into another register, a sched_match la unit, and exit_merge keeping a
+mid-function return as a jump.
 
 ## Tools
 
