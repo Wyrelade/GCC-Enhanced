@@ -3729,11 +3729,19 @@ def _tgt_div_check(tgt, k):
 
 def slot_unfill_pass(stext, tgt):
     lines = stext.split("\n")
-    tb, tfall = [], []
+    tb, tfall, thead = [], [], []
     for k, (_w, d) in enumerate(tgt):
         mn = d.strip().split(None, 1)[0] if d.strip() else ""
         if mn in _COND_BR_MN and not _tgt_div_check(tgt, k):
             tb.append(is_nop(tgt[k + 1][1].strip()) if k + 1 < len(tgt) else False)
+            # key of the first insn at the branch target (16-bit word offset)
+            try:
+                off = int(_w, 16) if isinstance(_w, str) else int(_w)
+                off = (off & 0xFFFF) - ((off & 0x8000) << 1)
+                ti = k + 1 + off
+                thead.append(_sm_key(tgt[ti][1].strip(), True) if 0 <= ti < len(tgt) else None)
+            except (TypeError, ValueError):
+                thead.append(None)
             # keys of the target's straight-line fall-through after the slot
             keys = set()
             for _w2, d2 in tgt[k + 2:]:
@@ -3764,6 +3772,22 @@ def slot_unfill_pass(stext, tgt):
         # Retail branches onto that copy and leaves its own slot empty.
         lab = re.search(r"(\$L\w+)\s*$", lines[j].split("#", 1)[0])
         tl = next((x for x, l in enumerate(lines) if lab and l.strip() == lab.group(1) + ":"), None)
+        # stolen and deleted from a sole-entrant taken block whose head the
+        # target keeps: X goes back to the head of that block
+        if (tl is not None and thead[n] is not None and len(d) == 1
+                and _ff_word_form(body) is not None
+                and _sm_key(_ff_word_form(body), False) == thead[n]
+                and _tf_sole_entrant(lines, lab.group(1))):
+            xi = _tf_next_insn(lines, tl)
+            xb = lines[xi].split("#", 1)[0].strip() if xi is not None else ""
+            ins_ = [(i, l) for i, l in enumerate(lines) if _s_is_insn(l)]
+            if xb.split() != body.split() and _zc_dead_after(lines, ins_, s, next(iter(d))):
+                ind = lines[s][:len(lines[s]) - len(lines[s].lstrip())]
+                xl = lines[s]
+                lines[s] = ind + "nop"
+                lines.insert(tl + 1, xl)
+                changed = True
+                continue
         if tl is not None:
             pc = next((x for x in range(tl - 1, -1, -1) if _s_is_insn(lines[x])
                        or (_s_is_label(lines[x]) and not lines[x].strip().startswith("LM"))), None)
