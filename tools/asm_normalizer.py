@@ -1183,6 +1183,13 @@ def _sm_units(lines, ins, la_tmp=None):
                         prev_br = False
                         i = j + 1
                         continue
+                    if (la_tmp is not None and m3 and idx is None
+                            and m3.group(2) == mh.group(1) and m3.group(3) == mh.group(2)
+                            and m3.group(1) == mh.group(1)):
+                        cur.append((i, j, "la\t%s,%s" % (m3.group(1), m3.group(3))))
+                        prev_br = False
+                        i = j + 1
+                        continue
                     m2 = re.match(r"(\w+)\s+(\$\w+)\s*,\s*%lo\(([^)]+)\)\((\$\w+)\)$", b2)
                     if (m2 and m2.group(3) == mh.group(2) and m2.group(4) == mh.group(1)
                             and m2.group(2) == mh.group(1)
@@ -3549,12 +3556,70 @@ def _su_shape(key):
     return tuple(k if i == 0 or not isinstance(k, str) else "r" for i, k in enumerate(key))
 
 
+def _s_void(lines):
+    """cc1 marks a void function `.type 0x21` in its COFF `.def`."""
+    return any(re.search(r"\.def\s+\w+;\s*\.val\s+\w+;\s*\.scl\s+2;\s*\.type\s+0x21;", l)
+               for l in lines)
+
+
+def _su_rehome(lines, j, s, pb, pc, tl, label, ob, tb, nr):
+    """Branch j (slot s) and the branch pb before label L (slot pc) both carry a
+    copy X of L's thread head, and L has no other entrant: when the target leaves
+    both slots empty, X goes back to the head of L. X must be one word and not
+    read what it writes; its destination must be dead where X no longer runs
+    (j's fall-through, pb's taken target). The span has no COFF `.def`, so a
+    return counts as reading $v0 unless X is a `lui %hi` half."""
+    if pb not in ob or not tb[ob.index(pb)] or pb not in nr:
+        return False
+    pat = re.compile(re.escape(label) + r"(?![\w$])")
+    if sum(len(pat.findall(l.split("#", 1)[0])) for x, l in enumerate(lines) if x != tl) != 1:
+        return False
+    body = lines[s].split("#", 1)[0].strip()
+    if _ff_word_form(body) is None and not _SU_CONST.match(lines[s]):
+        return False
+    d, u = defs_uses(body)
+    if len(d) != 1 or set(d) & set(u):
+        return False
+    x = next(iter(d))
+    lb = re.search(r"(\$L\w+)\s*$", lines[pb].split("#", 1)[0])
+    if not lb:
+        return False
+    ins = [(i, l) for i, l in enumerate(lines) if _s_is_insn(l)]
+    global _FF_RET_LIVE
+    keep = _FF_RET_LIVE
+    try:
+        # a lone `lui R,%hi(S)` is an address half, never a return value
+        if _s_void(lines) or re.match(r"lui\s+\$\w+\s*,\s*%hi\(", body):
+            _FF_RET_LIVE = keep - {x}
+        if not _zc_dead_after(lines, ins, s, x) or not _ff_dead_on(lines, ins, lb.group(1), x):
+            return False
+    finally:
+        _FF_RET_LIVE = keep
+    ind = lines[s][:len(lines[s]) - len(lines[s].lstrip())]
+    xl = lines[s]
+    lines[s] = ind + "nop"
+    lines[pc] = ind + "nop"
+    lines.insert(tl + 1, xl)
+    return True
+
+
+def _tgt_div_check(tgt, k):
+    """Target word k is a branch of an aspsx div/rem check expansion (`bnez d,L;
+    nop; break 7` and the signed `bne d,$at,L` / `bne s,$at,L` overflow checks),
+    which the cc1 source does not contain."""
+    d = tgt[k][1].strip()
+    if re.search(r"[\s,]\$?at\b", d.split(None, 1)[1] if len(d.split(None, 1)) > 1 else ""):
+        return True
+    return any(k + x < len(tgt) and tgt[k + x][1].split(None, 1)[0].lower() == "break"
+               for x in (2,))
+
+
 def slot_unfill_pass(stext, tgt):
     lines = stext.split("\n")
     tb, tfall = [], []
     for k, (_w, d) in enumerate(tgt):
         mn = d.strip().split(None, 1)[0] if d.strip() else ""
-        if mn in _COND_BR_MN:
+        if mn in _COND_BR_MN and not _tgt_div_check(tgt, k):
             tb.append(is_nop(tgt[k + 1][1].strip()) if k + 1 < len(tgt) else False)
             # keys of the target's straight-line fall-through after the slot
             keys = set()
@@ -3606,6 +3671,8 @@ def slot_unfill_pass(stext, tgt):
                     if not (mo and mp and _TF_INV.get(mo.group(1)) == mp.group(1)
                             and sorted(norm_reg(r) for r in split_ops(mo.group(2)))
                             == sorted(norm_reg(r) for r in split_ops(mp.group(2)))):
+                        if _su_rehome(lines, j, s, pb, pc, tl, lab.group(1), ob, tb, nr):
+                            changed = True
                         continue
                 lines[s] = ind + "nop"
                 lines[j] = lines[j][:lines[j].rindex(lab.group(1))] + nl_
