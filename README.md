@@ -98,16 +98,16 @@ Phases A, B and the core of C are working.
 The tool was started while decompiling Digimon World 2 (PSX, SLUS-01193), the motivating case
 study, but the method is general to any PSX-era GCC 2.x matching decomp.
 
-Case study status (2026-09-26): 771 of 907 functions (85.01%) of the Digimon World 2 main
-executable are matched and rebuild byte-identical, up from 750 (82.69%) at the start of this
-round. New this round: block_iso (a straight-line block with the target's dataflow but a
-different order and temporaries is rewritten to the target's form), slot_unsteal (a loop counter
-update kept in the body instead of the back branch slot), sreg_swap (a transposition of two
-callee-saved registers followed by web renaming), licm_li (a loop-head constant hoisted into the
-preheader), la_unfold for stores, flavors without the second scheduling pass, a compare against
-an immediate zero, a taken_fill form for jumps left in noreorder groups, accesses to distinct
-named objects treated as disjoint by the schedulers, and a fix that stops a divide trap from
-being counted as a branch.
+Case study status (2026-09-26): 785 of 907 functions (86.55%) of the Digimon World 2 main
+executable are matched and rebuild byte-identical, up from 771 (85.01%) at the start of this
+round. New this round: the assembler wrapper expands a large constant-offset load through its
+own destination register like the original assembler, sra_keep (an arithmetic shift of a
+zero-extended value), ior_add (an or of disjoint bit fields kept as an add), call_slot_sink (a
+callee-saved constant moved from a call slot to the next jump slot), giv_rebase (an induction
+base derived from the register just set from the same source), the pre-sigma scheduler pairing
+symbolic loads whose temporaries differ, callee-saved renaming that includes $fp and tries
+rotations of three registers, constant folding past conditional branches, and a callee argument
+read analysis that follows the callee's control flow instead of single blocks.
 
 ## Tools
 
