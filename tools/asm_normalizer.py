@@ -3543,6 +3543,69 @@ def web_realloc_pass(stext, tgt):
 
 
 # --------------------------------------------------------------------------
+# const_fold: `li $t,K ... addu $r,$b,$t` where retail folded the constant into
+# the add (`addiu $r,$b,K`; the li stays for $t's other uses). Our cc1 keeps the
+# register form when $t is a loop counter initialised to K (a giv init from a
+# biv). Target-guided: fires only while the target has more `addiu x,y,K` (y
+# not $zero/$sp) than we do. Straight line only; $t and $b not written in
+# between. Count-preserving.
+# --------------------------------------------------------------------------
+_CF_LI = re.compile(r"^(\s*)li\s+(\$\w+)\s*,\s*(-?(?:0x[0-9a-fA-F]+|\d+))\s*(#.*)?$")
+_CF_ADDU = re.compile(r"^(\s*)addu\s+(\$\w+)\s*,\s*(\$\w+)\s*,\s*(\$\w+)\s*(#.*)?$")
+
+
+def _cf_count(bodies, k):
+    n = 0
+    for b in bodies:
+        mn, regs, sk = insn_parts(b)
+        if mn == "addiu" and len(regs) == 2 and regs[1] not in ("zero", "sp") \
+                and _sm_int(sk[-1]) == k:
+            n += 1
+    return n
+
+
+def const_fold_pass(stext, tgt):
+    if not tgt:
+        return stext
+    lines = stext.split("\n")
+    nr = _noreorder_lines(lines)
+    tb = [d.strip() for _w, d in tgt]
+    changed = False
+    for i, l in enumerate(lines):
+        m = _CF_LI.match(l)
+        if not m or i in nr:
+            continue
+        t, k = norm_reg(m.group(2)), int(m.group(3), 0)
+        if not (-0x8000 <= k < 0x8000) or t in (None, "zero", "at"):
+            continue
+        for j in range(i + 1, len(lines)):
+            lj = lines[j]
+            if _join_label(lines, j):
+                break
+            if not _s_is_insn(lj) or lj.strip().startswith("."):
+                continue
+            body = lj.split("#", 1)[0].strip()
+            ma = _CF_ADDU.match(lj)
+            if ma and j not in nr and t in (norm_reg(ma.group(3)), norm_reg(ma.group(4))) \
+                    and norm_reg(ma.group(3)) != norm_reg(ma.group(4)):
+                b = ma.group(4) if norm_reg(ma.group(3)) == t else ma.group(3)
+                if norm_reg(b) in ("zero", "sp"):
+                    break
+                ours = [x.split("#", 1)[0].strip() for x in lines if _s_is_insn(x)
+                        and not x.strip().startswith(".")]
+                if _cf_count(tb, k) <= _cf_count(ours, k):
+                    break
+                lines[j] = "%saddiu\t%s,%s,%d" % (ma.group(1), ma.group(2), b, k)
+                changed = True
+                break
+            if _src_is_branch(lj) or _src_is_ret(lj) or re.match(r"\s*jalr?\b", lj):
+                break
+            if t in defs_uses(body)[0]:
+                break
+    return "\n".join(lines) if changed else stext
+
+
+# --------------------------------------------------------------------------
 # web_resched: web_realloc then sched_match again, run after sched_match. A load
 # the target hoists above a store can be stuck twice over: its destination is the
 # register the store's base lives in (a true dependence), and the target's
@@ -5351,6 +5414,7 @@ PASSES = {
     "ra_restore_sink": ra_restore_sink_pass,
     "sched_match": sched_match_pass,
     "web_resched": web_resched_pass,
+    "const_fold": const_fold_pass,
     "fallthrough_fill": fallthrough_fill_pass,
     "taken_fill": taken_fill_pass,
     "dead_code": dead_code_pass,
