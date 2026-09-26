@@ -1628,6 +1628,135 @@ def _bi_mem_indep(mx, my, bx, by):
     return False
 
 
+# --------------------------------------------------------------------------
+# slot_unsteal: cc1's reorg fills a backward loop branch's slot with the loop
+# counter update it takes from the loop's compare entry (`j Lx; INC` enters the
+# loop, the body falls into `Lx: C; bc Lbody; INC`). Retail keeps INC at the end
+# of the body, right before Lx, and fills the branch slot from the fall-through
+# (the next jump's slot insn), leaving that jump with a nop. Target-guided (the
+# target's slot is not INC and INC sits right before the target's compare).
+# Semantics: Lbody is entered only by this branch (no fall-in, one reference) and
+# the body Lbody..Lx neither reads nor writes INC's registers, so INC after the
+# body equals INC before it; INC's destination is dead on the fall-through; the
+# hoisted slot insn's destination is dead on the taken path.
+# --------------------------------------------------------------------------
+def _us_dead_ft(lines, ins, j, reg):
+    """`reg` is dead on the straight line starting after line j (a return
+    reads only $v0 and the callee-saved registers; `j L` follows the label)."""
+    k = j
+    while True:
+        k = _tf_next_insn(lines, k)
+        if k is None:
+            return False
+        body = lines[k].split("#", 1)[0].strip()
+        if _src_is_ret(lines[k]):
+            sl = _tf_next_insn(lines, k)
+            if sl is not None and sl in _noreorder_lines(lines) and \
+                    reg in defs_uses(lines[sl].split("#", 1)[0].strip())[1]:
+                return False
+            return reg not in _FF_RET_LIVE
+        mj = re.match(r"j\s+(\$L\w+)\s*$", body)
+        if mj:
+            sl = _tf_next_insn(lines, k)
+            if sl is not None and sl in _noreorder_lines(lines):
+                d, u = defs_uses(lines[sl].split("#", 1)[0].strip())
+                if reg in u:
+                    return False
+                if reg in d:
+                    return True
+            return _ff_dead_on(lines, ins, mj.group(1), reg)
+        if _src_is_branch(lines[k]) or re.match(r"\s*jalr?\b", lines[k]):
+            return False
+        d, u = defs_uses(_sm_dep_body(body))
+        if reg in u:
+            return False
+        if reg in d:
+            return True
+
+
+def slot_unsteal_pass(stext, tgt):
+    if not tgt:
+        return stext
+    tb = _tgt_cond_branches(tgt, stext)
+    lines = stext.split("\n")
+    ours = _tf_branches(lines)
+    if len(ours) != len(tb):
+        return stext
+    for k in range(len(ours)):
+        ours = _tf_branches(lines)
+        bi, nr = ours[k]
+        tk = tb[k]
+        if not nr or tk + 1 >= len(tgt):
+            continue
+        mb = re.match(r"\s*\w+\s+.*,\s*(\$L\w+)\s*$", lines[bi].split("#", 1)[0])
+        si = _tf_next_insn(lines, bi)
+        nrs = _noreorder_lines(lines)
+        if not mb or si is None or si not in nrs:
+            continue
+        lbody = mb.group(1)
+        inc = _ff_word_form(lines[si].split("#", 1)[0].strip())
+        if inc is None:
+            continue
+        d, u = defs_uses(inc)
+        if len(d) != 1:
+            continue
+        r = next(iter(d))
+        ik = _sm_key(inc, False)
+        if _sm_key(tgt[tk + 1][1].strip(), True) == ik:
+            continue
+        if not any(_sm_key(tgt[q][1].strip(), True) == ik for q in range(max(0, tk - 3), tk)):
+            continue
+        lb = next((y for y in range(bi) if lines[y].strip() == lbody + ":"), None)
+        if lb is None:
+            continue
+        refs = sum(1 for y, l in enumerate(lines) if _s_is_insn(l) and re.search(
+            re.escape(lbody) + r"\b", l.split("#", 1)[0]))
+        if refs != 1:
+            continue
+        # no fall-in: the insn before Lbody is the slot of an unconditional jump
+        ins = [(i, l) for i, l in enumerate(lines) if _s_is_insn(l)]
+        prev = [i for i, _l in ins if i < lb]
+        if len(prev) < 2 or prev[-1] not in nrs or not re.match(
+                r"\s*(j|b)\s", lines[prev[-2]]):
+            continue
+        labs = [y for y in range(lb + 1, bi) if re.match(r"\s*\$L\w+:", lines[y])]
+        if len(labs) != 1:
+            continue
+        lx = labs[0]
+        body = [y for y in range(lb + 1, lx) if _s_is_insn(lines[y])]
+        regs = set(d) | set(u)
+        if not body or any(_src_is_branch(lines[y]) or re.match(r"\s*jalr?\b", lines[y])
+                           or regs & (set(defs_uses(_sm_dep_body(
+                               lines[y].split("#", 1)[0].strip()))[0])
+                               | set(defs_uses(_sm_dep_body(
+                                   lines[y].split("#", 1)[0].strip()))[1]))
+                           for y in body):
+            continue
+        if not _us_dead_ft(lines, ins, si, r):
+            continue
+        new = list(lines)
+        new[si] = _src_indent(lines[si]) + "nop"
+        # refill from the fall-through: the next jump's slot insn, when the
+        # target's slot holds it and its destination is dead on the taken path
+        end = si + 1
+        while end < len(new) and new[end].strip().startswith(".set"):
+            end += 1
+        ji = _tf_next_insn(new, si)
+        if ji is not None and ji in nrs and re.match(r"\s*j\s", new[ji]):
+            js = _tf_next_insn(new, ji)
+            if js is not None and js in nrs:
+                fx = _ff_word_form(new[js].split("#", 1)[0].strip())
+                if fx is not None and _sm_key(tgt[tk + 1][1].strip(), True) == _sm_key(fx, False):
+                    dx = defs_uses(fx)[0]
+                    ins2 = [(i, l) for i, l in enumerate(new) if _s_is_insn(l)]
+                    if len(dx) == 1 and _ff_dead_on(new, ins2, lbody, next(iter(dx))):
+                        new[si] = _src_indent(lines[si]) + fx
+                        new[js] = _src_indent(new[js]) + "nop"
+        new.insert(lx, _src_indent(lines[body[-1]]) + inc)
+        lines = new
+    return "\n".join(lines)
+
+
 def sched_pre_pass(stext, tgt):
     """sched_match before sigma (PRE_SIGMA, count-preserving): units whose exact
     key has no target match are paired by their key with the s-registers masked,
@@ -5985,6 +6114,7 @@ PASSES = {
     "web_resched": web_resched_pass,
     "sreg_perm": sreg_perm_pass,
     "block_iso": block_iso_pass,
+    "slot_unsteal": slot_unsteal_pass,
     "arg_unprop": arg_unprop_pass,
     "const_fold": const_fold_pass,
     "fallthrough_fill": fallthrough_fill_pass,
