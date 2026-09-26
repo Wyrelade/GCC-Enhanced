@@ -1083,9 +1083,12 @@ def _sm_key(body, target):
             mn, ops = "addu", [ops[0], ops[1], "$0"]
         elif mn == "li" and len(ops) == 2:
             v = _sm_int(ops[1])
-            if v is None or not -0x8000 <= v < 0x8000:
+            if v is not None and 0x8000 <= v <= 0xFFFF:
+                mn, ops = "ori", [ops[0], "$0", ops[1]]     # the assembler's ori form
+            elif v is None or not -0x8000 <= v < 0x8000:
                 return None
-            mn, ops = "addiu", [ops[0], "$0", ops[1]]
+            else:
+                mn, ops = "addiu", [ops[0], "$0", ops[1]]
         elif mn == "subu" and len(ops) == 3 and _sm_int(ops[2]) is not None:
             mn, ops = "addiu", [ops[0], ops[1], str(-_sm_int(ops[2]))]
         elif mn == "addu" and len(ops) == 3 and _sm_int(ops[2]) is not None:
@@ -1365,7 +1368,7 @@ def sched_match_pass(stext, tgt, mask_s=False):
     # address it resolves to) is a barrier: reorder the matched runs around it
     runs = []
     la_tmp = {}
-    blocks = _sm_units(lines, ins, la_tmp, reorder_after_br=mask_s)
+    blocks = _sm_units(lines, ins, la_tmp, reorder_after_br=True)
     wpos, w = {}, 0
     for i, l in ins:
         wpos[i] = w
