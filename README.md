@@ -98,14 +98,14 @@ Phases A, B and the core of C are working.
 The tool was started while decompiling Digimon World 2 (PSX, SLUS-01193), the motivating case
 study, but the method is general to any PSX-era GCC 2.x matching decomp.
 
-Case study status (2026-09-26): 750 of 907 functions (82.69%) of the Digimon World 2 main
-executable are matched and rebuild byte-identical, up from 740 (81.59%) at the start of this
-round. New this round: sreg_perm (a consistent renaming of the callee-saved registers, which
-closed several "register numbering" walls at once), sched_pre (scheduling before the register
-map is derived, with callee-saved names masked), arg_unprop (work fed from a call argument copy
-reads the original register again), web_resched, la_unfold (an address kept in a register),
-const_fold, taken_fill for branches left in reorder mode, v0 treated as dead at a void
-function return, and a delay_fill fix for divide macros.
+Case study status (2026-09-26): 762 of 907 functions (84.01%) of the Digimon World 2 main
+executable are matched and rebuild byte-identical, up from 750 (82.69%) at the start of this
+round. New this round: block_iso (a straight-line block with the target's dataflow but a
+different order and temporaries is rewritten to the target's form), slot_unsteal (a loop counter
+update kept in the body instead of the back branch slot), sreg_swap (a transposition of two
+callee-saved registers followed by web renaming), licm_li (a loop-head constant hoisted into the
+preheader), la_unfold for stores, flavors without the second scheduling pass, a compare against
+an immediate zero, and a taken_fill form for jumps left in noreorder groups.
 
 ## Tools
 
