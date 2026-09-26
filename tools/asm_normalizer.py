@@ -2568,7 +2568,13 @@ def _j_steal(stext, tgt):
 
 
 def taken_fill_pass(stext, tgt):
-    out = _j_steal(_taken_fill_core(stext, tgt), tgt)
+    # to a fixed point: an Op F rewrite can create the shape a later Op needs
+    out = stext
+    for _ in range(3):
+        new = _j_steal(_taken_fill_core(out, tgt), tgt)
+        if new == out:
+            break
+        out = new
     return _jnext_drop(out) if out != stext else out
 
 
