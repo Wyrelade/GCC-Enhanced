@@ -6863,6 +6863,138 @@ def ior_add_pass(stext, tgt):
     return "\n".join(lines) if changed else stext
 
 
+# --------------------------------------------------------------------------
+# la_copy: retail builds a global's address in a caller-saved temp and copies it
+# into the callee-saved register a loop uses (`la vK,S` ... `move sN,vK` in the
+# loop preheader, after the guard branches); our cc1 cse'd the copy away and puts
+# the la straight into sN. Target-guided: the target has, for S, exactly as many
+# `la vK,S` (vK caller-saved) followed within 12 insns by `move sM,vK` (sM
+# callee-saved, vK not redefined in between) as we have `la $sN,S`, and no la of
+# S straight into a callee-saved register. Our la becomes `la vK,S` and the move
+# goes after as many conditional branches as the target has between its lui and
+# its move. Sound only when, on the straight line up to the move: no label, sN
+# not written (reads of it are renamed to vK), vK not touched, sN and vK dead at
+# every taken target, and vK dead after the move. Count-changing (+1): pre-sigma.
+# --------------------------------------------------------------------------
+_LC_LA = re.compile(r"^(\s*)la\s+(\$\w+)\s*,\s*([A-Za-z_]\w*)\s*$")
+_LC_CALLER = {"v0", "v1", "a0", "a1", "a2", "a3", "t0", "t1", "t2", "t3", "t4", "t5", "t6", "t7",
+              "t8", "t9"}
+_LC_SREG = {"s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7", "fp"}
+
+
+def _lc_target_copies(tgt):
+    lui_re = re.compile(r"lui\s+(\$?\w+)\s*,\s*%hi\(([\w.$]+)\)")
+    add_re = re.compile(r"addiu\s+(\$?\w+)\s*,\s*(\$?\w+)\s*,\s*%lo\(([\w.$]+)\)")
+    cps, direct = {}, set()
+    for i in range(len(tgt)):
+        a = lui_re.search(tgt[i][1])
+        if not a:
+            continue
+        v, sym = norm_reg(a.group(1)), a.group(2)
+        ad = None
+        for q in range(i + 1, min(i + 4, len(tgt))):
+            b = add_re.search(tgt[q][1])
+            if b and b.group(3) == sym and norm_reg(b.group(1)) == norm_reg(b.group(2)) == v:
+                ad = q
+                break
+        if ad is None:
+            continue
+        if v in _LC_SREG:
+            direct.add(sym)
+            continue
+        if v not in _LC_CALLER:
+            continue
+        nbr = 0
+        for q in range(i + 1, min(i + 13, len(tgt))):
+            d = tgt[q][1].strip()
+            mn = d.split(None, 1)[0].lower()
+            dd, uu = defs_uses(d)
+            if q > ad and mn in ("addu", "move", "or"):
+                ops = [norm_reg(x.strip()) for x in d.split(None, 1)[1].split(",")] if " " in d else []
+                src = [x for x in ops[1:] if x != "zero"]
+                if len(ops) >= 2 and ops[0] in _LC_SREG and src == [v] and len(ops) - 1 - len(src) <= 1:
+                    cps.setdefault(sym, []).append((v, nbr))
+                    break
+            if q != ad and v in dd:
+                break
+            if mn in _COND_BR_MN:
+                nbr += 1
+            elif mn in ("j", "jr", "jal", "jalr", "b"):
+                break
+    return cps, direct
+
+
+def _lc_label(body):
+    m = re.search(r",\s*(\$L\w+)\s*$", body)
+    return m.group(1) if m else None
+
+
+def la_copy_pass(stext, tgt):
+    if not tgt:
+        return stext
+    cps, direct = _lc_target_copies(tgt)
+    if not cps:
+        return stext
+    lines = stext.split("\n")
+    nr = _noreorder_lines(lines)
+    ours = {}
+    for i, l in enumerate(lines):
+        m = _LC_LA.match(l.split("#", 1)[0])
+        if m and norm_reg(m.group(2)) in _LC_SREG and i not in nr:
+            ours.setdefault(m.group(3), []).append(i)
+    edits = []
+    for sym, ix in ours.items():
+        if sym in direct or sym not in cps or len(cps[sym]) != len(ix):
+            continue
+        for i, (v, nbr) in zip(ix, cps[sym]):
+            m = _LC_LA.match(lines[i].split("#", 1)[0])
+            sn = norm_reg(m.group(2))
+            ins = [(y, l) for y, l in enumerate(lines) if _s_is_insn(l)]
+            reads, seen, at, ok = [], 0, None, True
+            for y in range(i + 1, len(lines)):
+                l = lines[y]
+                if _s_is_label(l) and not l.strip().startswith("LM"):
+                    ok = False
+                    break
+                if not _s_is_insn(l):
+                    continue
+                body = l.split("#", 1)[0].strip()
+                if y in nr or re.match(r"(jalr?|j|jr|b)\b", body):
+                    ok = False
+                    break
+                d, u = defs_uses(body)
+                if sn in d or v in d or v in u:
+                    ok = False
+                    break
+                if sn in u:
+                    reads.append(y)
+                if body.split(None, 1)[0].lower() in _COND_BR_MN:
+                    lab = _lc_label(body)
+                    if lab is None or not _ff_dead_on(lines, ins, lab, sn) or \
+                            not _ff_dead_on(lines, ins, lab, v):
+                        ok = False
+                        break
+                    seen += 1
+                    if seen == nbr:
+                        at = y
+                        break
+            if not ok or at is None or not _us_dead_ft(lines, ins, at, v):
+                continue
+            if nbr == 0:
+                continue
+            edits.append((i, at, m, sn, v, reads))
+    if not edits:
+        return stext
+    for i, at, m, sn, v, reads in sorted(edits, key=lambda e: -e[0]):
+        vr, sr = "$%d" % ABI2NUM[v], m.group(2)
+        lines.insert(at + 1, "%smove\t%s,%s" % (m.group(1), sr, vr))
+        rr = re.compile(r"(?<![\w$])" + re.escape(sr) + r"(?![\w])")
+        for y in reads:
+            lines[y] = rr.sub(vr, lines[y])
+        lines[i] = "%sla\t%s,%s" % (m.group(1), vr, m.group(3))
+    return "\n".join(lines)
+
+
 PASSES = {
     # reg_realloc is applied specially (it needs sigma from words); the ordered
     # list in the manifest still names it so the recipe is explicit and auditable.
@@ -6916,6 +7048,7 @@ PASSES = {
     "call_slot_sink": call_slot_sink_pass,
     "giv_rebase": giv_rebase_pass,
     "ior_add": ior_add_pass,
+    "la_copy": la_copy_pass,
 }
 
 # Passes that CHANGE the instruction count and so must run BEFORE sigma is derived
@@ -6925,7 +7058,7 @@ PASSES = {
 PRE_SIGMA_PASSES = ("la_unfold_st", "un_hi_cse", "un_hi_cse_store", "exit_merge", "base_cse_collapse",
                     "shift_const_fold", "zero_remat", "load_remat", "nodiv",
                     "offset_unfold", "zext_keep", "zero_cmp", "param_copy",
-                    "undo_drop", "la_unfold", "arg_unprop", "sched_pre")
+                    "undo_drop", "la_unfold", "arg_unprop", "sched_pre", "la_copy")
 
 # --------------------------------------------------------------------------
 # WORD-LEVEL passes. The original PSY-Q assembler (aspsx) scheduled branch and
