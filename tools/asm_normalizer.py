@@ -1901,6 +1901,16 @@ def slot_unsteal_pass(stext, tgt):
     return "\n".join(lines)
 
 
+_SM_LOADS = {"lb", "lbu", "lh", "lhu", "lw", "lwl", "lwr"}
+
+
+def _sm_symload(k):
+    """A sched key `(load, dest, SYMBOL)` of a symbolic (non-frame) load."""
+    return (isinstance(k, tuple) and len(k) == 3 and k[0] in _SM_LOADS
+            and isinstance(k[2], str) and norm_reg(k[2]) is None
+            and re.match(r"[A-Za-z_.]", k[2]) is not None)
+
+
 def sched_pre_pass(stext, tgt):
     """sched_match before sigma (PRE_SIGMA, count-preserving): units whose exact
     key has no target match are paired by their key with the s-registers masked,
@@ -1970,6 +1980,13 @@ def sched_match_pass(stext, tgt, mask_s=False):
                 km = _sm_mask_s(k)
                 if km != k:
                     cands = [q for q, tk in enumerate(tmask) if tk == km and q not in used]
+            if not cands and mask_s and _sm_symload(k):
+                # before sigma a load's destination temporary may differ from
+                # the target's: pair by (op, symbol) when that is unique
+                cands = [q for q, tk in enumerate(tkeys) if q not in used and _sm_symload(tk)
+                         and tk[0] == k[0] and tk[2] == k[2]]
+                if len(cands) != 1:
+                    cands = []
             est = wpos.get(u[0], 0) + _sm_drift(anchors, u[0])
             t = min(cands, key=lambda q: (abs(q - est), q)) if cands else None
             if t is None:
