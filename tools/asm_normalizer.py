@@ -6567,7 +6567,10 @@ _BRANCHY = re.compile(r"^(b|j|jr|jal|beq|bne|blez|bgtz|bltz|bgez|beqz|bnez)")
 
 
 def is_branch(disasm):
-    return bool(_BRANCHY.match(disasm.split(None, 1)[0].lower()))
+    mn = disasm.split(None, 1)[0].lower() if disasm.strip() else ""
+    if mn == "break":
+        return False                    # a trap, not a transfer (no delay slot)
+    return bool(_BRANCHY.match(mn))
 
 
 def is_nop(disasm):
