@@ -4418,10 +4418,29 @@ def arg_unprop_pass(stext, tgt):
 # Count-preserving.
 # --------------------------------------------------------------------------
 _SR_NUM = {"s%d" % k: "$%d" % (16 + k) for k in range(8)}
+_SR_NUM["fp"] = "$30"
+
+
+def _sr_used(lines):
+    """Callee-saved registers the body uses as plain registers: s0-s7, plus $fp
+    when it is not a frame pointer (never set from $sp or copied into it)."""
+    used, fp_frame = set(), False
+    for l in lines:
+        if _s_is_insn(l) and not l.strip().startswith("."):
+            d, u = defs_uses(l.split("#", 1)[0].strip())
+            regs = set(d) | set(u)
+            used |= {r for r in regs if re.match(r"s[0-7]$|fp$", r or "")}
+            mn = l.split("#", 1)[0].split(None, 1)[0].lower()
+            if mn not in _SM_LOADS and mn not in _STORE_MN and (
+                    ("fp" in d and "sp" in u) or ("sp" in d and "fp" in u)):
+                fp_frame = True
+    if fp_frame:
+        used.discard("fp")
+    return used
 
 
 def _sr_rename(lines, perm):
-    pat = re.compile(r"\$(1[6-9]|2[0-3]|s[0-7])(?![\w])")
+    pat = re.compile(r"\$(1[6-9]|2[0-3]|30|s[0-8]|fp)(?![\w])")
 
     def sub(m):
         r = norm_reg(m.group(0))
@@ -4444,12 +4463,7 @@ def sreg_perm_pass(stext, tgt):
         return stext
     import itertools
     lines = stext.split("\n")
-    used = set()
-    for l in lines:
-        if _s_is_insn(l) and not l.strip().startswith("."):
-            d, u = defs_uses(l.split("#", 1)[0].strip())
-            used |= {r for r in list(d) + list(u) if re.match(r"s[0-7]$", r or "")}
-    used = sorted(used)
+    used = sorted(_sr_used(lines))
     if len(used) < 2:
         return stext
     tk = [_sm_key(d.strip(), True) for _w, d in tgt]
@@ -4483,6 +4497,17 @@ def sreg_perm_pass(stext, tgt):
                 if sc > best_s:
                     step, best_s = perm, sc
             if step is None:
+                # no single swap helps: try 3-cycles (a rotation of three
+                # registers needs two swaps, neither of which helps alone)
+                for x, y, z in itertools.permutations(used, 3):
+                    if x > y or x > z:
+                        continue
+                    perm = dict(cur)
+                    perm[x], perm[y], perm[z] = cur[y], cur[z], cur[x]
+                    sc = score(_sr_rename(lines, perm))
+                    if sc > best_s:
+                        step, best_s = perm, sc
+            if step is None:
                 break
             cur = best = step
     if best is None:
@@ -4504,12 +4529,7 @@ def sreg_swap_pass(stext, tgt):
         return stext
     import itertools
     lines = stext.split("\n")
-    used = set()
-    for l in lines:
-        if _s_is_insn(l) and not l.strip().startswith("."):
-            d, u = defs_uses(l.split("#", 1)[0].strip())
-            used |= {r for r in list(d) + list(u) if re.match(r"s[0-7]$", r or "")}
-    used = sorted(used)
+    used = sorted(_sr_used(lines))
     if len(used) < 2:
         return stext
     tk = [_sm_key(d.strip(), True) for _w, d in tgt]
