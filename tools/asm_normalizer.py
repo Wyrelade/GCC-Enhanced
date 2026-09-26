@@ -3750,7 +3750,7 @@ def sreg_perm_pass(stext, tgt):
             d, u = defs_uses(l.split("#", 1)[0].strip())
             used |= {r for r in list(d) + list(u) if re.match(r"s[0-7]$", r or "")}
     used = sorted(used)
-    if len(used) < 2 or len(used) > 5:
+    if len(used) < 2:
         return stext
     tk = [_sm_key(d.strip(), True) for _w, d in tgt]
     tk = [k for k in tk if k not in (None, "skip")]
@@ -3763,13 +3763,28 @@ def sreg_perm_pass(stext, tgt):
         return sum(b.size for b in sm.get_matching_blocks())
     base = score(lines)
     best, best_s = None, base
-    for pm in itertools.permutations(used):
-        perm = dict(zip(used, pm))
-        if all(k == v for k, v in perm.items()):
-            continue
-        sc = score(_sr_rename(lines, perm))
-        if sc > best_s:
-            best, best_s = perm, sc
+    if len(used) <= 5:
+        for pm in itertools.permutations(used):
+            perm = dict(zip(used, pm))
+            if all(k == v for k, v in perm.items()):
+                continue
+            sc = score(_sr_rename(lines, perm))
+            if sc > best_s:
+                best, best_s = perm, sc
+    else:
+        # too many for every permutation: greedy transpositions, best first
+        cur = {r: r for r in used}
+        while True:
+            step = None
+            for x, y in itertools.combinations(used, 2):
+                perm = dict(cur)
+                perm[x], perm[y] = cur[y], cur[x]
+                sc = score(_sr_rename(lines, perm))
+                if sc > best_s:
+                    step, best_s = perm, sc
+            if step is None:
+                break
+            cur = best = step
     if best is None:
         return stext
     return "\n".join(_sr_rename(lines, best))
