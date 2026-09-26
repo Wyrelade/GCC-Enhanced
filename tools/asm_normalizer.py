@@ -1480,7 +1480,7 @@ def _bi_live_after(lines, last, reg):
     for j in range(last + 1, len(lines)):
         l = lines[j]
         if _s_is_label(l):
-            return True
+            continue                # other entrants do not matter on this path
         if not _s_is_insn(l):
             continue
         body = l.split("#", 1)[0].strip()
@@ -1505,16 +1505,43 @@ def _bi_live_after(lines, last, reg):
     return True
 
 
+def _bi_key(body):
+    """Sched key of one of our units; an indexed symbolic access `op $r,S+k($b)`
+    also carries its index register: (op, r, resolved S+k, b)."""
+    m = re.match(r"(lw|lh|lhu|lb|lbu|sw|sh|sb)\s+(\$\w+)\s*,\s*([A-Za-z_]\w*(?:\+\d+)?)"
+                 r"\((\$\w+)\)\s*$", body)
+    if m and norm_reg(m.group(2)) not in ("1", "at") and norm_reg(m.group(4)) is not None:
+        return (m.group(1).lower(), norm_reg(m.group(2)), _sm_sym(m.group(3)), norm_reg(m.group(4)))
+    return _sm_srckey(body)
+
+
 def _bi_tgt_units(tgt, a, n):
-    """Target units in words [a, a+n): [(first_word, nwords, key)] or None."""
-    out, k = [], a
-    while k < a + n:
+    """Target units covering n non-nop words from a: [(first_word, nwords, key)] or
+    None. The assembler's load-delay nops inside the window are skipped (ours are
+    not in the source text)."""
+    out, k, end = [], a, a + n
+    while k < end:
+        if k >= len(tgt):
+            return None
         d = tgt[k][1].strip()
+        if d == "nop" and out:
+            end += 1
+            k += 1
+            continue
         if is_branch(d) or re.match(r"\s*j", d):
             return None
         key = _sm_key(d, True)
+        if key == "skip" and k + 2 < end:
+            # indexed symbolic access `lui $at,%hi(S); addu $at,$at,$b; op $r,%lo(S)($at)`
+            ma = re.match(r"addu\s+\$at\s*,\s*\$at\s*,\s*(\$\w+)$", tgt[k + 1][1].strip())
+            m3 = re.match(r"(\w+)\s+(\$\w+)\s*,\s*%lo\(([\w.$]+)\)\(\$at\)$", tgt[k + 2][1].strip())
+            if ma and m3:
+                out.append((k, 3, (m3.group(1).lower(), norm_reg(m3.group(2)), m3.group(3),
+                                   norm_reg(ma.group(1)))))
+                k += 3
+                continue
         if key == "skip":
-            if k + 1 >= a + n:
+            if k + 1 >= end:
                 return None
             k2 = _sm_key(tgt[k + 1][1].strip(), True)
             if not isinstance(k2, tuple):
@@ -1591,7 +1618,7 @@ def _bi_try(lines, blk, tkeys, tgt, wpos):
     """One block_iso attempt on units `blk`: (pi, tw), "same" or None."""
     ou, nw = [], []
     for a, z, b in blk:
-        u = _bi_unit(_sm_srckey(b))
+        u = _bi_unit(_bi_key(b))
         if u is None:
             break
         dd, uu = defs_uses(_sm_dep_body(b))
@@ -1609,10 +1636,18 @@ def _bi_try(lines, blk, tkeys, tgt, wpos):
         key = _sm_srckey(b)
         qs = [q for q, tk in enumerate(tkeys) if tk == key]
         for q in qs:
+            # the key sits on the unit's last word; step back over the words
+            # before it, not counting the target's load-delay nops
+            st, need = q, off + k - 1
+            while need > 0 and st > 0:
+                st -= 1
+                if tgt[st][1].strip() != "nop":
+                    need -= 1
+            starts.add(st)
             starts.add(q - off)
         off += k
     for st in sorted(starts, key=lambda q: abs(q - wpos[blk[0][0]])):
-        if st < 0 or st + span > len(tgt):
+        if st < 0 or st >= len(tgt):
             continue
         tw = _bi_tgt_units(tgt, st, span)
         if tw is None or len(tw) != len(ou):
@@ -1692,7 +1727,7 @@ def block_iso_pass(stext, tgt):
                 lines[insl[0]] = _src_indent(lines[insl[0]]) + p[0] + ("\t" + ops if ops else "")
             else:
                 mp = {}
-                okey, tkey = _sm_srckey(b), tw[pi[i]][2]
+                okey, tkey = _bi_key(b), tw[pi[i]][2]
                 for x, y in zip(okey, tkey):
                     if isinstance(x, str) and x in _BI_REGS and isinstance(y, str):
                         mp[x] = y
