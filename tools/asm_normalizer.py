@@ -276,6 +276,72 @@ def laform_fold_pass(stext, tgt):
 
 
 # --------------------------------------------------------------------------
+# la_unfold: retail's cc1 kept a global's address in a register (`la R,S` =
+# `lui R,%hi(S); addiu R,R,%lo(S)`) and loaded through it at offset 0, where our
+# cc1 folded the address into a symbolic load `op $r,S` (`lui; op %lo(S)`).
+# Target-guided: S must appear in the target only in that la form (no %lo(S)
+# memory access), with as many la pairs as we have folded loads of S. Each folded
+# load becomes `la $r,S; op $r,0($r)` (the loaded register is the address
+# temp, so nothing else changes). Count-changing (+1 per load): pre-sigma.
+# --------------------------------------------------------------------------
+_LU_HI = re.compile(r"^\s*lui\s+(\$\w+)\s*,\s*%hi\(([A-Za-z_]\w*)\)\s*$")
+_LU_LO = re.compile(r"^(\s*)(lw|lh|lhu|lb|lbu)(\s+)(\$\w+)\s*,\s*%lo\(([A-Za-z_]\w*)\)\((\$\w+)\)\s*$")
+_LU_LOAD = re.compile(r"^(\s*)(lw|lh|lhu|lb|lbu)(\s+)(\$\w+)\s*,\s*([A-Za-z_]\w*)\s*(#.*)?$")
+
+
+def la_unfold_pass(stext, tgt):
+    if not tgt:
+        return stext
+    lui_re = re.compile(r"lui\s+(\$?\w+)\s*,\s*%hi\(([\w.$]+)\)")
+    add_re = re.compile(r"addiu\s+(\$?\w+)\s*,\s*(\$?\w+)\s*,\s*%lo\(([\w.$]+)\)")
+    la_n, lo_mem = {}, set()
+    for i in range(len(tgt)):
+        d = tgt[i][1]
+        m = re.search(r"%lo\(([\w.$]+)\)\(", d)
+        if m:
+            lo_mem.add(m.group(1))
+        a = lui_re.search(d)
+        b = add_re.search(tgt[i + 1][1]) if a and i + 1 < len(tgt) else None
+        if a and b and b.group(3) == a.group(2) and \
+                norm_reg(a.group(1)) == norm_reg(b.group(1)) == norm_reg(b.group(2)):
+            la_n[a.group(2)] = la_n.get(a.group(2), 0) + 1
+    lines = stext.split("\n")
+    nr = _noreorder_lines(lines)
+    hits = {}
+    for i, l in enumerate(lines):
+        if i in nr:
+            continue
+        m = _LU_LOAD.match(l)
+        if m and norm_reg(m.group(4)) not in (None, "zero", "at"):
+            hits.setdefault(m.group(5), []).append((i, None))
+            continue
+        # the expanded form `lui $r,%hi(S); op $r,%lo(S)($r)`
+        mh = _LU_HI.match(l.split("#", 1)[0])
+        j = _tf_next_insn(lines, i) if mh else None
+        mo = _LU_LO.match(lines[j].split("#", 1)[0]) if j is not None and j not in nr else None
+        if (mo and mo.group(5) == mh.group(2)
+                and norm_reg(mo.group(4)) == norm_reg(mh.group(1)) == norm_reg(mo.group(6))
+                and norm_reg(mh.group(1)) not in ("zero", "at")):
+            hits.setdefault(mh.group(2), []).append((i, j))
+    edits = [x for s, ix in hits.items()
+             if s in la_n and s not in lo_mem and la_n[s] == len(ix) for x in ix]
+    if not edits:
+        return stext
+    for i, j in sorted(edits, reverse=True):
+        if j is None:
+            m = _LU_LOAD.match(lines[i])
+            ind, r = m.group(1), m.group(4)
+            lines[i:i + 1] = ["%sla\t%s,%s" % (ind, r, m.group(5)),
+                              "%s%s%s%s,0(%s)" % (ind, m.group(2), m.group(3), r, r)]
+        else:
+            mo = _LU_LO.match(lines[j].split("#", 1)[0])
+            ind, r, sym = mo.group(1), mo.group(4), mo.group(5)
+            lines[j:j + 1] = ["%saddiu\t%s,%s,%%lo(%s)" % (ind, r, r, sym),
+                              "%s%s%s%s,0(%s)" % (ind, mo.group(2), mo.group(3), r, r)]
+    return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------
 # un-hi-cse (rematerialize): our cc1 hoists a global's `lui %hi` once and shares
 # the base across several `%lo` loads; retail's cc1 rematerializes the `lui %hi`
 # at EACH use (`lui R,%hi(S); lw R,%lo(S)(R)`, base == dest). This is a COUNT-
@@ -5282,6 +5348,7 @@ PASSES = {
     "taken_fill": taken_fill_pass,
     "dead_code": dead_code_pass,
     "offset_unfold": offset_unfold_pass,
+    "la_unfold": la_unfold_pass,
     "slot_unfill": slot_unfill_pass,
     "cross_jump": cross_jump_pass,
     "zext_keep": zext_keep_pass,
@@ -5304,7 +5371,7 @@ PASSES = {
 PRE_SIGMA_PASSES = ("un_hi_cse", "un_hi_cse_store", "exit_merge", "base_cse_collapse",
                     "shift_const_fold", "zero_remat", "load_remat", "nodiv",
                     "offset_unfold", "zext_keep", "zero_cmp", "param_copy",
-                    "undo_drop")
+                    "undo_drop", "la_unfold")
 
 # --------------------------------------------------------------------------
 # WORD-LEVEL passes. The original PSY-Q assembler (aspsx) scheduled branch and
