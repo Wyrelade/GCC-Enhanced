@@ -1629,7 +1629,8 @@ def _ff_dead_on(lines, ins, label, reg, seen=None, callee_args=True):
                 if reg in sd:
                     return True
             if _src_is_ret(l):
-                return reg not in _FF_RET_LIVE
+                # a void function's return does not read $v0
+                return reg not in _FF_RET_LIVE or (reg == "v0" and _s_void(lines))
             lab = re.search(r"(\$L\w+)\s*$", body)
             if not lab:
                 return False
@@ -3799,10 +3800,16 @@ def _su_shape(key):
     return tuple(k if i == 0 or not isinstance(k, str) else "r" for i, k in enumerate(key))
 
 
+# normalize_s records whether the span it is running text passes on is a void
+# function (its COFF `.def` sits before the span, out of the passes' sight)
+_SPAN_INFO = {}
+
+
 def _s_void(lines):
     """cc1 marks a void function `.type 0x21` in its COFF `.def`."""
-    return any(re.search(r"\.def\s+\w+;\s*\.val\s+\w+;\s*\.scl\s+2;\s*\.type\s+0x21;", l)
-               for l in lines)
+    return bool(_SPAN_INFO.get("void")) or any(
+        re.search(r"\.def\s+\w+;\s*\.val\s+\w+;\s*\.scl\s+2;\s*\.type\s+0x21;", l)
+        for l in lines)
 
 
 def _su_rehome(lines, j, s, pb, pc, tl, label, ob, tb, nr):
@@ -6871,6 +6878,9 @@ def normalize_s(s_file, ctx, manifest=None):
         pre = [p for p in text_passes if p in PRE_SIGMA_PASSES]
         rest = [p for p in text_passes if p not in PRE_SIGMA_PASSES]
         span = out[start:end]
+        _SPAN_INFO["void"] = bool(re.search(
+            r"\.def\s+%s;\s*\.val\s+%s;\s*\.scl\s+2;\s*\.type\s+0x21;"
+            % (re.escape(name), re.escape(name)), out))
         for p in pre:
             span = PASSES[p](span, tgt)
         if pre:                             # re-assemble to align sigma to remat form
@@ -6887,6 +6897,7 @@ def normalize_s(s_file, ctx, manifest=None):
             _write_bytes_str(s_file, out)
         if name not in rewrote:
             rewrote.append(name)
+    _SPAN_INFO.clear()
 
     # Pass 2 -- word passes. These need the ASSEMBLED words of the text-normalized
     # code, so write pass 1 to disk first and assemble each span in full-file
