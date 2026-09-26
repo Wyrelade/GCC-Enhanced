@@ -1340,11 +1340,17 @@ def sched_match_pass(stext, tgt):
         order = sorted(range(len(blk)), key=lambda x: pos[x])
         if order == list(range(len(blk))):
             continue
-        dset = set()
-        for b in bodies:
-            dset |= set(defs_uses(b)[0])
-        stable = frozenset(r for b in bodies for r in defs_uses(b)[1]) - dset
-        if not all(_sm_indep(bodies[x], bodies[y], stable)
+        # a base register is stable for a pair when no unit between the two (in
+        # our order) redefines it: every unit that does keeps its order against
+        # both accesses (it writes what they read), so both see one value
+        defs_at = [set(defs_uses(b)[0]) for b in bodies]
+
+        def stable_for(y, x):
+            s = set(defs_uses(bodies[x])[1]) | set(defs_uses(bodies[y])[1])
+            for z in range(y + 1, x):
+                s -= defs_at[z]
+            return frozenset(s)
+        if not all(_sm_indep(bodies[x], bodies[y], stable_for(y, x))
                    for a_, x in enumerate(order) for y in order[a_ + 1:] if y < x):
             continue
         edits.append((blk, order))
@@ -3424,6 +3430,18 @@ def web_realloc_pass(stext, tgt):
 
 
 # --------------------------------------------------------------------------
+# web_resched: web_realloc then sched_match again, run after sched_match. A load
+# the target hoists above a store can be stuck twice over: its destination is the
+# register the store's base lives in (a true dependence), and the target's
+# destination is only free once sched_match has moved an earlier copy out of it.
+# After the first sched_match the web can take the target register, and the
+# second sched_match can then hoist the load. Count-preserving.
+# --------------------------------------------------------------------------
+def web_resched_pass(stext, tgt):
+    return sched_match_pass(web_realloc_pass(stext, tgt), tgt)
+
+
+# --------------------------------------------------------------------------
 # save_slot. After reg_realloc renames callee-saved registers, each one still
 # lives in the stack slot its OLD number was given (cc1 lays the save area out by
 # register number), so `sw $s1,0x14($sp)` can come out as `sw $s1,0x20($sp)`
@@ -5213,6 +5231,7 @@ PASSES = {
     "copy_use": copy_use_pass,
     "ra_restore_sink": ra_restore_sink_pass,
     "sched_match": sched_match_pass,
+    "web_resched": web_resched_pass,
     "fallthrough_fill": fallthrough_fill_pass,
     "taken_fill": taken_fill_pass,
     "dead_code": dead_code_pass,
