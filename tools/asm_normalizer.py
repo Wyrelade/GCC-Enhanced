@@ -7440,6 +7440,9 @@ ALT_FLAVORS = {
     # units built without the second cse pass and without cse jump following
     "nocse": ["-fno-rerun-cse-after-loop", "-fno-cse-follow-jumps"],
     "nosplit_nocse": ["-mno-split-addresses", "-fno-rerun-cse-after-loop", "-fno-cse-follow-jumps"],
+    # units built without the second (post-allocation) scheduling pass
+    "nos2": ["-fno-schedule-insns2"],
+    "nosplit_nos2": ["-mno-split-addresses", "-fno-schedule-insns2"],
 }
 META_PASSES = tuple(ALT_FLAVORS)
 # local-label prefix per alternate compile (nosplit keeps the historical "ns")
@@ -7448,7 +7451,7 @@ _ALT_TAG = {"nosplit": "ns", "nosplit_nodb": "nsnd", "nodb": "nd", "gp8": "gp",
             "gp8_nosplit_noskip": "gpnk", "hf": "hf", "nosplit_hf": "nshf",
             "nodb_hf": "ndhf", "nosplit_nodb_hf": "nsndhf",
             "nosr": "nsr", "nosplit_nosr": "nsnsr", "nocse": "ncse",
-            "nosplit_nocse": "nsncse"}
+            "nosplit_nocse": "nsncse", "nos2": "ns2", "nosplit_nos2": "nsns2"}
 
 
 def alt_flavors(manifest):
