@@ -6401,6 +6401,74 @@ def copy_swap_pass(stext, tgt):
     return "\n".join(lines) if changed else stext
 
 
+# --------------------------------------------------------------------------
+# sra_keep: cc1 combine turns `x >> k` of a value whose sign bit is known zero
+# (a zero-extending lbu/lhu load or an andi mask) into srl; retail keeps sra.
+# Both give the same value on a nonnegative input. Rewrite `srl R,X,k` to
+# `sra R,X,k` when X's reaching def in the same straight-line block is
+# lbu/lhu/andi, as long as the target has more `sra *,*,k` and fewer
+# `srl *,*,k` than ours (count-guided, first come). Count-preserving.
+# --------------------------------------------------------------------------
+_SK_SH = re.compile(r"^(\s*)(srl|sra)\s+(\$\w+)\s*,\s*(\$\w+)\s*,\s*(\w+)\s*(#.*)?$")
+
+
+def _sk_counts(insns):
+    c = {}
+    for d in insns:
+        mn, regs, sk = insn_parts(d)
+        if mn in ("srl", "sra") and len(regs) == 2 and sk:
+            try:
+                k = int(sk[-1], 0)
+            except ValueError:
+                continue
+            c[(mn, k)] = c.get((mn, k), 0) + 1
+    return c
+
+
+def sra_keep_pass(stext, tgt):
+    if not tgt:
+        return stext
+    lines = stext.split("\n")
+    ours = [l.split("#", 1)[0].strip() for l in lines if _s_is_insn(l) and not l.strip().startswith(".")]
+    tc = _sk_counts([d.strip() for _w, d in tgt])
+    oc = _sk_counts(ours)
+    changed = False
+    for i, l in enumerate(lines):
+        m = _SK_SH.match(l)
+        if not m or m.group(2) != "srl":
+            continue
+        try:
+            k = int(m.group(5), 0)
+        except ValueError:
+            continue
+        if not (0 < k < 32):
+            continue
+        if tc.get(("sra", k), 0) <= oc.get(("sra", k), 0) or tc.get(("srl", k), 0) >= oc.get(("srl", k), 0):
+            continue
+        x = norm_reg(m.group(4))
+        ok = False
+        for j in range(i - 1, -1, -1):
+            lj = lines[j]
+            if _join_label(lines, j):
+                break
+            if not _s_is_insn(lj) or lj.strip().startswith("."):
+                continue
+            body = lj.split("#", 1)[0].strip()
+            if _src_is_branch(body) or _src_is_ret(body) or re.match(r"jalr?\b", body):
+                break
+            if x in defs_uses(body)[0]:
+                mn = body.split(None, 1)[0]
+                ok = mn in ("lbu", "lhu", "andi")
+                break
+        if not ok:
+            continue
+        lines[i] = "%ssra\t%s,%s,%s" % (m.group(1), m.group(3), m.group(4), m.group(5))
+        oc[("srl", k)] -= 1
+        oc[("sra", k)] = oc.get(("sra", k), 0) + 1
+        changed = True
+    return "\n".join(lines) if changed else stext
+
+
 PASSES = {
     # reg_realloc is applied specially (it needs sigma from words); the ordered
     # list in the manifest still names it so the recipe is explicit and auditable.
@@ -6450,6 +6518,7 @@ PASSES = {
     "slot_retake": slot_retake_pass,
     "undo_drop": undo_drop_pass,
     "copy_swap": copy_swap_pass,
+    "sra_keep": sra_keep_pass,
 }
 
 # Passes that CHANGE the instruction count and so must run BEFORE sigma is derived
