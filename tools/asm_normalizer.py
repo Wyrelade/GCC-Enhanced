@@ -3380,11 +3380,43 @@ def _src_reg_tok(like, reg):
     return "$" + reg
 
 
+_SLT_S = re.compile(r"^(\s*)(slt|sltu)\s+(\$\w+)\s*,\s*(\$\w+)\s*,\s*(\$\w+)\s*(#.*)?$")
+_SLTI0_TGT = re.compile(r"^(slti|sltiu)\s+\$?\w+\s*,\s*\$?\w+\s*,\s*(?:0x0|0)$")
+_SLTI0_S = re.compile(r"^\s*(slti|sltiu|slt|sltu)\s+\$\w+\s*,\s*\$\w+\s*,\s*0\s*(#.*)?$")
+
+
+def zero_cmp_imm_s(stext, budget):
+    """`slt/sltu X,Y,R` where R holds zero on every path reaching it becomes
+    `slt/sltu X,Y,0` (the assembler's slti/sltiu against 0)."""
+    if budget <= 0:
+        return stext
+    lines = stext.split("\n")
+    ins = [(i, l) for i, l in enumerate(lines) if _s_is_insn(l)]
+    nr = _noreorder_lines(lines)
+    changed = False
+    for p, (li, l) in enumerate(ins):
+        if budget <= 0:
+            break
+        m = _SLT_S.match(l)
+        if not m:
+            continue
+        r = _src_reg(m.group(5))
+        if not r or r == _src_reg("$0") or not _zero_reach(lines, ins, p, r, nr):
+            continue
+        lines[li] = "%s%s\t%s,%s,0" % (m.group(1), m.group(2), m.group(3), m.group(4))
+        budget -= 1
+        changed = True
+    return "\n".join(lines) if changed else stext
+
+
 def zero_remat_pass(stext, tgt):
     want = sum(1 for _w, dis in tgt if _ZERO_TGT.match(dis.strip()))
     have = sum(1 for l in stext.split("\n")
                if _s_is_insn(l) and _ZERO_DEF_S.match(l))
     stext = zero_remat_s(stext, want - have)
+    want = sum(1 for _w, dis in tgt if _SLTI0_TGT.match(dis.strip()))
+    have = sum(1 for l in stext.split("\n") if _s_is_insn(l) and _SLTI0_S.match(l))
+    stext = zero_cmp_imm_s(stext, want - have)
     wk = {}
     for _w, dis in tgt:
         m = _KTGT.match(dis.strip())
