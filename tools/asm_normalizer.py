@@ -2084,16 +2084,115 @@ def _callee_insns(fn):
     return _CALLEE_S[fn]
 
 
+_CALLEE_CFG = {}
+
+
+def _callee_cfg(fn):
+    """The retail asm of `fn` as [(insn, label or None)], or None."""
+    if fn not in _CALLEE_CFG:
+        p = find_target_s(_ASM_ROOT, fn) if _ASM_ROOT else None
+        out, lab = [], []
+        if p:
+            pat = re.compile(r"/\*\s*[0-9A-Fa-f]+\s+[0-9A-Fa-f]{8}\s+[0-9A-Fa-f]{8}\s*\*/\s+(.*)$")
+            pend = []
+            for line in open(p, encoding="utf-8", errors="replace"):
+                m = pat.search(line)
+                if m:
+                    out.append(re.sub(r"\s+", " ", m.group(1).strip()))
+                    lab.append(pend)
+                    pend = []
+                else:
+                    ml = re.match(r"\s*(\.L\w+):", line)
+                    if ml:
+                        pend.append(ml.group(1))
+        _CALLEE_CFG[fn] = (out, lab) if out else None
+    return _CALLEE_CFG[fn]
+
+
+def _callee_reads_flow(fn, reg, depth):
+    """Dataflow form of _callee_reads; None when the CFG cannot be built."""
+    cfg = _callee_cfg(fn)
+    if cfg is None:
+        return None
+    body, labs = cfg
+    at = {}
+    for i, ls in enumerate(labs):
+        for l in ls:
+            at[l] = i
+    nb = len(body)
+    xfer = {"j", "b", "jal", "jalr", "jr"} | _COND_BR_MN
+
+    def mnem(i):
+        return body[i].split(None, 1)[0].lower()
+    succ = [[] for _ in range(nb)]
+    call_after = {}                          # slot index -> callee name (or "?")
+    for i in range(nb):
+        if i > 0 and mnem(i - 1) in xfer:
+            continue                         # a delay slot: set by its transfer
+        mn = mnem(i)
+        if mn not in xfer:
+            succ[i] = [i + 1] if i + 1 < nb else []
+            continue
+        if i + 1 >= nb:
+            return None
+        succ[i] = [i + 1]
+        ops = body[i].split(None, 1)[1] if " " in body[i] else ""
+        tgt = re.search(r"(\.L\w+)", ops)
+        if mn in ("jal", "jalr"):
+            mc = re.match(r"jal (\w+)$", body[i])
+            call_after[i + 1] = mc.group(1) if mc else "?"
+            succ[i + 1] = [i + 2] if i + 2 < nb else []
+        elif mn == "jr":
+            if norm_reg(ops.strip()) != "ra":
+                return None                  # jump table: give up
+            succ[i + 1] = []
+        else:
+            if not tgt or tgt.group(1) not in at:
+                return None
+            succ[i + 1] = [at[tgt.group(1)]]
+            if mn in _COND_BR_MN and i + 2 < nb:
+                succ[i + 1].append(i + 2)
+    # forward: nodes where `reg` may still hold the entry value (only True
+    # states matter: a read is only a read of the entry value then)
+    may = [False] * nb
+    may[0] = True
+    work = [0]
+    while work:
+        i = work.pop()
+        d, u = defs_uses(body[i])
+        if reg in u and mnem(i) != "jal":
+            return True
+        if reg in d:
+            continue
+        if i in call_after:
+            c = call_after[i]
+            if c == "?" or _callee_reads(c, reg, depth + 1):
+                return True
+            continue                         # the call clobbers a0-a3
+        for t in succ[i]:
+            if not may[t]:
+                may[t] = True
+                work.append(t)
+    return False
+
+
 def _callee_reads(fn, reg, depth=0):
     """Conservatively: may function `fn` (retail asm) read argument register `reg`
-    before writing it? A read counts unless `reg` was written earlier in the same
-    basic block or in the straight-line entry prefix (delay slots included); a
-    call made while `reg` may still hold the entry value recurses into that
-    callee (depth-limited). Unknown callee or deep chain: assume it reads."""
+    before writing it? Dataflow over the callee's CFG (delay slots included): a
+    read while `reg` may still hold the entry value counts; a call made then
+    recurses into that callee (depth-limited). When the CFG cannot be built, a
+    read counts unless `reg` was written earlier in the same basic block or in
+    the straight-line entry prefix. Unknown callee or deep chain: assume it
+    reads."""
     key = (fn, reg)
     if key in _CALLEE_RD:
         return _CALLEE_RD[key]
     _CALLEE_RD[key] = True                   # recursion guard: assume read
+    if depth <= 8:
+        fl = _callee_reads_flow(fn, reg, depth)
+        if fl is not None:
+            _CALLEE_RD[key] = fl
+            return fl
     body = _callee_insns(fn)
     if body is None or depth > 8:
         return True
