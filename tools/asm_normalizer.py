@@ -5951,6 +5951,13 @@ def delay_fill_src(span, tgt, our_words):
     kbr = -1
     for p in range(len(ins)):
         i, l = ins[p]
+        # a 3-operand divide macro assembles with its own check branches
+        # (div/rem: bnez + two bne; divu/remu: bnez): count them so the k-th
+        # source branch stays paired with the k-th assembled one
+        mdv = re.match(r"\s*(div|divu|rem|remu)\s+(\$\w+)\s*,\s*\$\w+\s*,\s*\$\w+", l)
+        if mdv and norm_reg(mdv.group(2)) != "zero":
+            kbr += 3 if mdv.group(1) in ("div", "rem") else 1
+            continue
         if not _src_is_branch(l):
             continue
         kbr += 1
@@ -5963,6 +5970,8 @@ def delay_fill_src(span, tgt, our_words):
         pi, pl = ins[p - 1]
         if _src_is_branch(pl) or _src_is_nop(pl):
             continue
+        if re.match(r"\s*(div|divu|rem|remu)\s+\$\w+\s*,\s*\$\w+\s*,\s*\$\w+", pl):
+            continue            # a divide macro is many words: never a slot filler
         # dependency: prev must not define a register the branch reads
         bmn = re.match(r"\s*([a-z]+)", l).group(1)
         bu = defs_uses(l.strip())[1]
