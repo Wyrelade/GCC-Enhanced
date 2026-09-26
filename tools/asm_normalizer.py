@@ -1208,6 +1208,11 @@ def _sm_mem(body):
     ops = split_ops(p[1]) if len(p) > 1 else []
     if len(ops) == 2 and "(" not in ops[1]:
         return (st, ("sym", re.split(r"[+-]", ops[1].strip())[0]))
+    # indexed access into a named C object `op r,S+k($b)`: it stays inside S
+    # (GCC's own alias rule: accesses based on distinct symbols never overlap)
+    mx = re.fullmatch(r"([A-Za-z_]\w*)(?:[+-]\d+)?\(\$\w+\)", ops[1].strip()) if len(ops) == 2 else None
+    if mx and norm_reg(mx.group(1)) is None:
+        return (st, ("symx", mx.group(1)))
     return (st, ("any",))
 
 
@@ -1240,6 +1245,10 @@ def _sm_indep(a, b, stable=frozenset()):
         if _sm_save_slot(a) or _sm_save_slot(b):
             if wa[0] != "sp" or wb[0] != "sp":
                 return True
+        if "symx" in (wa[0], wb[0]) and "any" not in (wa[0], wb[0]):
+            if wa[0] == "sp" or wb[0] == "sp":
+                return True                 # frame vs a named global object
+            return wa[1] != wb[1]           # distinct objects (same one: unknown)
         if "any" in (wa[0], wb[0]):
             return False
         if wa[0] == "sym" and wb[0] == "sym":
@@ -1703,8 +1712,10 @@ def _bi_mem_indep(mx, my, bx, by):
         return wx[1] != wy[1]
     if wx[0] == "sp" and wy[0] == "sp":
         return wx[1] + wx[2] <= wy[1] or wy[1] + wy[2] <= wx[1]
-    if "sp" in (wx[0], wy[0]) and "sym" in (wx[0], wy[0]):
+    if "sp" in (wx[0], wy[0]) and ("sym" in (wx[0], wy[0]) or "symx" in (wx[0], wy[0])):
         return True
+    if wx[0] in ("sym", "symx") and wy[0] in ("sym", "symx"):
+        return wx[1] != wy[1]               # distinct named objects never overlap
     return False
 
 
