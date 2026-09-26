@@ -919,6 +919,11 @@ def _zero_reach(lines, ins, p, reg, nr, depth=0):
                     and ins[q - 1][0] in nr):
                 return True     # ql is the slot of a `j`: no fall-through entrant
         if _src_is_branch(ql):
+            # the fall-through of a conditional branch: it was not taken and
+            # writes no register (its slot was scanned already): keep walking
+            if ql.split("#", 1)[0].split(None, 1)[0].lower() in _COND_BR_MN:
+                li = qi
+                continue
             return False
         d, _u = defs_uses(ql.split("#", 1)[0].strip())
         if reg in d:
