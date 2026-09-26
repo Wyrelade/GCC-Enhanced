@@ -98,14 +98,16 @@ Phases A, B and the core of C are working.
 The tool was started while decompiling Digimon World 2 (PSX, SLUS-01193), the motivating case
 study, but the method is general to any PSX-era GCC 2.x matching decomp.
 
-Case study status (2026-09-26): 762 of 907 functions (84.01%) of the Digimon World 2 main
+Case study status (2026-09-26): 771 of 907 functions (85.01%) of the Digimon World 2 main
 executable are matched and rebuild byte-identical, up from 750 (82.69%) at the start of this
 round. New this round: block_iso (a straight-line block with the target's dataflow but a
 different order and temporaries is rewritten to the target's form), slot_unsteal (a loop counter
 update kept in the body instead of the back branch slot), sreg_swap (a transposition of two
 callee-saved registers followed by web renaming), licm_li (a loop-head constant hoisted into the
 preheader), la_unfold for stores, flavors without the second scheduling pass, a compare against
-an immediate zero, and a taken_fill form for jumps left in noreorder groups.
+an immediate zero, a taken_fill form for jumps left in noreorder groups, accesses to distinct
+named objects treated as disjoint by the schedulers, and a fix that stops a divide trap from
+being counted as a branch.
 
 ## Tools
 
