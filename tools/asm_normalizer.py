@@ -749,22 +749,9 @@ def shift_const_fold_s(stext, allowed):
         cnt = _src_reg(m.group(6))
         if not cnt:
             continue
-        k = None
-        for q in range(p - 1, -1, -1):
-            qi, ql = ins[q]
-            if q == p - 1 and _src_is_branch(ql) and not _src_is_ret(ql):
-                continue            # we sit in its delay slot: it has not transferred yet
-            if _src_is_branch(ql) or any(_branch_target_label(lines, ins, x)
-                                        for x in lines[qi:li]):
-                break
-            d, _u = defs_uses(ql.split("#", 1)[0].strip())
-            if cnt in d:
-                c = _CONST_DEF_S.match(ql)
-                if c:
-                    reg = c.group(1) or c.group(3)
-                    if _src_reg(reg) == cnt:
-                        k = int(c.group(2) or c.group(4), 0)
-                break
+        # the constant's straight-line reaching def (also on the fall-through
+        # of a conditional branch)
+        k = _const_reaching(lines, ins, p, cnt)
         if k is None or not (0 <= k <= 31) or (m.group(2), k) not in allowed:
             continue
         lines[li] = "%s%s\t%s,%s,%d" % (m.group(1), m.group(2), m.group(4), m.group(5), k)
@@ -6692,6 +6679,91 @@ def giv_rebase_pass(stext, tgt):
     return "\n".join(lines) if changed else stext
 
 
+# --------------------------------------------------------------------------
+# ior_add: combine turns `(x << k) + y` into `or` when y's nonzero bits fit below
+# bit k (a zero-extended lbu/lhu or an andi mask); retail keeps addu. With
+# disjoint bits both give the same value. Rewrite `or R,A,B` -> `addu R,A,B`
+# when one operand's reaching def in the block is `sll _,_,k` and the other's is
+# lbu (k >= 8) / lhu (k >= 16) / andi with a mask below 1 << k, while the target
+# has more addu and fewer or than ours (count-guided). Count-preserving.
+# --------------------------------------------------------------------------
+_IA_OR = re.compile(r"^(\s*)or\s+(\$\w+)\s*,\s*(\$\w+)\s*,\s*(\$\w+)\s*(#.*)?$")
+
+
+def _ia_def(lines, i, reg):
+    """The body of reg's reaching def in the straight-line block before line i."""
+    for j in range(i - 1, -1, -1):
+        lj = lines[j]
+        if _join_label(lines, j):
+            return None
+        if not _s_is_insn(lj) or lj.strip().startswith("."):
+            continue
+        body = lj.split("#", 1)[0].strip()
+        mn = body.split(None, 1)[0].lower()
+        if mn in _COND_BR_MN:
+            continue
+        if _src_is_branch(body) or _src_is_ret(body) or re.match(r"jalr?\b", body):
+            return None
+        if reg in defs_uses(body)[0]:
+            return body
+    return None
+
+
+def _ia_bits(body):
+    """Upper bound (exclusive bit index) of body's result, or the sll amount as
+    ('sll', k)."""
+    mn, regs, sk = insn_parts(body)
+    if mn == "lbu":
+        return 8
+    if mn == "lhu":
+        return 16
+    if mn == "andi" and sk:
+        v = _sm_int(sk[-1])
+        return v.bit_length() if v is not None else None
+    if mn == "sll" and len(regs) == 2 and sk:
+        v = _sm_int(sk[-1])
+        return ("sll", v) if v is not None else None
+    return None
+
+
+def ior_add_pass(stext, tgt):
+    if not tgt:
+        return stext
+    lines = stext.split("\n")
+    t_add = sum(1 for _w, d in tgt if d.strip().split(None, 1)[0] == "addu")
+    t_or = sum(1 for _w, d in tgt if d.strip().split(None, 1)[0] == "or")
+    ours = [l.split("#", 1)[0].strip() for l in lines if _s_is_insn(l) and not l.strip().startswith(".")]
+    # cc1 writes `addu $d,$s,K` for addiu: count only register-register addu
+    o_add = sum(1 for b in ours if b.split(None, 1)[0] == "move" or
+                (b.split(None, 1)[0] == "addu" and split_ops(b.split(None, 1)[1])[-1].strip().startswith("$")))
+    o_or = sum(1 for b in ours if b.split(None, 1)[0] == "or")
+    changed = False
+    for i, l in enumerate(lines):
+        if not (t_add > o_add and t_or < o_or):
+            break
+        m = _IA_OR.match(l)
+        if not m:
+            continue
+        a, b = norm_reg(m.group(3)), norm_reg(m.group(4))
+        if "zero" in (a, b):
+            continue
+        da, db = _ia_def(lines, i, a), _ia_def(lines, i, b)
+        if not da or not db:
+            continue
+        ba, bb = _ia_bits(da), _ia_bits(db)
+        ok = False
+        for x, y in ((ba, bb), (bb, ba)):
+            if isinstance(x, tuple) and isinstance(y, int) and x[1] is not None and y <= x[1]:
+                ok = True
+        if not ok:
+            continue
+        lines[i] = "%saddu\t%s,%s,%s" % (m.group(1), m.group(2), m.group(3), m.group(4))
+        o_add += 1
+        o_or -= 1
+        changed = True
+    return "\n".join(lines) if changed else stext
+
+
 PASSES = {
     # reg_realloc is applied specially (it needs sigma from words); the ordered
     # list in the manifest still names it so the recipe is explicit and auditable.
@@ -6744,6 +6816,7 @@ PASSES = {
     "sra_keep": sra_keep_pass,
     "call_slot_sink": call_slot_sink_pass,
     "giv_rebase": giv_rebase_pass,
+    "ior_add": ior_add_pass,
 }
 
 # Passes that CHANGE the instruction count and so must run BEFORE sigma is derived
