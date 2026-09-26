@@ -1614,7 +1614,7 @@ def _bi_op_text(o):
     return re.sub(r"(?<![\w$])(-?)0x([0-9a-fA-F]+)", lambda m: str(int(m.group(1) + m.group(2), 16)), o)
 
 
-def _bi_try(lines, blk, tkeys, tgt, wpos):
+def _bi_try(lines, blk, tkeys, tgt, wpos, anchors=()):
     """One block_iso attempt on units `blk`: (pi, tw), "same" or None."""
     ou, nw = [], []
     for a, z, b in blk:
@@ -1646,9 +1646,10 @@ def _bi_try(lines, blk, tkeys, tgt, wpos):
             starts.add(st)
             starts.add(q - off)
         off += k
-    for st in sorted(starts, key=lambda q: abs(q - wpos[blk[0][0]])):
-        if st < 0 or st >= len(tgt):
-            continue
+    est = wpos[blk[0][0]] + _sm_drift(anchors, blk[0][0])
+    for st in sorted(starts, key=lambda q: abs(q - est)):
+        if st < 0 or st >= len(tgt) or (anchors and abs(st - est) > 8):
+            continue                    # another block with the same shape
         tw = _bi_tgt_units(tgt, st, span)
         if tw is None or len(tw) != len(ou):
             continue
@@ -1684,6 +1685,15 @@ def _bi_try(lines, blk, tkeys, tgt, wpos):
                         bad = True
         if bad:
             continue
+        # the assembler pads a load directly followed by a reader of its
+        # destination: the new order must need exactly the target's nops
+        order = sorted(range(len(pi)), key=lambda i: pi[i])
+        haz = sum(1 for p, q in zip(order, order[1:])
+                  if ou[p][0][0] in ("lw", "lh", "lhu", "lb", "lbu") and ou[p][1]
+                  and ou[p][1] in ou[q][2])
+        tnops = tw[-1][0] + tw[-1][1] - st - span
+        if haz != tnops:
+            continue
         return pi, tw
     return None
 
@@ -1699,6 +1709,14 @@ def block_iso_pass(stext, tgt):
         wpos[i] = w
         w += _src_nwords(l)
     blocks = _sm_units(lines, ins, None, reorder_after_br=True)
+    # anchors (as sched_match): units whose key occurs once in the target
+    anchors = []
+    for blk0 in blocks:
+        for u in blk0:
+            k = _sm_srckey(u[2])
+            qs = [q for q, tk in enumerate(tkeys) if k is not None and tk == k]
+            if len(qs) == 1 and u[0] in wpos:
+                anchors.append((u[0], qs[0] - wpos[u[0]]))
     edits = []
     for blk0 in blocks:
         # the whole block, else with up to 3 units trimmed at either end (a
@@ -1708,7 +1726,7 @@ def block_iso_pass(stext, tgt):
                       key=lambda ij: (ij[0] - ij[1], ij[0]))
         for i, j in subs:
             blk = blk0[i:j]
-            r = _bi_try(lines, blk, tkeys, tgt, wpos)
+            r = _bi_try(lines, blk, tkeys, tgt, wpos, anchors)
             if r == "same" and (i, j) == (0, n0):
                 break
             if r and r != "same":
