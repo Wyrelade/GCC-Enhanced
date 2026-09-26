@@ -2060,6 +2060,52 @@ def _taken_fill_core(stext, tgt):
         if not _tf_place(new, at, f1, d1, u1):
             continue
         lines = new
+    # Op F2: Op F for a branch cc1 left in reorder mode (the nodb flavors):
+    # `bc r,L1; X; j L2; L1:` where the assembler moves X into the jump's slot and
+    # leaves the branch slot empty, and retail has `binv r,L2; X`. X then also runs
+    # on the L1 path, so its destination must be dead there.
+    for k in range(len(ours)):
+        ours = _tf_branches(lines)
+        if len(ours) != len(tb) or k >= len(ours):
+            break
+        bi, nr = ours[k]
+        tk = tb[k]
+        if nr or tk + 1 >= len(tgt):
+            continue
+        mb = re.match(r"(\s*)(\w+)(\s+.*,\s*)(\$L\w+)\s*$", lines[bi].split("#", 1)[0])
+        if not mb or _TF_INV.get(mb.group(2)) is None:
+            continue
+        inv = _TF_INV[mb.group(2)]
+        tmn = tgt[tk][1].split(None, 1)[0].lower()
+        if tmn not in (inv, {"bne": "bnez", "beq": "beqz"}.get(inv, inv)) and not (
+                inv in ("bnez", "beqz") and tmn == inv[:3]):
+            continue
+        xi = _tf_next_insn(lines, bi)
+        ji = _tf_next_insn(lines, xi) if xi is not None else None
+        if ji is None or any(_join_label(lines, y) for y in range(bi + 1, ji)):
+            continue
+        if any(lines[y].strip().startswith(".set") for y in range(bi + 1, ji)):
+            continue
+        mj = re.match(r"\s*j\s+(\$L\w+)\s*$", lines[ji].split("#", 1)[0])
+        if not mj:
+            continue
+        l1 = mb.group(4)
+        nxt = _tf_next_insn(lines, ji)
+        if nxt is None or not any(lines[y].strip() == l1 + ":" for y in range(ji + 1, nxt)):
+            continue
+        fx = _ff_word_form(lines[xi].split("#", 1)[0].strip())
+        if fx is None or _sm_key(tgt[tk + 1][1].strip(), True) != _sm_key(fx, False):
+            continue
+        dx, _ux = defs_uses(fx)
+        if len(dx) != 1:
+            continue
+        ins = [(i, l) for i, l in enumerate(lines) if _s_is_insn(l)]
+        if not _ff_dead_on(lines, ins, l1, next(iter(dx))):
+            continue
+        ind = mb.group(1)
+        lines[bi:ji + 1] = [ind + ".set\tnoreorder", ind + ".set\tnomacro",
+                            ind + inv + mb.group(3) + mj.group(1), _src_indent(lines[xi]) + fx,
+                            ind + ".set\tmacro", ind + ".set\treorder"]
     # Op C: our slot holds an insn cc1 stole from the fall-through path where the
     # target leaves a nop: put it back on the fall-through, right before the first
     # insn that reads its destination (its destination must be dead on the taken
