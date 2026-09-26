@@ -1684,7 +1684,7 @@ def _ff_nr_swap(stext, tgt):
     there, Y no longer does)."""
     if not tgt:
         return stext
-    tb = [k for k, (_w, d) in enumerate(tgt) if d.split(None, 1)[0].lower() in _COND_BR_MN]
+    tb = _tgt_cond_branches(tgt, stext)
     lines = stext.split("\n")
     ours = _tf_branches(lines)
     if len(ours) != len(tb):
@@ -1743,8 +1743,7 @@ def _ff_nr_swap(stext, tgt):
 
 def fallthrough_fill_pass(stext, tgt):
     stext = _ff_nr_swap(stext, tgt)
-    tb = [k for k, (_w, d) in enumerate(tgt)
-          if d.split(None, 1)[0].lower() in _COND_BR_MN] if tgt else []
+    tb = _tgt_cond_branches(tgt, stext) if tgt else []
     lines = stext.split("\n")
     ins = [(i, l) for i, l in enumerate(lines) if _s_is_insn(l)]
     noreo = False
@@ -2088,7 +2087,7 @@ def taken_fill_pass(stext, tgt):
 def _taken_fill_core(stext, tgt):
     if not tgt:
         return stext
-    tb = [k for k, (_w, d) in enumerate(tgt) if d.split(None, 1)[0].lower() in _COND_BR_MN]
+    tb = _tgt_cond_branches(tgt, stext)
     lines = stext.split("\n")
     ours = _tf_branches(lines)
     if len(ours) != len(tb):
@@ -2138,10 +2137,16 @@ def _taken_fill_core(stext, tgt):
         if len(d1) != 1 or len(d2) != 1:
             continue
         ins = [(i, l) for i, l in enumerate(lines) if _s_is_insn(l)]
-        if not _ff_dead_on(lines, ins, l1, next(iter(d2))):
+        # S1 goes back on the L1 path before the first reader of its dest, so a
+        # S2 writing that same register is overwritten there before any read
+        same = set(d1) == set(d2) and not (set(d1) & set(u1))
+        if not same and not _ff_dead_on(lines, ins, l1, next(iter(d2))):
             continue
         if not _ff_dead_on(lines, ins, mj.group(1), next(iter(d1))):
             continue
+        # retail may also keep a copy of S1 right before the inverted branch
+        # (dead on the L2 path: checked above)
+        keep = tk >= 1 and _sm_key(tgt[tk - 1][1].strip(), True) == _sm_key(f1, False)
         new = list(lines)
         # s2 line and the j group go; the branch becomes binv L2 with S2 in its slot
         grp_end = s2 + 1
@@ -2156,6 +2161,11 @@ def _taken_fill_core(stext, tgt):
         at = grp_start
         if not _tf_place(new, at, f1, d1, u1):
             continue
+        if keep:
+            b0 = bi
+            while b0 > 0 and new[b0 - 1].strip().startswith(".set"):
+                b0 -= 1
+            new.insert(b0, _src_indent(new[bi]) + f1)
         lines = new
     # Op F2: Op F for a branch cc1 left in reorder mode (the nodb flavors):
     # `bc r,L1; X; j L2; L1:` where the assembler moves X into the jump's slot and
@@ -2203,6 +2213,86 @@ def _taken_fill_core(stext, tgt):
         lines[bi:ji + 1] = [ind + ".set\tnoreorder", ind + ".set\tnomacro",
                             ind + inv + mb.group(3) + mj.group(1), _src_indent(lines[xi]) + fx,
                             ind + ".set\tmacro", ind + ".set\treorder"]
+    # Op F3: a reorder-mode `bc r,L1` followed by cc1's noreorder group
+    # `j L2; S2` and then L1: retail has `binv r,L2; S2`. S2 now also runs on the
+    # L1 path: its dest must be dead there, or (target-guided: the target has it
+    # right after the slot) the straight-line insn R that last set that register
+    # before the branch is recomputed on the fall-through, ahead of L1.
+    for k in range(len(ours)):
+        ours = _tf_branches(lines)
+        if len(ours) != len(tb) or k >= len(ours):
+            break
+        bi, nr = ours[k]
+        tk = tb[k]
+        if nr or tk + 1 >= len(tgt):
+            continue
+        mb = re.match(r"(\s*)(\w+)(\s+.*,\s*)(\$L\w+)\s*$", lines[bi].split("#", 1)[0])
+        if not mb or _TF_INV.get(mb.group(2)) is None:
+            continue
+        inv = _TF_INV[mb.group(2)]
+        tmn = tgt[tk][1].split(None, 1)[0].lower()
+        if tmn not in (inv, {"bne": "bnez", "beq": "beqz"}.get(inv, inv)) and not (
+                inv in ("bnez", "beqz") and tmn == inv[:3]):
+            continue
+        ji = _tf_next_insn(lines, bi)
+        if ji is None or any(_join_label(lines, y) for y in range(bi + 1, ji)):
+            continue
+        mj = re.match(r"\s*j\s+(\$L\w+)\s*$", lines[ji].split("#", 1)[0])
+        nrs = _noreorder_lines(lines)
+        s2 = _tf_next_insn(lines, ji)
+        if not mj or ji not in nrs or s2 is None or s2 not in nrs:
+            continue
+        l1 = mb.group(4)
+        nxt = _tf_next_insn(lines, s2)
+        if nxt is None or not any(lines[y].strip() == l1 + ":" for y in range(s2 + 1, nxt)):
+            continue
+        f2 = _ff_word_form(lines[s2].split("#", 1)[0].strip())
+        if f2 is None or _sm_key(tgt[tk + 1][1].strip(), True) != _sm_key(f2, False):
+            continue
+        d2, _u2 = defs_uses(f2)
+        if len(d2) != 1:
+            continue
+        r2 = next(iter(d2))
+        ins = [(i, l) for i, l in enumerate(lines) if _s_is_insn(l)]
+        recompute = None
+        if not _ff_dead_on(lines, ins, l1, r2):
+            if tk + 2 >= len(tgt):
+                continue
+            # the last straight-line writer of r2 before the branch (slots included)
+            ri = None
+            for y in range(bi - 1, -1, -1):
+                ly = lines[y]
+                if _join_label(lines, y):
+                    break
+                if not _s_is_insn(ly) or ly.strip().startswith("."):
+                    continue
+                if re.match(r"\s*jalr?\b", ly) or _src_is_ret(ly):
+                    break
+                dy, uy = defs_uses(ly.split("#", 1)[0].strip())
+                if r2 in dy:
+                    ri = y
+                    break
+            if ri is None:
+                continue
+            fr = _ff_word_form(lines[ri].split("#", 1)[0].strip())
+            if fr is None or _sm_key(tgt[tk + 2][1].strip(), True) != _sm_key(fr, False):
+                continue
+            dr, ur = defs_uses(fr)
+            if r2 in ur or any(set(defs_uses(lines[y].split("#", 1)[0].strip())[0]) & set(ur)
+                               for y in range(ri + 1, bi) if _s_is_insn(lines[y])
+                               and not lines[y].strip().startswith(".")):
+                continue
+            recompute = fr
+        ind = mb.group(1)
+        end = s2 + 1
+        while end < len(lines) and lines[end].strip().startswith(".set"):
+            end += 1
+        grp = [ind + ".set\tnoreorder", ind + ".set\tnomacro",
+               ind + inv + mb.group(3) + mj.group(1), _src_indent(lines[s2]) + f2,
+               ind + ".set\tmacro", ind + ".set\treorder"]
+        if recompute:
+            grp.append(ind + recompute)
+        lines[bi:end] = grp
     # Op C: our slot holds an insn cc1 stole from the fall-through path where the
     # target leaves a nop: put it back on the fall-through, right before the first
     # insn that reads its destination (its destination must be dead on the taken
@@ -4104,6 +4194,17 @@ def _su_rehome(lines, j, s, pb, pc, tl, label, ob, tb, nr):
     return True
 
 
+def _tgt_cond_branches(tgt, stext):
+    """Indices of the target's conditional branches that pair with our source's.
+    A 3-operand divide macro in our source assembles its check branches itself,
+    so while our text has no explicit `break`, the target's div/rem check
+    branches are left out of the pairing."""
+    tb = [k for k, (_w, d) in enumerate(tgt) if d.split(None, 1)[0].lower() in _COND_BR_MN]
+    if re.search(r"^\s*break\b", stext, re.M):
+        return tb
+    return [k for k in tb if not _tgt_div_check(tgt, k)]
+
+
 def _tgt_div_check(tgt, k):
     """Target word k is a branch of an aspsx div/rem check expansion (`bnez d,L;
     nop; break 7` and the signed `bne d,$at,L` / `bne s,$at,L` overflow checks),
@@ -5306,7 +5407,7 @@ def selfmove_nop_pass(stext, tgt):
 def slot_swap_pass(stext, tgt):
     if not tgt:
         return stext
-    tb = [k for k, (_w, d) in enumerate(tgt) if d.split(None, 1)[0].lower() in _COND_BR_MN]
+    tb = _tgt_cond_branches(tgt, stext)
     lines = stext.split("\n")
     if len(_tf_branches(lines)) != len(tb):
         return stext
@@ -5388,7 +5489,7 @@ def slot_swap_pass(stext, tgt):
 def slot_retake_pass(stext, tgt):
     if not tgt:
         return stext
-    tb = [k for k, (_w, d) in enumerate(tgt) if d.split(None, 1)[0].lower() in _COND_BR_MN]
+    tb = _tgt_cond_branches(tgt, stext)
     lines = stext.split("\n")
     if len(_tf_branches(lines)) != len(tb):
         return stext
@@ -5946,6 +6047,7 @@ def delay_fill_src(span, tgt, our_words):
             our_slot_nop.append(is_nop(nxt) or not nxt.strip())
     lines = span.split("\n")
     ins = [(i, l) for i, l in enumerate(lines) if _s_is_insn(l)]
+    nrl = _noreorder_lines(lines)
     drop = set()
     move = {}                   # branch_line_idx -> (prev_line_idx, prev_text)
     keep_nop = set()            # branch line idx whose filler leaves a load-delay nop
@@ -5973,6 +6075,8 @@ def delay_fill_src(span, tgt, our_words):
         pi, pl = ins[p - 1]
         if _src_is_branch(pl) or _src_is_nop(pl):
             continue
+        if pi in nrl and p >= 2 and _src_is_branch(ins[p - 2][1]):
+            continue            # already another transfer's slot (noreorder group)
         if re.match(r"\s*(div|divu|rem|remu)\s+\$\w+\s*,\s*\$\w+\s*,\s*\$\w+", pl):
             continue            # a divide macro is many words: never a slot filler
         # dependency: prev must not define a register the branch reads
