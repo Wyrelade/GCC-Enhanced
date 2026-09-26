@@ -98,16 +98,15 @@ Phases A, B and the core of C are working.
 The tool was started while decompiling Digimon World 2 (PSX, SLUS-01193), the motivating case
 study, but the method is general to any PSX-era GCC 2.x matching decomp.
 
-Case study status (2026-09-26): 785 of 907 functions (86.55%) of the Digimon World 2 main
-executable are matched and rebuild byte-identical, up from 771 (85.01%) at the start of this
-round. New this round: the assembler wrapper expands a large constant-offset load through its
-own destination register like the original assembler, sra_keep (an arithmetic shift of a
-zero-extended value), ior_add (an or of disjoint bit fields kept as an add), call_slot_sink (a
-callee-saved constant moved from a call slot to the next jump slot), giv_rebase (an induction
-base derived from the register just set from the same source), the pre-sigma scheduler pairing
-symbolic loads whose temporaries differ, callee-saved renaming that includes $fp and tries
-rotations of three registers, constant folding past conditional branches, and a callee argument
-read analysis that follows the callee's control flow instead of single blocks.
+Case study status (2026-09-26): 800 of 907 functions (88.20%) of the Digimon World 2 main
+executable are matched and rebuild byte-identical, up from 785 (86.55%) at the start of this
+round. New this round: la_copy (a loop base built in a temporary and copied into a callee-saved
+register in the preheader), thread_steal (a branch delay slot filled from the jump target of its
+fall-through), slot_sink (an empty branch slot whose instruction sits further down the
+fall-through), selfmove_drop, an injective variant of the register renaming, block reordering
+that matches a symbol plus offset by address and trims more of a block head, load-delay fixes
+for indirect calls and for fills across labels, and unaligned half loads that read their
+destination.
 
 ## Tools
 
