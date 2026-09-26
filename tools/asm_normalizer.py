@@ -1095,6 +1095,8 @@ def _sm_key(body, target):
             # immediate operand macro: the assembler emits the -i form
             mn = {"slt": "slti", "sltu": "sltiu", "and": "andi", "or": "ori",
                   "xor": "xori"}[mn]
+        elif mn in ("sll", "srl", "sra") and len(ops) == 3 and ops[2].startswith("$"):
+            mn += "v"                       # shift by register: the assembler's -v form
     key = [mn]
     for o in ops:
         m = re.fullmatch(r"(-?(?:0x[0-9a-fA-F]+|\d+))\((\$?\w+)\)", o)
@@ -1166,7 +1168,7 @@ def _sm_indep(a, b, stable=frozenset()):
     return True
 
 
-def _sm_units(lines, ins, la_tmp=None):
+def _sm_units(lines, ins, la_tmp=None, reorder_after_br=False):
     """Straight-line blocks of movable units. A unit is one insn line, or an
     explicitly expanded symbolic access `.set noat; lui $1,%hi(S); op ..%lo(S)($1);
     .set at` (keyed and dependency-checked by its %lo insn). Returns
@@ -1221,10 +1223,14 @@ def _sm_units(lines, ins, la_tmp=None):
         if i in ins_at:
             br = bool(_src_is_branch(l) or _src_is_ret(l) or re.match(r"\s*jalr?\b", l))
             if noreo or br or prev_br:
+                was_prev = prev_br
                 flush()
                 prev_br = br
-                i += 1
-                continue
+                # (reorder_after_br: in reorder mode the insn after a transfer is
+                # not a delay slot, so it starts the next block as a movable unit)
+                if not (was_prev and reorder_after_br and not noreo and not br):
+                    i += 1
+                    continue
             mh = re.match(r"\s*lui\s+(\$\w+)\s*,\s*%hi\(([^)]+)\)\s*$", l.split("#", 1)[0])
             if mh and mh.group(1) not in ("$1", "$at"):
                 j = next((x for x, _l in ins if x > i), None)
@@ -1332,8 +1338,25 @@ def _sm_drift(anchors, line):
     return min(anchors, key=lambda a: abs(a[0] - line))[1]
 
 
-def sched_match_pass(stext, tgt):
+def _sm_mask_s(k):
+    """A key with callee-saved register names masked (before reg_realloc the
+    s-registers may be permuted relative to the target)."""
+    if not isinstance(k, tuple):
+        return k
+    return tuple("S" if isinstance(x, str) and re.match(r"s[0-7]$", x) else x for x in k)
+
+
+def sched_pre_pass(stext, tgt):
+    """sched_match before sigma (PRE_SIGMA, count-preserving): units whose exact
+    key has no target match are paired by their key with the s-registers masked,
+    so a block whose s-registers are permuted can be put in target order first
+    and sigma is then derived from aligned code."""
+    return sched_match_pass(stext, tgt, mask_s=True)
+
+
+def sched_match_pass(stext, tgt, mask_s=False):
     tkeys = [_sm_key(d.strip(), True) for _w, d in tgt]
+    tmask = [_sm_mask_s(k) for k in tkeys]
     lines = stext.split("\n")
     ins = [(i, l) for i, l in enumerate(lines) if _s_is_insn(l)]
     used = set()
@@ -1342,7 +1365,7 @@ def sched_match_pass(stext, tgt):
     # address it resolves to) is a barrier: reorder the matched runs around it
     runs = []
     la_tmp = {}
-    blocks = _sm_units(lines, ins, la_tmp)
+    blocks = _sm_units(lines, ins, la_tmp, reorder_after_br=mask_s)
     wpos, w = {}, 0
     for i, l in ins:
         wpos[i] = w
@@ -1388,6 +1411,10 @@ def sched_match_pass(stext, tgt):
             # target occurrence nearest to where this unit sits
             cands = [q for q, tk in enumerate(tkeys)
                      if k is not None and tk == k and q not in used]
+            if not cands and mask_s and k is not None:
+                km = _sm_mask_s(k)
+                if km != k:
+                    cands = [q for q, tk in enumerate(tmask) if tk == km and q not in used]
             est = wpos.get(u[0], 0) + _sm_drift(anchors, u[0])
             t = min(cands, key=lambda q: (abs(q - est), q)) if cands else None
             if t is None:
@@ -3606,6 +3633,149 @@ def const_fold_pass(stext, tgt):
 
 
 # --------------------------------------------------------------------------
+# arg_unprop: our sched1 hoisted a call's argument copy `move $aN,$S` above other
+# work, and cse then fed that work from the copy ($aN) instead of $S. Retail keeps
+# the copies right before the call and the work reads $S. Rewrite each non-call
+# reader of $aN between the copy and its call to read $S (same value: neither is
+# written in between), so sched_match can sink the copy. Target-guided: fires only
+# when the target has no insn other than a copy that reads $aN in a
+# straight-line call setup, i.e. the target's reader of that value reads an
+# s-register. Count-preserving.
+# --------------------------------------------------------------------------
+_AU_MOVE = re.compile(r"^(\s*)move\s+(\$\w+)\s*,\s*(\$\w+)\s*(#.*)?$")
+
+
+def _au_tgt_arg_reads(tgt):
+    """Number of target insns that read an argument register and are not a copy,
+    a call, a store of it, or a branch."""
+    n = 0
+    for _w, d in tgt:
+        mn, regs, _sk = insn_parts(d.strip())
+        if mn in ("jal", "jalr", "addu", "or") and (mn in ("jal", "jalr") or "zero" in regs[1:]):
+            continue
+        if mn in _STORE_MN or mn in _COND_BR_MN:
+            continue
+        _d, u = defs_uses(d.strip())
+        if any(r in ("a0", "a1", "a2", "a3") for r in u):
+            n += 1
+    return n
+
+
+def arg_unprop_pass(stext, tgt):
+    if not tgt:
+        return stext
+    lines = stext.split("\n")
+    nr = _noreorder_lines(lines)
+    ours = [l.split("#", 1)[0].strip() for l in lines if _s_is_insn(l) and not l.strip().startswith(".")]
+    budget = _au_tgt_arg_reads(tgt) - _au_tgt_arg_reads([(0, b) for b in ours])
+    if budget >= 0:
+        return stext
+    changed = False
+    for i, l in enumerate(lines):
+        m = _AU_MOVE.match(l)
+        if not m or i in nr:
+            continue
+        a, src = norm_reg(m.group(2)), norm_reg(m.group(3))
+        if a not in ("a0", "a1", "a2", "a3") or not re.match(r"s[0-7]$", src or ""):
+            continue
+        hits, ok = [], False
+        for j in range(i + 1, len(lines)):
+            lj = lines[j]
+            if _join_label(lines, j):
+                break
+            if not _s_is_insn(lj) or lj.strip().startswith("."):
+                continue
+            body = lj.split("#", 1)[0].strip()
+            if re.match(r"jal\s", body):
+                ok = True
+                break
+            if _src_is_branch(lj) or _src_is_ret(lj):
+                break
+            d, u = defs_uses(body)
+            if a in d or src in d:
+                break
+            if a in u and j not in nr:
+                hits.append(j)
+        if not ok or not hits:
+            continue
+        for j in hits:
+            body, com = (lines[j].split("#", 1) + [""])[:2]
+            nb = re.sub(r"(?<![\w$])%s(?![\w])" % re.escape(m.group(2)), m.group(3), body)
+            if nb != body:
+                lines[j] = nb + ("#" + com if com else "")
+                changed = True
+    return "\n".join(lines) if changed else stext
+
+
+# --------------------------------------------------------------------------
+# sreg_perm: our allocator gave the callee-saved pseudos the s-registers in a
+# different order than retail (e.g. param copy in s2, a global's address in s0,
+# retail the other way round) while everything else lines up. Renaming the
+# s-registers consistently over the whole function (saves and restores
+# included) preserves its meaning. Try every permutation of the s-registers we
+# use (up to 5) and keep the one whose insn sequence matches the target best,
+# only when it beats the identity. save_slot then re-lays the save area.
+# Count-preserving.
+# --------------------------------------------------------------------------
+_SR_NUM = {"s%d" % k: "$%d" % (16 + k) for k in range(8)}
+
+
+def _sr_rename(lines, perm):
+    pat = re.compile(r"\$(1[6-9]|2[0-3]|s[0-7])(?![\w])")
+
+    def sub(m):
+        r = norm_reg(m.group(0))
+        n = perm.get(r, r)
+        if n == r:
+            return m.group(0)
+        return _SR_NUM[n] if m.group(1).isdigit() else "$" + n
+    out = []
+    for l in lines:
+        if _s_is_insn(l) and not l.strip().startswith("."):
+            body, sep, com = l.partition("#")
+            out.append(pat.sub(sub, body) + sep + com)
+        else:
+            out.append(l)
+    return out
+
+
+def sreg_perm_pass(stext, tgt):
+    if not tgt:
+        return stext
+    import itertools
+    lines = stext.split("\n")
+    used = set()
+    for l in lines:
+        if _s_is_insn(l) and not l.strip().startswith("."):
+            d, u = defs_uses(l.split("#", 1)[0].strip())
+            used |= {r for r in list(d) + list(u) if re.match(r"s[0-7]$", r or "")}
+    used = sorted(used)
+    if len(used) < 2 or len(used) > 5:
+        return stext
+    tk = [_sm_key(d.strip(), True) for _w, d in tgt]
+    tk = [k for k in tk if k not in (None, "skip")]
+
+    def score(ls):
+        ok = [_sm_srckey(l.split("#", 1)[0].strip()) for l in ls
+              if _s_is_insn(l) and not l.strip().startswith(".")]
+        ok = [k for k in ok if k is not None]
+        sm = difflib.SequenceMatcher(None, ok, tk, autojunk=False)
+        return sum(b.size for b in sm.get_matching_blocks())
+    base = score(lines)
+    best, best_s = None, base
+    for pm in itertools.permutations(used):
+        perm = dict(zip(used, pm))
+        if all(k == v for k, v in perm.items()):
+            continue
+        sc = score(_sr_rename(lines, perm))
+        if sc > best_s:
+            best, best_s = perm, sc
+    if best is None:
+        return stext
+    return "\n".join(_sr_rename(lines, best))
+
+
+# --------------------------------------------------------------------------
 # web_resched: web_realloc then sched_match again, run after sched_match. A load
 # the target hoists above a store can be stuck twice over: its destination is the
 # register the store's base lives in (a true dependence), and the target's
@@ -5413,7 +5583,10 @@ PASSES = {
     "copy_use": copy_use_pass,
     "ra_restore_sink": ra_restore_sink_pass,
     "sched_match": sched_match_pass,
+    "sched_pre": sched_pre_pass,
     "web_resched": web_resched_pass,
+    "sreg_perm": sreg_perm_pass,
+    "arg_unprop": arg_unprop_pass,
     "const_fold": const_fold_pass,
     "fallthrough_fill": fallthrough_fill_pass,
     "taken_fill": taken_fill_pass,
@@ -5442,7 +5615,7 @@ PASSES = {
 PRE_SIGMA_PASSES = ("un_hi_cse", "un_hi_cse_store", "exit_merge", "base_cse_collapse",
                     "shift_const_fold", "zero_remat", "load_remat", "nodiv",
                     "offset_unfold", "zext_keep", "zero_cmp", "param_copy",
-                    "undo_drop", "la_unfold")
+                    "undo_drop", "la_unfold", "arg_unprop", "sched_pre")
 
 # --------------------------------------------------------------------------
 # WORD-LEVEL passes. The original PSY-Q assembler (aspsx) scheduled branch and
