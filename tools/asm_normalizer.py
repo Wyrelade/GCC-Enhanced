@@ -4324,6 +4324,48 @@ def sreg_perm_pass(stext, tgt):
 
 
 # --------------------------------------------------------------------------
+# sreg_swap: an s-register can host two webs (a parameter copy early, a loop
+# accumulator late) while retail swapped only the early ones between two
+# s-registers. sreg_perm's whole-function rename then fixes the early webs and
+# breaks the late ones, so it never wins. Try each transposition of two
+# s-registers over the whole function followed by web_realloc (which moves the
+# late webs back where the target wants them, soundly: interference checked);
+# keep the best when it beats web_realloc alone. Count-preserving.
+# --------------------------------------------------------------------------
+def sreg_swap_pass(stext, tgt):
+    if not tgt:
+        return stext
+    import itertools
+    lines = stext.split("\n")
+    used = set()
+    for l in lines:
+        if _s_is_insn(l) and not l.strip().startswith("."):
+            d, u = defs_uses(l.split("#", 1)[0].strip())
+            used |= {r for r in list(d) + list(u) if re.match(r"s[0-7]$", r or "")}
+    used = sorted(used)
+    if len(used) < 2:
+        return stext
+    tk = [_sm_key(d.strip(), True) for _w, d in tgt]
+    tk = [k for k in tk if k not in (None, "skip")]
+
+    def score(txt):
+        ok = [_sm_srckey(l.split("#", 1)[0].strip()) for l in txt.split("\n")
+              if _s_is_insn(l) and not l.strip().startswith(".")]
+        ok = [k for k in ok if k is not None]
+        sm = difflib.SequenceMatcher(None, ok, tk, autojunk=False)
+        return sum(b.size for b in sm.get_matching_blocks())
+    best = web_realloc_pass(stext, tgt)
+    best_s = score(best)
+    base_s = best_s
+    for x, y in itertools.combinations(used, 2):
+        cand = web_realloc_pass("\n".join(_sr_rename(lines, {x: y, y: x})), tgt)
+        sc = score(cand)
+        if sc > best_s:
+            best, best_s = cand, sc
+    return best if best_s > base_s else stext
+
+
+# --------------------------------------------------------------------------
 # web_resched: web_realloc then sched_match again, run after sched_match. A load
 # the target hoists above a store can be stuck twice over: its destination is the
 # register the store's base lives in (a true dependence), and the target's
@@ -6145,6 +6187,7 @@ PASSES = {
     "sched_pre": sched_pre_pass,
     "web_resched": web_resched_pass,
     "sreg_perm": sreg_perm_pass,
+    "sreg_swap": sreg_swap_pass,
     "block_iso": block_iso_pass,
     "slot_unsteal": slot_unsteal_pass,
     "arg_unprop": arg_unprop_pass,
