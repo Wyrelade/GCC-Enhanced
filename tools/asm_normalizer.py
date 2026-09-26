@@ -1453,9 +1453,10 @@ def _bi_unit(key):
         return None
     mn = key[0]
     regs = [(k, x) for k, x in enumerate(key) if k and isinstance(x, str) and x in _BI_REGS]
-    if any(r in ("at", "sp", "gp") for _k, r in regs if mn not in _STORE_MN
-           and mn not in ("lw", "lh", "lhu", "lb", "lbu")):
+    if any(r == "at" for _k, r in regs):
         return None
+    if mn not in _STORE_MN and regs and regs[0][1] in ("sp", "gp"):
+        return None                         # the frame/global pointer is never rewritten
     shape = tuple("#" if (k and isinstance(x, str) and x in _BI_REGS) else x
                   for k, x in enumerate(key))
     if mn in _STORE_MN:
@@ -4445,6 +4446,94 @@ def sreg_swap_pass(stext, tgt):
 
 
 # --------------------------------------------------------------------------
+# licm_li: our loop head re-materializes a constant (`L: li R,K` with the back
+# branches jumping to L) where retail's loop.c hoisted it into the preheader.
+# Move the li above L (the preheader falls into L). Sound when every branch to L
+# lies in the loop region (L .. the last branch to L), nothing else in the region
+# writes R (no call either when R is caller-saved), and no label inside the
+# region is a branch target from outside it. Target-guided: the target has the
+# same li, and the insn after our li (the loop's first insn) does not follow it
+# directly in the target. Count-preserving; sched_match then places the li.
+# --------------------------------------------------------------------------
+def licm_li_pass(stext, tgt):
+    if not tgt:
+        return stext
+    tkeys = [_sm_key(d.strip(), True) for _w, d in tgt]
+    lines = stext.split("\n")
+    changed = False
+    i = 0
+    while i < len(lines):
+        m = re.match(r"^\s*(\$L\w+):\s*$", lines[i])
+        if not m:
+            i += 1
+            continue
+        lab = m.group(1)
+        li = _tf_next_insn(lines, i)
+        if li is None or any(re.match(r"^\s*\$L\w+:", lines[y]) for y in range(i + 1, li)):
+            i += 1
+            continue
+        body = lines[li].split("#", 1)[0].strip()
+        mli = re.match(r"li\s+(\$\w+)\s*,\s*(-?(?:0x[0-9a-fA-F]+|\d+))$", body)
+        if not mli or li in _noreorder_lines(lines):
+            i += 1
+            continue
+        r = norm_reg(mli.group(1))
+        refs = [y for y, l in enumerate(lines) if _s_is_insn(l) and re.search(
+            r"[\s,]" + re.escape(lab) + r"\s*$", l.split("#", 1)[0])]
+        if not refs or min(refs) < i:
+            i += 1
+            continue
+        end = max(refs)
+        nx = _tf_next_insn(lines, li)
+        k_li = _sm_srckey(body)
+        k_nx = _sm_srckey(lines[nx].split("#", 1)[0].strip()) if nx is not None else None
+        ql = [q for q, k in enumerate(tkeys) if k == k_li]
+        if nx is not None and (k_nx is None or _src_is_branch(lines[nx])):
+            # a branch has no key (label operand): compare mnemonics
+            mn = lines[nx].split(None, 1)[0].lower()
+            qn = [q for q, (_w, d) in enumerate(tgt) if d.split(None, 1)[0].lower() == mn]
+        else:
+            qn = [q for q, k in enumerate(tkeys) if k == k_nx]
+        if not ql or not qn or any(b - a == 1 for a in ql for b in qn):
+            i += 1
+            continue
+        ok = True
+        inner = set()
+        for y in range(li + 1, end + 2):
+            if y >= len(lines):
+                break
+            l = lines[y]
+            ml = re.match(r"^\s*(\$L\w+):\s*$", l)
+            if ml:
+                inner.add(ml.group(1))
+                continue
+            if not _s_is_insn(l) or l.strip().startswith("."):
+                continue
+            b = l.split("#", 1)[0].strip()
+            if re.match(r"jalr?\b", b) and (r in ("v0", "v1", "at") or re.match(r"[at]\d$", r)):
+                ok = False
+                break
+            if r in defs_uses(_sm_dep_body(b))[0]:
+                ok = False
+                break
+        if ok:
+            for y, l in enumerate(lines):
+                if (y < i or y > end + 1) and _s_is_insn(l):
+                    t = re.search(r"[\s,](\$L\w+)\s*$", l.split("#", 1)[0])
+                    if t and t.group(1) in inner:
+                        ok = False
+                        break
+        if not ok:
+            i += 1
+            continue
+        line = lines.pop(li)
+        lines.insert(i, line)
+        changed = True
+        i = li + 1
+    return "\n".join(lines) if changed else stext
+
+
+# --------------------------------------------------------------------------
 # web_resched: web_realloc then sched_match again, run after sched_match. A load
 # the target hoists above a store can be stuck twice over: its destination is the
 # register the store's base lives in (a true dependence), and the target's
@@ -6267,6 +6356,7 @@ PASSES = {
     "web_resched": web_resched_pass,
     "sreg_perm": sreg_perm_pass,
     "sreg_swap": sreg_swap_pass,
+    "licm_li": licm_li_pass,
     "la_unfold_st": la_unfold_st_pass,
     "block_iso": block_iso_pass,
     "slot_unsteal": slot_unsteal_pass,
