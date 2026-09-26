@@ -1349,6 +1349,285 @@ def _sm_mask_s(k):
     return tuple("S" if isinstance(x, str) and re.match(r"s[0-7]$", x) else x for x in k)
 
 
+# --------------------------------------------------------------------------
+# block_iso: a straight-line block whose dataflow graph equals the target's but
+# whose order AND temporaries differ (sched_match keys on registers, so it cannot
+# pair the units). Target-guided, count-preserving: find the target window of the
+# block's word count, pair every unit with a target unit of the same operation
+# whose inputs are the same live-in registers or the paired producers (commutative
+# ALU operands in either order), require every register live after the block to
+# end with the paired value, and memory units that change relative order to be
+# independent. Then emit the target's units: a single-word unit as the target
+# insn, a symbolic access as our unit with its register renamed.
+# --------------------------------------------------------------------------
+_BI_ALU = {"addu", "addiu", "subu", "and", "andi", "or", "ori", "xor", "xori", "nor",
+           "sll", "srl", "sra", "sllv", "srlv", "srav", "slt", "slti", "sltu", "sltiu",
+           "lui", "lw", "lh", "lhu", "lb", "lbu", "sw", "sh", "sb", "la"}
+_BI_COMM = {"addu", "and", "or", "xor", "nor"}
+_BI_REGS = set(NUM2ABI) - {"zero"}
+
+
+def _bi_unit(key):
+    """(shape, dest, srcs) of a sched key, or None. Registers other than $zero
+    become value slots; the first register is the destination except for stores."""
+    if not isinstance(key, tuple) or not key or key[0] not in _BI_ALU:
+        return None
+    mn = key[0]
+    regs = [(k, x) for k, x in enumerate(key) if k and isinstance(x, str) and x in _BI_REGS]
+    if any(r in ("at", "sp", "gp") for _k, r in regs if mn not in _STORE_MN
+           and mn not in ("lw", "lh", "lhu", "lb", "lbu")):
+        return None
+    shape = tuple("#" if (k and isinstance(x, str) and x in _BI_REGS) else x
+                  for k, x in enumerate(key))
+    if mn in _STORE_MN:
+        return shape, None, [r for _k, r in regs]
+    if not regs or regs[0][0] != 1:
+        return None
+    return shape, regs[0][1], [r for _k, r in regs[1:]]
+
+
+def _bi_live_after(lines, last, reg):
+    """Conservative: may `reg` be read after line `last`?"""
+    for j in range(last + 1, len(lines)):
+        l = lines[j]
+        if _s_is_label(l):
+            return True
+        if not _s_is_insn(l):
+            continue
+        body = l.split("#", 1)[0].strip()
+        if re.match(r"\s*jal\s+\w+\s*$", body):
+            if reg in ("a0", "a1", "a2", "a3"):
+                return True
+            nb = next((lines[y] for y in range(j + 1, len(lines)) if _s_is_insn(lines[y])), "")
+            d, u = defs_uses(_sm_dep_body(nb.split("#", 1)[0].strip())) if nb else (set(), set())
+            if reg in u:
+                return True             # the call's delay slot reads it
+            # the callee clobbers the caller-saved temporaries
+            return reg not in ("v0", "v1", "at") and not re.match(r"t\d$", reg)
+        if _src_is_ret(l):
+            return reg in _FF_RET_LIVE
+        if _src_is_branch(l) or re.match(r"\s*jalr\b", l):
+            return True
+        d, u = defs_uses(_sm_dep_body(body))
+        if reg in u:
+            return True
+        if reg in d:
+            return False
+    return True
+
+
+def _bi_tgt_units(tgt, a, n):
+    """Target units in words [a, a+n): [(first_word, nwords, key)] or None."""
+    out, k = [], a
+    while k < a + n:
+        d = tgt[k][1].strip()
+        if is_branch(d) or re.match(r"\s*j", d):
+            return None
+        key = _sm_key(d, True)
+        if key == "skip":
+            if k + 1 >= a + n:
+                return None
+            k2 = _sm_key(tgt[k + 1][1].strip(), True)
+            if not isinstance(k2, tuple):
+                return None
+            out.append((k, 2, k2))
+            k += 2
+            continue
+        if not isinstance(key, tuple) or _SYM_RE.findall(d):
+            return None
+        out.append((k, 1, key))
+        k += 1
+    return out
+
+
+def _bi_match(ou, tu):
+    """Unit pairing pi (ours -> target) with equal dataflow, or None."""
+    n = len(ou)
+
+    def vals(units):
+        cur, res = {}, []
+        for sh, dst, srcs in units:
+            res.append([cur.get(r, ("in", r)) for r in srcs])
+            if dst:
+                cur[dst] = ("u", len(res) - 1)
+        return res, cur
+    ov, ofin = vals(ou)
+    tv, tfin = vals(tu)
+    pi, used = [None] * n, set()
+    steps = [0]
+
+    def ok_in(i, t):
+        if ou[i][0] != tu[t][0]:
+            return False
+        a = [x if x[0] == "in" else ("u", pi[x[1]]) for x in ov[i]]
+        b = tv[t]
+        if a == b:
+            return True
+        return ou[i][0][0] in _BI_COMM and len(a) == 2 and a == b[::-1]
+
+    def go(i):
+        if i == n:
+            return True
+        steps[0] += 1
+        if steps[0] > 20000:
+            return False
+        for t in range(n):
+            if t not in used and ok_in(i, t):
+                pi[i] = t
+                used.add(t)
+                if go(i + 1):
+                    return True
+                used.discard(t)
+        pi[i] = None
+        return False
+    if not go(0):
+        return None
+    return pi, ofin, tfin
+
+
+def _bi_reg_text(tok):
+    """cc1's spelling of a register: $sp/$fp/$gp by name, the rest numbered."""
+    r = norm_reg(tok)
+    if r is None:
+        return tok
+    return "$" + r if r in ("sp", "fp", "gp") else "$%d" % ABI2NUM[r]
+
+
+def _bi_op_text(o):
+    o = re.sub(r"\$\w+", lambda m: _bi_reg_text(m.group(0)), o.strip())
+    return re.sub(r"(?<![\w$])(-?)0x([0-9a-fA-F]+)", lambda m: str(int(m.group(1) + m.group(2), 16)), o)
+
+
+def _bi_try(lines, blk, tkeys, tgt, wpos):
+    """One block_iso attempt on units `blk`: (pi, tw), "same" or None."""
+    ou, nw = [], []
+    for a, z, b in blk:
+        u = _bi_unit(_sm_srckey(b))
+        if u is None:
+            break
+        dd, uu = defs_uses(_sm_dep_body(b))
+        dd, uu = set(dd) - {"at"}, set(uu) - {"at"}
+        if dd != ({u[1]} if u[1] else set()) or uu != set(u[2]):
+            break                       # the key does not carry every register
+        ou.append(u)
+        nw.append(sum(_src_nwords(lines[y]) for y in range(a, z + 1) if _s_is_insn(lines[y])))
+    if len(ou) != len(blk) or len(blk) < 3 or blk[0][0] not in wpos:
+        return None
+    span = sum(nw)
+    starts = set()
+    off = 0
+    for (a, z, b), k in zip(blk, nw):
+        key = _sm_srckey(b)
+        qs = [q for q, tk in enumerate(tkeys) if tk == key]
+        for q in qs:
+            starts.add(q - off)
+        off += k
+    for st in sorted(starts, key=lambda q: abs(q - wpos[blk[0][0]])):
+        if st < 0 or st + span > len(tgt):
+            continue
+        tw = _bi_tgt_units(tgt, st, span)
+        if tw is None or len(tw) != len(ou):
+            continue
+        tu = [_bi_unit(k) for _f, _n, k in tw]
+        if any(x is None for x in tu):
+            continue
+        m = _bi_match(ou, tu)
+        if m is None:
+            continue
+        pi, ofin, tfin = m
+        if all(pi[i] == i for i in range(len(pi))) and all(
+                ou[i][1] == tu[i][1] and ou[i][2] == tu[i][2] for i in range(len(pi))):
+            return "same"               # already the target's block
+        if any(nw[i] != tw[pi[i]][1] for i in range(len(pi))):
+            continue
+        last = blk[-1][1]
+        bad = False
+        for r in set(ofin) | set(tfin):
+            if not _bi_live_after(lines, last, r):
+                continue
+            if r not in ofin or r not in tfin or pi[ofin[r][1]] != tfin[r][1]:
+                bad = True
+                break
+        if bad:
+            continue
+        # memory units that change relative order must be independent
+        bodies = [_sm_dep_body(b) for _a, _z, b in blk]
+        for x in range(len(blk)):
+            for y in range(x + 1, len(blk)):
+                if pi[x] > pi[y] and _sm_mem(bodies[x]) and _sm_mem(bodies[y]):
+                    mx, my = _sm_mem(bodies[x]), _sm_mem(bodies[y])
+                    if (mx[0] or my[0]) and not _bi_mem_indep(mx, my, bodies[x], bodies[y]):
+                        bad = True
+        if bad:
+            continue
+        return pi, tw
+    return None
+
+
+def block_iso_pass(stext, tgt):
+    if not tgt:
+        return stext
+    tkeys = [_sm_key(d.strip(), True) for _w, d in tgt]
+    lines = stext.split("\n")
+    ins = [(i, l) for i, l in enumerate(lines) if _s_is_insn(l)]
+    wpos, w = {}, 0
+    for i, l in ins:
+        wpos[i] = w
+        w += _src_nwords(l)
+    blocks = _sm_units(lines, ins, None, reorder_after_br=True)
+    edits = []
+    for blk0 in blocks:
+        # the whole block, else with up to 3 units trimmed at either end (a
+        # unit the target moved into a delay slot leaves the window)
+        n0 = len(blk0)
+        subs = sorted({(i, j) for i in range(min(4, n0)) for j in range(max(i + 3, n0 - 3), n0 + 1)},
+                      key=lambda ij: (ij[0] - ij[1], ij[0]))
+        for i, j in subs:
+            blk = blk0[i:j]
+            r = _bi_try(lines, blk, tkeys, tgt, wpos)
+            if r == "same" and (i, j) == (0, n0):
+                break
+            if r and r != "same":
+                edits.append((blk, r[0], r[1]))
+                break
+    if not edits:
+        return stext
+    for blk, pi, tw in sorted(edits, key=lambda e: -e[0][0][0]):
+        for i, (a, z, b) in enumerate(blk):
+            f, n, _k = tw[pi[i]]
+            if n == 1:
+                d = tgt[f][1].strip()
+                p = d.split(None, 1)
+                ops = ",".join(_bi_op_text(o) for o in split_ops(p[1])) if len(p) > 1 else ""
+                insl = [y for y in range(a, z + 1) if _s_is_insn(lines[y])]
+                lines[insl[0]] = _src_indent(lines[insl[0]]) + p[0] + ("\t" + ops if ops else "")
+            else:
+                mp = {}
+                okey, tkey = _sm_srckey(b), tw[pi[i]][2]
+                for x, y in zip(okey, tkey):
+                    if isinstance(x, str) and x in _BI_REGS and isinstance(y, str):
+                        mp[x] = y
+                for y in range(a, z + 1):
+                    if _s_is_insn(lines[y]) and not re.match(r"\s*lui\s+\$(?:1|at)\s*,", lines[y]):
+                        lines[y] = re.sub(r"\$\w+", lambda m: (
+                            "$%d" % ABI2NUM[mp[norm_reg(m.group(0))]]
+                            if norm_reg(m.group(0)) in mp else m.group(0)), lines[y])
+        order = sorted(range(len(blk)), key=lambda i: pi[i])
+        _unit_permute(lines, blk, order)
+    return "\n".join(lines)
+
+
+def _bi_mem_indep(mx, my, bx, by):
+    wx, wy = mx[1], my[1]
+    if wx[0] == "sym" and wy[0] == "sym":
+        return wx[1] != wy[1]
+    if wx[0] == "sp" and wy[0] == "sp":
+        return wx[1] + wx[2] <= wy[1] or wy[1] + wy[2] <= wx[1]
+    if "sp" in (wx[0], wy[0]) and "sym" in (wx[0], wy[0]):
+        return True
+    return False
+
+
 def sched_pre_pass(stext, tgt):
     """sched_match before sigma (PRE_SIGMA, count-preserving): units whose exact
     key has no target match are paired by their key with the s-registers masked,
@@ -5705,6 +5984,7 @@ PASSES = {
     "sched_pre": sched_pre_pass,
     "web_resched": web_resched_pass,
     "sreg_perm": sreg_perm_pass,
+    "block_iso": block_iso_pass,
     "arg_unprop": arg_unprop_pass,
     "const_fold": const_fold_pass,
     "fallthrough_fill": fallthrough_fill_pass,
