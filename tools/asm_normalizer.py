@@ -6511,6 +6511,187 @@ def sra_keep_pass(stext, tgt):
     return "\n".join(lines) if changed else stext
 
 
+# --------------------------------------------------------------------------
+# call_slot_sink: our reorg fills a call's delay slot with a 1-word insn X that
+# writes a callee-saved register from $0 / callee-saved sources (`jal F;
+# move $s5,$0`), and the next unconditional jump in the same straight-line run
+# with the insn before it (`Y; j L` -> `j L; Y`). Retail leaves the call slot
+# empty and puts X in the jump's slot (`jal F; nop; ...; Y; j L; X`). Sound when
+# X's destination and sources are neither read nor written between the call and
+# the jump (the call preserves callee-saved registers), and no label lies in
+# between. Target-guided: the k-th call of the target has a nop slot while ours
+# does not, and the target's next `j` slot holds X. Count-preserving.
+# --------------------------------------------------------------------------
+_CSS_CALLEE = {"s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7", "fp", "zero", "sp"}
+
+
+def _css_tgt_calls(tgt):
+    """For each target call (in order): (slot is nop, key of the next j's slot)."""
+    out = []
+    ds = [d.strip() for _w, d in tgt]
+    for q, d in enumerate(ds):
+        mn = d.split(None, 1)[0].lower() if d else ""
+        if mn not in ("jal", "jalr") or q + 1 >= len(ds):
+            continue
+        nop = ds[q + 1].split(None, 1)[0].lower() == "nop"
+        jk = None
+        for r in range(q + 2, len(ds)):
+            m2 = ds[r].split(None, 1)[0].lower() if ds[r] else ""
+            if m2 == "j" and r + 1 < len(ds):
+                jk = _sm_key(ds[r + 1], True)
+                break
+            if m2 in ("jal", "jalr", "jr") or m2 in _COND_BR_MN or m2 in ("b", "beqz", "bnez"):
+                break
+        out.append((nop, jk))
+    return out
+
+
+def call_slot_sink_pass(stext, tgt):
+    if not tgt:
+        return stext
+    lines = stext.split("\n")
+    tcalls = _css_tgt_calls(tgt)
+    ins = [i for i, l in enumerate(lines) if _s_is_insn(l) and not l.strip().startswith(".")]
+    calls = [x for x in range(len(ins)) if re.match(r"\s*jalr?\b", lines[ins[x]])]
+    if len(calls) != len(tcalls):
+        return stext
+    nr = _noreorder_lines(lines)
+    changed = False
+    for k, x in enumerate(calls):
+        tnop, tjk = tcalls[k]
+        if not tnop or tjk is None or x + 1 >= len(ins):
+            continue
+        ci, si = ins[x], ins[x + 1]
+        if ci not in nr or si not in nr:
+            continue
+        sbody = lines[si].split("#", 1)[0].strip()
+        if sbody.split(None, 1)[0].lower() == "nop" or _src_nwords(lines[si]) != 1:
+            continue
+        if _sm_srckey(sbody) != tjk:
+            continue
+        d, u = defs_uses(sbody)
+        d = sorted(d)
+        if len(d) != 1 or not re.match(r"s[0-7]$|fp$", d[0] or "") or \
+                not all(r in _CSS_CALLEE for r in u):
+            continue
+        regs = set(d) | set(u)
+        # find the next `j` in the same run: no label, branch or call before it
+        ok, jx = True, None
+        for y in range(si + 1, len(lines)):
+            ly = lines[y]
+            if re.match(r"^\s*[\$\w.]+:\s*$", ly) and not re.match(r"^\s*LM\w*:\s*$", ly):
+                ok = False
+                break
+            if not _s_is_insn(ly) or ly.strip().startswith("."):
+                continue
+            body = ly.split("#", 1)[0].strip()
+            mn = body.split(None, 1)[0].lower()
+            if mn == "j":
+                jx = y
+                break
+            if mn in _COND_BR_MN or mn in ("jal", "jalr", "jr", "b"):
+                ok = False
+                break
+            dy, uy = defs_uses(body)
+            if regs & (set(dy) | set(uy)):
+                ok = False
+                break
+        if not ok or jx is None or jx not in nr:
+            continue
+        yi = next((y for y in range(jx + 1, len(lines)) if _s_is_insn(lines[y])
+                   and not lines[y].strip().startswith(".")), None)
+        if yi is None or yi not in nr or _src_nwords(lines[yi]) != 1:
+            continue
+        ybody = lines[yi].split("#", 1)[0].strip()
+        if ybody.split(None, 1)[0].lower() == "nop":
+            continue
+        # Y leaves the j slot for the spot before the jump's noreorder block
+        st = jx
+        while st > 0 and lines[st - 1].strip().startswith(".set"):
+            st -= 1
+        ind = re.match(r"^(\s*)", lines[si]).group(1)
+        yl = lines[yi]
+        lines[yi] = ind + sbody
+        lines[si] = ind + "nop"
+        lines.insert(st, re.match(r"^(\s*)", yl).group(1) + ybody)
+        changed = True
+        break
+    if changed:
+        return call_slot_sink_pass("\n".join(lines), tgt)
+    return stext
+
+
+# --------------------------------------------------------------------------
+# giv_rebase: loop strength reduction gives an induction base as `X = A + k`
+# where retail derived it from a register it had just set from the same source
+# (`B = A + d; X = B + (k - d)`, e.g. q = &r->f1 then q + 5 instead of r + 6).
+# Same value when A and B are not written between B's definition and X's.
+# Target-guided by keys: the target has more `addiu X,B,k-d` and fewer
+# `addiu X,A,k` than ours. Count-preserving; runs after sigma.
+# --------------------------------------------------------------------------
+_GR_ADD = re.compile(r"^(\s*)(addu|addiu)\s+(\$\w+)\s*,\s*(\$\w+)\s*,\s*(-?(?:0x[0-9a-fA-F]+|\d+))\s*(#.*)?$")
+
+
+def giv_rebase_pass(stext, tgt):
+    if not tgt:
+        return stext
+    lines = stext.split("\n")
+    tc = {}
+    for _w, d in tgt:
+        k = _sm_key(d.strip(), True)
+        if isinstance(k, tuple):
+            tc[k] = tc.get(k, 0) + 1
+
+    def ours_counts():
+        c = {}
+        for l in lines:
+            if _s_is_insn(l) and not l.strip().startswith("."):
+                k = _sm_srckey(l.split("#", 1)[0].strip())
+                if isinstance(k, tuple):
+                    c[k] = c.get(k, 0) + 1
+        return c
+    changed = False
+    for i, l in enumerate(lines):
+        m = _GR_ADD.match(l)
+        if not m:
+            continue
+        x, a, k = norm_reg(m.group(3)), norm_reg(m.group(4)), int(m.group(5), 0)
+        if x == a or a in ("zero", "sp"):
+            continue
+        body = l.split("#", 1)[0].strip()
+        kx = _sm_srckey(body)
+        oc = ours_counts()
+        if not isinstance(kx, tuple) or tc.get(kx, 0) >= oc.get(kx, 0):
+            continue
+        seen = set()
+        for j in range(i - 1, -1, -1):
+            lj = lines[j]
+            if _join_label(lines, j):
+                break
+            if not _s_is_insn(lj) or lj.strip().startswith("."):
+                continue
+            bj = lj.split("#", 1)[0].strip()
+            if _src_is_branch(bj) or _src_is_ret(bj) or re.match(r"jalr?\b", bj):
+                break
+            mj = _GR_ADD.match(lj)
+            dj = defs_uses(bj)[0]
+            if mj and norm_reg(mj.group(4)) == a and norm_reg(mj.group(3)) not in (a, x) and \
+                    norm_reg(mj.group(3)) not in seen:
+                b, dd = mj.group(3), int(mj.group(5), 0)
+                nk = k - dd
+                if -0x8000 <= nk < 0x8000:
+                    cand = "%saddu\t%s,%s,%d" % (m.group(1), m.group(3), b, nk)
+                    ck = _sm_srckey(cand.strip())
+                    if isinstance(ck, tuple) and tc.get(ck, 0) > oc.get(ck, 0):
+                        lines[i] = cand
+                        changed = True
+                break
+            if a in dj or x in dj:
+                break
+            seen |= set(dj)
+    return "\n".join(lines) if changed else stext
+
+
 PASSES = {
     # reg_realloc is applied specially (it needs sigma from words); the ordered
     # list in the manifest still names it so the recipe is explicit and auditable.
@@ -6561,6 +6742,8 @@ PASSES = {
     "undo_drop": undo_drop_pass,
     "copy_swap": copy_swap_pass,
     "sra_keep": sra_keep_pass,
+    "call_slot_sink": call_slot_sink_pass,
+    "giv_rebase": giv_rebase_pass,
 }
 
 # Passes that CHANGE the instruction count and so must run BEFORE sigma is derived
