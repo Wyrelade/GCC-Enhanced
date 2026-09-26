@@ -342,6 +342,85 @@ def la_unfold_pass(stext, tgt):
 
 
 # --------------------------------------------------------------------------
+# la_unfold_st: the store form of la_unfold. Retail kept the global's address in
+# a register (`la T,S; sw R,k(T)`) where our cc1 folded it into a symbolic store
+# (`lui $at,%hi(S+k); sw R,%lo(S+k)($at)`). Target-guided: the target has that
+# many `la T,S` pairs each followed (within 4 words) by `op X,k(T)`, and no
+# %lo memory access of the address S+k resolves to. T is the target's register;
+# it must not be the stored register and must be dead after the store in ours
+# (written before read on the straight line). Count-changing (+1): pre-sigma.
+# --------------------------------------------------------------------------
+_LS_ST = re.compile(r"^(\s*)(sw|sh|sb)(\s+)(\$\w+)\s*,\s*%lo\(([A-Za-z_]\w*)(?:\+(\d+))?\)\(\$(?:1|at)\)\s*$")
+
+
+def la_unfold_st_pass(stext, tgt):
+    if not tgt:
+        return stext
+    lui_re = re.compile(r"lui\s+(\$?\w+)\s*,\s*%hi\(([\w.$]+)\)")
+    add_re = re.compile(r"addiu\s+(\$?\w+)\s*,\s*(\$?\w+)\s*,\s*%lo\(([\w.$]+)\)")
+    want, lo_mem = {}, set()
+    for i in range(len(tgt)):
+        d = tgt[i][1]
+        m = re.search(r"%lo\(([\w.$]+)\)\(", d)
+        if m:
+            lo_mem.add(m.group(1))
+        a = lui_re.search(d)
+        b = add_re.search(tgt[i + 1][1]) if a and i + 1 < len(tgt) else None
+        if not (a and b and b.group(3) == a.group(2)
+                and norm_reg(a.group(1)) == norm_reg(b.group(1)) == norm_reg(b.group(2))):
+            continue
+        t = norm_reg(a.group(1))
+        for q in range(i + 2, min(i + 6, len(tgt))):
+            mn, regs, sk = insn_parts(tgt[q][1].strip())
+            mo = _mem_operand(tgt[q][1].strip())
+            if mn in ("sw", "sh", "sb") and mo and mo[0] == t:
+                key = (mn, a.group(2), mo[1], t)
+                want[key] = want.get(key, 0) + 1
+                break
+            if t in defs_uses(tgt[q][1].strip())[0]:
+                break
+    if not want:
+        return stext
+    lines = stext.split("\n")
+    nr = _noreorder_lines(lines)
+    ins = [(i, l) for i, l in enumerate(lines) if _s_is_insn(l)]
+    hits = {}
+    for j, l in enumerate(lines):
+        m = _LS_ST.match(l.split("#", 1)[0])
+        if not m or j in nr:
+            continue
+        k = int(m.group(6) or 0)
+        for (mn, sym, off, t), n in want.items():
+            if mn == m.group(2) and sym == m.group(5) and off == k:
+                hits.setdefault((mn, sym, off, t), []).append(j)
+    edits = []
+    for key, js in hits.items():
+        mn, sym, off, t = key
+        if len(js) != want[key] or _sm_sym("%s+%d" % (sym, off)) in lo_mem or (
+                off == 0 and sym in lo_mem):
+            continue
+        mine = []
+        for j in js:
+            m = _LS_ST.match(lines[j].split("#", 1)[0])
+            if norm_reg(m.group(4)) == t or not _us_dead_ft(lines, ins, j, t):
+                break
+            hi = next((y for y in range(j - 1, -1, -1) if _s_is_insn(lines[y])), None)
+            if hi is None or not re.match(r"\s*lui\s+\$(?:1|at)\s*,\s*%hi\(", lines[hi]):
+                break
+            mine.append((hi, j, m, t, off))
+        else:
+            edits += mine
+    if not edits:
+        return stext
+    for hi, j, m, t, off in sorted(edits, key=lambda e: -e[0]):
+        ind = m.group(1)
+        tr = "$%d" % ABI2NUM[t]
+        lines[j] = "%s%s%s%s,%d(%s)" % (ind, m.group(2), m.group(3), m.group(4), off, tr)
+        lines[hi] = "%sla\t%s,%s" % (ind, tr, m.group(5))
+    return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------
 # un-hi-cse (rematerialize): our cc1 hoists a global's `lui %hi` once and shares
 # the base across several `%lo` loads; retail's cc1 rematerializes the `lui %hi`
 # at EACH use (`lui R,%hi(S); lw R,%lo(S)(R)`, base == dest). This is a COUNT-
@@ -6188,6 +6267,7 @@ PASSES = {
     "web_resched": web_resched_pass,
     "sreg_perm": sreg_perm_pass,
     "sreg_swap": sreg_swap_pass,
+    "la_unfold_st": la_unfold_st_pass,
     "block_iso": block_iso_pass,
     "slot_unsteal": slot_unsteal_pass,
     "arg_unprop": arg_unprop_pass,
@@ -6216,7 +6296,7 @@ PASSES = {
 # (the register correspondence has to be built from count-aligned assembly). Any
 # such pass listed in a recipe is applied ahead of reg_realloc regardless of the
 # manifest order; the rest keep their listed order after sigma.
-PRE_SIGMA_PASSES = ("un_hi_cse", "un_hi_cse_store", "exit_merge", "base_cse_collapse",
+PRE_SIGMA_PASSES = ("la_unfold_st", "un_hi_cse", "un_hi_cse_store", "exit_merge", "base_cse_collapse",
                     "shift_const_fold", "zero_remat", "load_remat", "nodiv",
                     "offset_unfold", "zext_keep", "zero_cmp", "param_copy",
                     "undo_drop", "la_unfold", "arg_unprop", "sched_pre")
