@@ -98,16 +98,12 @@ Phases A, B and the core of C are working.
 The tool was started while decompiling Digimon World 2 (PSX, SLUS-01193), the motivating case
 study, but the method is general to any PSX-era GCC 2.x matching decomp.
 
-Case study status (2026-09-27): 820 of 907 functions (90.41%) of the Digimon World 2 main
-executable are matched and rebuild byte-identical, up from 815 (89.86%) at the start of this
-round. New this round: range_unswap (undo a case-tree range swap the jump optimizer made),
-slot_rethread and slot_redundant (delay slots filled from the other thread, and a copy of the
-slot instruction the reorg pass would have deleted), const_uncse and sreg_const_use (a
-constant rebuilt at each use, or read from a register known to hold it), la_unhoist (an
-address hoisted out of a loop built again at each load), li_uncopy, param_copy_fresh,
-zst_place (zero stores and small constants back at their source position in a block), block
-reordering through explicit load-delay nops, a void-return aware register reallocation, and
-per-group block-copy scratch renaming.
+Case study status (2026-09-27): 821 of 907 functions (90.52%) of the Digimon World 2 main
+executable are matched and rebuild byte-identical, and every function that was written in C
+is now matched; the rest are hand-written assembly (BIOS stubs, GTE helpers, exception
+handlers). The last C function needed dead_spill: a loop invariant the register allocator
+spilled although every reload of it is dead goes back to the callee-saved register the
+original build kept it in, with the frame slot left reserved and empty.
 
 ## Tools
 
