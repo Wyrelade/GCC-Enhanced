@@ -1,3 +1,11 @@
+<p align="center">
+  <a href="https://nyen.cc/"><img src="https://nyen.cc/favicon.svg" alt="NYEN logo" width="56" height="56"></a>
+  <br>
+  <sub>Powered by</sub>
+  <br>
+  <a href="https://nyen.cc/"><b>NYEN</b></a>
+</p>
+
 # GCC-Enhanced
 
 A target-guided matching backend for PSX-era GCC 2.x matching decompilation projects.
