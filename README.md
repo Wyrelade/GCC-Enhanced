@@ -98,13 +98,13 @@ Phases A, B and the core of C are working.
 The tool was started while decompiling Digimon World 2 (PSX, SLUS-01193), the motivating case
 study, but the method is general to any PSX-era GCC 2.x matching decomp.
 
-Case study status (2026-09-27): 906 of 907 functions of the Digimon World 2 main executable
-rebuild byte-identical: 829 matched in C and 77 hand-written assembly functions restored as
-readable sources. New this round: dead_spill (a spilled loop invariant whose reloads are all dead
-goes back to the callee-saved register the original kept it in), arg_unrename (an entry read of
-a never-defined temporary is the argument register a global register map renamed), GTE register
-operands kept out of register maps and liveness, and function or data addresses resolved
-through the symbol file so the project can rename symbols without changing a byte.
+Case study status (2026-09-27): all 907 functions of the Digimon World 2 main executable
+rebuild byte-identical: 830 matched in C and 77 hand-written assembly functions restored as
+readable sources. The last function closed with two loop operators: giv_unreduce (a combined
+address giv the original compiler found not worth reducing is recomputed at the loop top instead
+of kept in a preheader-initialized, incremented register) and const_unhoist (a constant the
+original built inside the loop is moved back from the preheader, exchanging registers when every
+temporary is busy). The project has since moved on to naming functions, fields and types.
 
 ## Tools
 
