@@ -98,15 +98,15 @@ Phases A, B and the core of C are working.
 The tool was started while decompiling Digimon World 2 (PSX, SLUS-01193), the motivating case
 study, but the method is general to any PSX-era GCC 2.x matching decomp.
 
-Case study status (2026-09-26): 800 of 907 functions (88.20%) of the Digimon World 2 main
-executable are matched and rebuild byte-identical, up from 785 (86.55%) at the start of this
-round. New this round: la_copy (a loop base built in a temporary and copied into a callee-saved
-register in the preheader), thread_steal (a branch delay slot filled from the jump target of its
-fall-through), slot_sink (an empty branch slot whose instruction sits further down the
-fall-through), selfmove_drop, an injective variant of the register renaming, block reordering
-that matches a symbol plus offset by address and trims more of a block head, load-delay fixes
-for indirect calls and for fills across labels, and unaligned half loads that read their
-destination.
+Case study status (2026-09-27): 815 of 907 functions (89.86%) of the Digimon World 2 main
+executable are matched and rebuild byte-identical, up from 800 (88.20%) at the start of this
+round. New this round: la_split (a shared address register split back into per-access
+symbolic loads and stores), const_sink (a loop constant held in a callee-saved register moved
+back into a temporary, one save slot less), zext_drop (a redundant zero-extension after a
+byte or halfword load), at_dest (an indexed load expanded through its destination instead of
+$at), hi_interleave, call_slot_swap, renaming of block-copy scratch registers, a wider block
+reordering that also handles multiply and divide results and indirect calls, and zero
+propagation across calls for callee-saved registers.
 
 ## Tools
 
