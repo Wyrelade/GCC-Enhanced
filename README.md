@@ -98,15 +98,16 @@ Phases A, B and the core of C are working.
 The tool was started while decompiling Digimon World 2 (PSX, SLUS-01193), the motivating case
 study, but the method is general to any PSX-era GCC 2.x matching decomp.
 
-Case study status (2026-09-27): 815 of 907 functions (89.86%) of the Digimon World 2 main
-executable are matched and rebuild byte-identical, up from 800 (88.20%) at the start of this
-round. New this round: la_split (a shared address register split back into per-access
-symbolic loads and stores), const_sink (a loop constant held in a callee-saved register moved
-back into a temporary, one save slot less), zext_drop (a redundant zero-extension after a
-byte or halfword load), at_dest (an indexed load expanded through its destination instead of
-$at), hi_interleave, call_slot_swap, renaming of block-copy scratch registers, a wider block
-reordering that also handles multiply and divide results and indirect calls, and zero
-propagation across calls for callee-saved registers.
+Case study status (2026-09-27): 820 of 907 functions (90.41%) of the Digimon World 2 main
+executable are matched and rebuild byte-identical, up from 815 (89.86%) at the start of this
+round. New this round: range_unswap (undo a case-tree range swap the jump optimizer made),
+slot_rethread and slot_redundant (delay slots filled from the other thread, and a copy of the
+slot instruction the reorg pass would have deleted), const_uncse and sreg_const_use (a
+constant rebuilt at each use, or read from a register known to hold it), la_unhoist (an
+address hoisted out of a loop built again at each load), li_uncopy, param_copy_fresh,
+zst_place (zero stores and small constants back at their source position in a block), block
+reordering through explicit load-delay nops, a void-return aware register reallocation, and
+per-group block-copy scratch renaming.
 
 ## Tools
 
