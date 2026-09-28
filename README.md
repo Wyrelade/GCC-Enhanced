@@ -106,13 +106,14 @@ Phases A, B and the core of C are working.
 The tool was started while decompiling Digimon World 2 (PSX, SLUS-01193), the motivating case
 study, but the method is general to any PSX-era GCC 2.x matching decomp.
 
-Case study status (2026-09-27): all 907 functions of the Digimon World 2 main executable
-rebuild byte-identical: 830 matched in C and 77 hand-written assembly functions restored as
-readable sources. The last function closed with two loop operators: giv_unreduce (a combined
-address giv the original compiler found not worth reducing is recomputed at the loop top instead
-of kept in a preheader-initialized, incremented register) and const_unhoist (a constant the
-original built inside the loop is moved back from the preheader, exchanging registers when every
-temporary is busy). The project has since moved on to naming functions, fields and types.
+Case study status (2026-09-28): all 907 functions of the Digimon World 2 main executable
+rebuild byte-identical (830 matched in C, 77 hand-written assembly functions restored as
+readable sources). The game also loads 7 stage overlays (STAG*.PRO, 738 functions, all at the
+same address); 654 of them are matched and all 7 files rebuild byte-identical, 1561 of 1645
+functions over the whole game. Overlay game code matches with the main executable's compiler
+flags and mostly no normalizer recipe; the Psy-Q libraries linked into the overlays need the same
+recipes as in the main executable. The normalizer looks up target asm per unit, since overlays
+repeat function names at the same addresses.
 
 ## Tools
 
