@@ -109,7 +109,7 @@ study, but the method is general to any PSX-era GCC 2.x matching decomp.
 Case study status (2026-09-30): all 907 functions of the Digimon World 2 main executable
 rebuild byte-identical (830 matched in C, 77 hand-written assembly functions restored as
 readable sources). The game also loads 7 stage overlays (STAG*.PRO, 738 functions, all at the
-same address); 689 of them are matched and all 7 files rebuild byte-identical, 1596 of 1645
+same address); 691 of them are matched and all 7 files rebuild byte-identical, 1598 of 1645
 functions over the whole game. Overlay game code matches with the main executable's compiler
 flags and mostly no normalizer recipe; the Psy-Q libraries linked into the overlays need the same
 recipes as in the main executable. The normalizer looks up target asm per unit, since overlays
