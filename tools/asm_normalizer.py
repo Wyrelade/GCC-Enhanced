@@ -599,21 +599,22 @@ def un_hi_cse_pass(stext, tgt):
 
 
 # --------------------------------------------------------------------------
-# store-side un_hi_cse: the get/set-through-assembler-temp leaf
-# `T f(T a){ T old = G; G = a; return old; }`. Our cc1 CSEs ONE `lui $B,%hi(G)`
-# and shares $B as the base of both the load (`lw $D,%lo(G)($B)`, dest != base)
-# and the store (`sw $src,%lo(G)($B)`). The retail codegen instead (a)
-# materializes the load base==dest (`lui $D,%hi(G); lw $D,%lo(G)($D)`) and (b)
-# rematerializes a SEPARATE `lui $at,%hi(G)` for the store. Plain un_hi_cse
-# handles only the load and would leave the store's base ($B) dangling, so this
-# pass does both together. Count-changing (one net extra `lui`) -> PRE_SIGMA.
+# store-side un_hi_cse: the get/set-via-$at leaf `int f(int a0){ int old=D;
+# D=a0; return old; }`. Our cc1 CSEs ONE `lui $B,%hi(D)` and shares $B as the
+# base of both the load (`lw $D,%lo(D)($B)`, dest != base) and the store
+# (`sw $src,%lo(D)($B)`). Retail instead: (a) materializes the load base==dest
+# (`lui $D,%hi(D); lw $D,%lo(D)($D)`) and (b) rematerializes a SEPARATE
+# `lui $at,%hi(D)` for the store, `sw $src,%lo(D)($at)`. Plain un_hi_cse handles
+# only the load and would leave the store's base ($B) dangling, so this pass does
+# both together: fold the load to base==dest, drop the shared hoist, and give the
+# store its own `lui $at`. Count-changing (one net extra `lui`) -> PRE_SIGMA.
 # --------------------------------------------------------------------------
 _SW_LO = re.compile(r"^(\s*)(s[bhw])\s+(\$\d+)\s*,\s*%lo\(([\w.$]+)\)\((\$\d+)\)")
 
 
 def target_store_remat_syms(tgt):
     """Symbols the target stores through a rematerialized `$at` base: it carries
-    a base==dest `lui;lw` for S AND a `s? R,%lo(S)($at)` store of S."""
+    a base==dest `lui;lw` for S AND a `s? R,%lo(S)($at)` store of S. $at is $1."""
     loads = target_remat_syms(tgt)
     if not loads:
         return set()
@@ -629,13 +630,12 @@ def target_store_remat_syms(tgt):
 def un_hi_cse_store_s(stext, remat_syms):
     """Split a shared %hi base that feeds both a load and a store of the same
     symbol S in `remat_syms`: fold the load to base==dest and give the store its
-    own `lui $at`. Fires only when our source has that exact shared shape. The
-    fresh `lui $at` is hoisted above a leading return, since cc1 often schedules
-    the store into the return's delay slot."""
+    own `lui $at`. Fires only when our source has that exact shared shape."""
     if not remat_syms:
         return stext
     lines = stext.split("\n")
-    lui_idx = {}
+    # locate, per symbol, the shared lui base + its lw (dest!=base) + sw uses
+    lui_idx = {}                             # sym -> (line idx, base reg)
     for idx, ln in enumerate(lines):
         m = _LUI_HI.match(ln)
         if m and m.group(3) in remat_syms:
@@ -655,9 +655,14 @@ def un_hi_cse_store_s(stext, remat_syms):
         if lw_i is None or sw_i is None:
             continue
         indent = (_LW_LO.match(lines[lw_i]).group(1) or "\t")
-        out[li] = None
+        # (a) load base==dest, replacing both the shared lui and the lw
+        out[li] = None                       # drop the shared hoist
         out[lw_i] = ("%slui\t%s,%%hi(%s)\n%slw\t%s,%%lo(%s)(%s)"
                      % (indent, lw_dst, sym, indent, lw_dst, sym, lw_dst))
+        # (b) store via a fresh $at. cc1 often puts the store in the return's
+        # delay slot; the fresh `lui $at` must precede the RETURN, not the sw
+        # (which sits in the slot), so scan back over directives/blanks and, if a
+        # return leads the store, hoist the lui above it.
         out[sw_i] = "%ssw\t%s,%%lo(%s)($1)" % (sw_indent, sw_src, sym)
         ins_at = sw_i
         j = sw_i - 1
@@ -4177,7 +4182,7 @@ def operand_recolor_s(stext, tgt):
 # --------------------------------------------------------------------------
 # web_realloc. reg_realloc renames registers through ONE global sigma, so it
 # cannot express "this live range of $a0 is $v1 in the target while the entry
-# value stays in $a0" (e.g. `lbu $v1,0x46($a0)` where ours reuses the
+# value stays in $a0" (func_80025114: `lbu $v1,0x46($a0)` where ours reuses the
 # dead argument register). This pass splits every register into webs (def-use
 # chains joined at shared uses, reaching definitions over the delay-slot aware
 # CFG), aligns our instructions with the target words (mnemonic sequence
@@ -9763,8 +9768,8 @@ PRE_SIGMA_PASSES = ("la_unfold_st", "un_hi_cse", "un_hi_cse_store", "exit_merge"
 # under `.set noreorder` (one instruction per line, verbatim source) to stop the
 # assembler re-scheduling it. padnop needs neither (a trailing nop cannot be
 # rescheduled).
-WORD_PASSES = ("delay_fill", "epilogue_unfill", "reorder_indep", "padnop",
-               "prologue_save_hoist", "delay_slot_select")
+WORD_PASSES = ("delay_fill", "epilogue_unfill", "reorder_indep", "reorder_indep_nops",
+               "padnop", "prologue_save_hoist", "delay_slot_select", "decouple_reg")
 
 # minimal register def/use for the delay_fill dependency guard (gas `$reg` syntax)
 _STORE_MN = {"sb", "sh", "sw", "swl", "swr", "swc1", "swc2", "sd", "sdc1", "sdc2"}
@@ -10482,23 +10487,24 @@ def delay_slot_select_src(span, tgt, our_words):
     """Swap a jal's delay-slot instruction with the instruction immediately before
     the jal when the target has exactly those two transposed. Retail's cc1 and ours
     both compute two independent argument-setup instructions before a call but pick
-    a different one to sink into the branch delay slot; ours does the reverse. A
-    delay-slot instruction executes before control transfers, so both orderings
-    present identical argument registers to the callee -- swapping the two is
-    semantics-preserving when they are register-independent. reorder_indep cannot
-    express this because the move crosses the jal (a control transfer it will not
-    hop). Target-guided and minimal: fires only on an exact A<->B transposition around
-    a jal where both A and B are pure-ALU and mutually independent and the slot does
-    not already match.
+    a different one to sink into the branch delay slot (func_80029FB4: target fills
+    the slot with `addiu $a0,$zero,0x2` and emits the `%lo($a1)` addiu before the jal;
+    ours does the reverse). A delay-slot instruction executes before control transfers,
+    so both orderings present identical argument registers to the callee -- swapping
+    the two is semantics-preserving when they are register-independent. reorder_indep
+    cannot express this because the move crosses the jal (a control transfer it will
+    not hop). Target-guided and minimal: fires only on an exact A<->B transposition
+    around a jal where both A and B are pure-ALU and mutually independent and the
+    slot does not already match.
 
-    Anchored on the jal, NOT on a global 1:1 source-word mapping: the assembler inserts
-    load-delay nops elsewhere in the body, so the source-insn and word counts differ.
-    But a jal's immediate word neighbours DO correspond to its immediate source
-    neighbours -- the pre insn is pure-ALU (we check) so no nop is inserted between it
-    and the jal, and the following word is the delay slot itself. So align the k-th jal
-    across our words, the target words and the source insns, and read A/B from the jal's
-    neighbours in each. The touched region is wrapped in `.set noreorder` so the
-    assembler keeps the schedule. Returns (new_span, fired)."""
+    Anchored on the jal, NOT on a global 1:1 source-word mapping: maspsx inserts
+    load-delay nops elsewhere in the body (e.g. the epilogue), so the source-insn and
+    word counts differ. But a jal's immediate word neighbours DO correspond to its
+    immediate source neighbours -- the pre insn is pure-ALU (we check) so no nop is
+    inserted between it and the jal, and the following word is the delay slot itself.
+    So align the k-th jal across our words, the target words and the source insns, and
+    read A/B from the jal's neighbours in each. The touched region is wrapped in
+    `.set noreorder` so the assembler keeps the schedule. Returns (new_span, fired)."""
     def _is_call(dis):
         p = dis.split(None, 1)
         return bool(p) and p[0].lower() in ("jal", "bal", "jalr")
@@ -10744,12 +10750,300 @@ def prologue_save_hoist_src(span, tgt):
     return "\n".join(out), True
 
 
+def _norm_skel(skel):
+    """Skeleton with integer immediates canonicalized (our objdump prints `-6`, the
+    retail .s prints `-0x6`; both are the same operand)."""
+    out = []
+    for t in skel:
+        s = t.strip()
+        try:
+            out.append(str(int(s, 0)))
+        except ValueError:
+            out.append(s)
+    return out
+
+
+def _reg_copy_dst_src(disasm):
+    """(dst, src) ABI regs if disasm is a register-to-register copy
+    (`move d,s` / `addu d,s,zero` / `or d,s,zero`), else None."""
+    m, regs, skel = insn_parts(disasm)
+    if m == "move" and len(regs) == 2:
+        return regs[0], regs[1]
+    if m in ("addu", "or", "addiu", "ori", "daddu") and len(regs) == 3 \
+            and regs[2] == "zero":
+        return regs[0], regs[1]
+    return None
+
+
+_MACRO_MNEM = {"li", "la", "move", "not", "neg", "b", "bal", "abs"}
+
+
+def _src_is_macro(line):
+    body = line.split("#", 1)[0]
+    p = body.split()
+    mn = p[0].lower() if p else ""
+    return mn in _MACRO_MNEM or "%hi" in body or "%lo" in body or "%gp_rel" in body
+
+
+def _src_set_op_reg(line, op_index, abi):
+    """Rewrite operand `op_index` of a cc1 gas insn line so its register is `$<num>`,
+    preserving a `off($b)` memory form. Returns the new line or None."""
+    body, sep, comment = line.partition("#")
+    m = re.match(r"^(\s*)(\S+)([ \t]+)(.*?)\s*$", body)
+    if not m:
+        return None
+    ind, mnem, gap, rest = m.groups()
+    ops = split_ops(rest)
+    if op_index >= len(ops):
+        return None
+    num = "$%d" % ABI2NUM[abi]
+    tok = ops[op_index].strip()
+    mm = re.fullmatch(r"(.*)\((\$?\w+)\)", tok)
+    ops[op_index] = "%s(%s)" % (mm.group(1), num) if mm else num
+    new = "%s%s%s%s" % (ind, mnem, gap, ",".join(ops))
+    return new + (sep + comment if sep else "")
+
+
+def _li_dst_imm(disasm):
+    """(dst, imm_int) if disasm loads an immediate (`li d,i` / `addiu d,zero,i` /
+    `ori d,zero,i`), else None."""
+    m, regs, skel = insn_parts(disasm)
+    if m == "li" and len(regs) == 1 and len(skel) == 2:
+        try:
+            return regs[0], int(skel[1], 0)
+        except ValueError:
+            return None
+    if m in ("addiu", "ori", "addu") and len(regs) == 2 and skel[1] == "#" \
+            and regs[1] == "zero" and len(skel) == 3:
+        try:
+            return regs[0], int(skel[2], 0)
+        except ValueError:
+            return None
+    return None
+
+
+def _same_insn(od, td):
+    """Two disassemblies are the same instruction up to spelling/relocation: equal
+    register-to-register copies, equal load-immediates, or same mnemonic + registers
+    (a branch/reloc whose only word difference is its unresolved target)."""
+    c = _reg_copy_dst_src(od)
+    if c is not None and c == _reg_copy_dst_src(td):
+        return True
+    li = _li_dst_imm(od)
+    if li is not None and li == _li_dst_imm(td):
+        return True
+    om, oregs, _ = insn_parts(od)
+    tm, tregs, _ = insn_parts(td)
+    return om == tm and oregs == tregs
+
+
+def decouple_reg_src(span, tgt, our_words):
+    """Un-coalesce a register the target keeps split by a dead copy. Retail sometimes
+    computes a value into one register, copies it to a second (`addu rD,rS,zero`), and
+    reads the original from rS while the shift/index reads the copy rD; our cc1
+    coalesces the two into one register and drops the copy, so we emit one instruction
+    fewer. This pass, guided by the target, retargets our definition's destination from
+    rD to rS, inserts the `addu rD,rS,zero` copy, and relabels the uses of rD that read
+    the ORIGINAL (which the target reads from rS) up to the point rD is redefined.
+
+    Splitting a live range by inserting `rD = rS` and reading rS instead of rD while the
+    two hold the same value is semantics-preserving. Target-guided and count-changing
+    (+1 copy); runs as a word pass and re-emits the touched run under `.set noreorder`
+    so the assembler keeps the inserted copy in place. Returns (new_span, fired)."""
+    lines = span.split("\n")
+    ins = [(i, l) for i, l in enumerate(lines) if _s_is_insn(l)]
+    n = len(our_words)
+    if n < 3:
+        return span, False
+    # map each assembled word to its source line, skipping the delay/load nops maspsx
+    # inserts (which have no source of their own). Non-nop words consume source insns in
+    # order; a real source `nop` line consumes a nop word.
+    word_src = [None] * n
+    si = 0
+    for w in range(n):
+        if is_nop(our_words[w][1]):
+            if si < len(ins) and _src_is_nop(ins[si][1]):
+                word_src[w] = ins[si][0]
+                si += 1
+        elif si < len(ins):
+            word_src[w] = ins[si][0]
+            si += 1
+    if si != len(ins):
+        return span, False                  # a macro expanded to several words: unsafe
+    line_of = {i: l for i, l in enumerate(lines)}
+
+    # locate the first word that differs from the target and read the split shape.
+    p = None
+    for k in range(min(n, len(tgt)) - 1):
+        if _word_eq(our_words[k][0], tgt[k][0], tgt[k][1]):
+            continue
+        if _same_insn(our_words[k][1], tgt[k][1]):
+            continue                        # spelling/branch-offset only: not a real diff
+        om, oregs, osk = insn_parts(our_words[k][1])
+        tm, tregs, tsk = insn_parts(tgt[k][1])
+        if om != tm or _norm_skel(osk) != _norm_skel(tsk):
+            return span, False
+        if len(oregs) != len(tregs) or oregs[1:] != tregs[1:] or oregs[0] == tregs[0]:
+            return span, False
+        R, S = oregs[0], tregs[0]           # our (coalesced) dest, target (kept) dest
+        if "zero" in (R, S) or R in _INJ_FIXED or S in _INJ_FIXED:
+            return span, False
+        cp = _reg_copy_dst_src(tgt[k + 1][1])
+        if cp != (R, S):
+            return span, False
+        p = k
+        break
+    if p is None:
+        return span, False
+
+    # walk the split: our[k] aligns to tgt[k+1] (target has the extra copy). The only
+    # allowed difference is a USE of R (ours) where the target reads S. Stop when R is
+    # redefined (the split ends there). Bail on any other structural difference.
+    if word_src[p] is None:
+        return span, False
+    pdef = _src_set_op_reg(line_of[word_src[p]], 0, S)      # def rD -> rS
+    if pdef is None:
+        return span, False
+    edits = {word_src[p]: pdef}
+    end = p
+    for k in range(p + 1, n):
+        if k + 1 >= len(tgt) or word_src[k] is None:
+            return span, False
+        defs, _uses = defs_uses(our_words[k][1])
+        if R in defs:                       # rD redefined here: the split ends before k
+            if not _same_insn(our_words[k][1], tgt[k + 1][1]):
+                return span, False
+            break
+        om, oregs, osk = insn_parts(our_words[k][1])
+        tm, tregs, tsk = insn_parts(tgt[k + 1][1])
+        # a branch/jump target operand is a label that legitimately differs; compare
+        # skeletons only for non-control-flow instructions.
+        skel_ok = is_branch(our_words[k][1]) or _norm_skel(osk) == _norm_skel(tsk)
+        if om != tm or not skel_ok or len(oregs) != len(tregs):
+            return span, False
+        line = line_of[word_src[k]]
+        for oi in range(len(oregs)):
+            if oregs[oi] == tregs[oi]:
+                continue
+            if oregs[oi] == R and tregs[oi] == S:
+                nl = _src_set_op_reg(line, oi, S)
+                if nl is None:
+                    return span, False
+                line = nl
+            else:
+                return span, False
+        if line != line_of[word_src[k]]:
+            edits[word_src[k]] = line
+        end = k
+
+    lo, hi = word_src[p], word_src[end]
+    if any(is_nop(our_words[w][1]) and word_src[w] is None
+           for w in range(p, end + 1)):
+        return span, False                  # a maspsx-inserted nop inside the frozen run
+    if any(_src_is_macro(lines[j]) for j in range(lo, hi + 1) if _s_is_insn(lines[j])):
+        return span, False                  # a macro in the frozen run is unsafe
+    indent = _src_indent(line_of[word_src[p]])
+    copy_line = indent + "addu\t$%d,$%d,$0" % (ABI2NUM[R], ABI2NUM[S])
+    out = []
+    for idx, l in enumerate(lines):
+        if idx < lo or idx > hi:
+            out.append(l)
+            continue
+        if idx == lo:
+            out.append(indent + ".set\tnoreorder")
+            out.append(indent + ".set\tnomacro")
+        st = l.strip()
+        if not (st.startswith(".set") and re.search(r"\b(no)?(reorder|macro)\b", st)):
+            out.append(edits.get(idx, l))
+        if idx == word_src[p]:
+            out.append(copy_line)
+        if idx == hi:
+            out.append(indent + ".set\tmacro")
+            out.append(indent + ".set\treorder")
+    return "\n".join(out), True
+
+
+def reorder_indep_nops_src(span, tgt, our_words):
+    """Swap two adjacent independent pure-ALU instructions to match the target's
+    schedule, even when maspsx-inserted delay/load nops earlier in the function break
+    the 1:1 source-to-word mapping `reorder_indep` needs (it truncates at the first
+    such nop and never reaches a later swap). This pass maps each assembled word to its
+    source line, skipping the maspsx nops (same word->source map as decouple_reg), then
+    at each adjacent word pair (pos, pos+1) that is mismatched against the target but
+    would BOTH match after a transpose, swaps their source lines -- provided both are
+    real-source pure-ALU instructions with no register dependency in either direction.
+    Restricting to pure-ALU pairs means neither is a load or store, so the swap cannot
+    create a load-use hazard or alias, and the touched pair carries no maspsx nop of its
+    own. The two lines are re-emitted under `.set noreorder` so the assembler keeps the
+    order. Count-preserving. Returns (new_span, fired)."""
+    lines = span.split("\n")
+    ins = [(i, l) for i, l in enumerate(lines) if _s_is_insn(l)]
+    n = len(our_words)
+    if n < 2:
+        return span, False
+    # map each assembled word to its source line, skipping maspsx-inserted nops (which
+    # have no source of their own): the identical mapping decouple_reg builds.
+    word_src = [None] * n
+    si = 0
+    for w in range(n):
+        if is_nop(our_words[w][1]):
+            if si < len(ins) and _src_is_nop(ins[si][1]):
+                word_src[w] = ins[si][0]
+                si += 1
+        elif si < len(ins):
+            word_src[w] = ins[si][0]
+            si += 1
+    if si != len(ins):
+        return span, False                       # a macro expanded to several words
+    line_of = {i: l for i, l in enumerate(lines)}
+    swaps = []                                    # (line_idx_a, line_idx_b) with a < b
+    p = 0
+    while p + 1 < min(n, len(tgt)):
+        a, b = word_src[p], word_src[p + 1]
+        if a is None or b is None:
+            p += 1; continue
+        oa, ob = our_words[p][1], our_words[p + 1][1]
+        # already-correct positions and any nop pair are skipped
+        if (_word_eq(our_words[p][0], tgt[p][0], tgt[p][1]) and
+                _word_eq(our_words[p + 1][0], tgt[p + 1][0], tgt[p + 1][1])):
+            p += 1; continue
+        # a transpose fixes BOTH positions, both are pure-ALU, and independent
+        if (_word_eq(our_words[p][0], tgt[p + 1][0], tgt[p + 1][1]) and
+                _word_eq(our_words[p + 1][0], tgt[p][0], tgt[p][1]) and
+                _pure_alu(oa) and _pure_alu(ob) and _indep(oa, ob)):
+            swaps.append((a, b) if a < b else (b, a))
+            p += 2
+            continue
+        p += 1
+    if not swaps:
+        return span, False
+    swap_by_a = {a: b for a, b in swaps}
+    swap_by_b = {b: a for a, b in swaps}
+    out = []
+    for idx, l in enumerate(lines):
+        if idx in swap_by_a:                      # first line of a pair: emit the second
+            b = swap_by_a[idx]
+            indent = _src_indent(line_of[idx])
+            out.append(indent + ".set\tnoreorder")
+            out.append(indent + line_of[b].strip())
+        elif idx in swap_by_b:                    # second line of a pair: emit the first
+            a = swap_by_b[idx]
+            indent = _src_indent(line_of[idx])
+            out.append(indent + line_of[a].strip())
+            out.append(indent + ".set\treorder")
+        else:
+            out.append(l)
+    return "\n".join(out), True
+
+
 _REORDER_SRC = {
     "epilogue_unfill": epilogue_unfill_src,
     "delay_fill": delay_fill_src,
     "reorder_indep": reorder_indep_src,
+    "reorder_indep_nops": reorder_indep_nops_src,
     "prologue_save_hoist": prologue_save_hoist_src,
     "delay_slot_select": delay_slot_select_src,
+    "decouple_reg": decouple_reg_src,
 }
 
 
@@ -10771,7 +11065,8 @@ def emit_noreorder_span(span, tgt, our_words, reorder_passes, reassemble=None):
         fn = _REORDER_SRC.get(name)
         if fn is None:
             raise NotImplementedError("reorder pass not wired: %s" % name)
-        if name in ("delay_fill", "reorder_indep", "delay_slot_select"):
+        if name in ("delay_fill", "reorder_indep", "reorder_indep_nops",
+                    "delay_slot_select", "decouple_reg"):
             words = reassemble(txt) if reassemble is not None else our_words
             txt, _fired = fn(txt, tgt, words)
         else:
@@ -10970,8 +11265,7 @@ def load_manifest(path=MANIFEST):
 # symbolic macro operand (`lw $r,S($idx)`, `sw $r,S`) and the assembler (aspsx /
 # maspsx) expands it: `lui $dst,%hi(S)` + `addu` + `lw $dst,%lo(S)($dst)` for a
 # load, a fresh `lui $at` for a store or when the destination is the index. The
-# project may compile several retail units as one C file, so a function from a
-# no-split unit is recovered by
+# project compiles one 156C.c, so a function from a no-split unit is recovered by
 # compiling the file a second time with -mno-split-addresses and splicing that
 # function's `.ent ... .end` span in place of the default one. It is still plain
 # cc1 output of the same C; the other passes in the recipe then run on it as usual.
@@ -11342,7 +11636,8 @@ def normalize_s(s_file, ctx, manifest=None):
                 continue
             reorder = [p for p in manifest[name]["passes"]
                        if p in ("delay_fill", "epilogue_unfill", "reorder_indep",
-                                "prologue_save_hoist", "delay_slot_select")]
+                                "reorder_indep_nops", "prologue_save_hoist",
+                                "delay_slot_select", "decouple_reg")]
             if not reorder:
                 continue
             our, err = assemble_words(ctx, s_file, name)
@@ -11356,7 +11651,10 @@ def normalize_s(s_file, ctx, manifest=None):
 
             def _reasm(span_txt, _s=start, _e=end, _n=name):
                 """Refresh the assembled words from the current (partially reordered)
-                span so a later word-consuming pass sees the real schedule."""
+                span so a later word-consuming pass sees the real schedule. Writes the
+                whole file with only this span replaced; earlier (higher-offset) spans
+                are already edited in `out`, later (lower-offset) spans are untouched
+                and still assemble, and this span's own words are what we need."""
                 _write_bytes_str(s_file, out[:_s] + span_txt + out[_e:])
                 w, werr = assemble_words(ctx, s_file, _n)
                 if werr:
