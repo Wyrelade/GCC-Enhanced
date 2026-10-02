@@ -110,8 +110,9 @@ Case study status (2026-10-02): the Digimon World 2 main executable and its 7 st
 (STAG*.PRO) rebuild byte-identical. The decomp now counts a function as matched only when its C
 reproduces the retail bytes with the compiler flags of its unit (main game -G8, overlays -G0) and
 no normalizer rewrites, and leaves PsyQ library code out of progress (DW2 issue #5). Under that
-standard 873 of 1089 game functions are matched; 59 + 107 game functions still depend on
-normalizer rewrites and 26 on a per-function flag set. The normalizer keeps the byte-identical build working while those are
+standard 954 of 1089 game functions are matched; 51 + 56 game functions still depend on
+normalizer rewrites and 4 on a per-function flag set. Small-data access follows the aspsx rule
+(gp only for symbols the file defines), which also located the main game's file boundaries. The normalizer keeps the byte-identical build working while those are
 re-matched; it is a build aid, not a matching criterion. It looks up target asm per unit, since
 overlays repeat function names at the same addresses.
 
