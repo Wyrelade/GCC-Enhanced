@@ -106,14 +106,14 @@ Phases A, B and the core of C are working.
 The tool was started while decompiling Digimon World 2 (PSX, SLUS-01193), the motivating case
 study, but the method is general to any PSX-era GCC 2.x matching decomp.
 
-Case study status (2026-09-30): all 907 functions of the Digimon World 2 main executable
-rebuild byte-identical (830 matched in C, 77 hand-written assembly functions restored as
-readable sources). The game also loads 7 stage overlays (STAG*.PRO, 738 functions, all at the
-same address); 716 of them are matched and all 7 files rebuild byte-identical, 1623 of 1645
-functions over the whole game. Overlay game code matches with the main executable's compiler
-flags and mostly no normalizer recipe; the Psy-Q libraries linked into the overlays need the same
-recipes as in the main executable. The normalizer looks up target asm per unit, since overlays
-repeat function names at the same addresses.
+Case study status (2026-10-02): the Digimon World 2 main executable and its 7 stage overlays
+(STAG*.PRO) rebuild byte-identical. The decomp now counts a function as matched only when its C
+reproduces the retail bytes with the base compiler flags and no normalizer rewrites, and leaves
+PsyQ library code out of progress (DW2 issue #5). Under that standard 842 of 1089 game functions
+are matched; 64 + 107 game functions still depend on normalizer rewrites and 52 on a
+per-function flag set. The normalizer keeps the byte-identical build working while those are
+re-matched; it is a build aid, not a matching criterion. It looks up target asm per unit, since
+overlays repeat function names at the same addresses.
 
 ## Tools
 
